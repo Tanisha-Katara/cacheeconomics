@@ -1,0 +1,832 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Cache Economics — when prompt caching actually pays</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; worker-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; object-src 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Prompt caching only pays when the cache gets read. An interactive model of cache pricing — when the five-minute write wins, when the one-hour write wins — plus measured evidence from three popular agents.">
+<meta property="og:title" content="Cache Economics — when prompt caching actually pays">
+<meta property="og:description" content="The first request is not a discount. Model the crossover between the five-minute and one-hour cache, and see the measured boundary.">
+<meta property="og:type" content="article">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231b1915'/%3E%3Cpath d='M5 21 L13 21 L13 12 L27 12' stroke='%23d95b26' stroke-width='3' fill='none'/%3E%3Cpath d='M5 26 L19 26 L19 17 L27 17' stroke='%232563c4' stroke-width='3' fill='none'/%3E%3C/svg%3E">
+<script>
+  try { const t = localStorage.getItem('ce-theme');
+    if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300..650;1,9..144,300..650&family=Newsreader:ital,opsz,wght@0,6..72,400..600;1,6..72,400..600&family=IBM+Plex+Mono:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #faf8f4; --fill: #f2efe7; --rule: #e2ddd0; --rule-2: #d2ccb9;
+    --ink: #1b1915; --ink-2: #59544a; --ink-3: #968f7e;
+    --s5m: #2563c4; --s1h: #d95b26; --band: rgba(217,91,38,0.07);
+    --ok: #157f3d; --warn: #9a6b1f; --crit: #b3402f;
+    --halo: rgba(27,25,21,0.09); --edge: rgba(217,91,38,0.5);
+    --sel: rgba(217,91,38,0.24);
+    --serif: 'Fraunces', 'Iowan Old Style', 'Palatino Linotype', Georgia, serif;
+    --text: 'Newsreader', Georgia, 'Times New Roman', serif;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --bg: #131110; --fill: #1c1916; --rule: #2a2620; --rule-2: #3a342b;
+      --ink: #efece3; --ink-2: #b3ac9c; --ink-3: #7c7566;
+      --s5m: #6aa3ef; --s1h: #e0703a; --band: rgba(224,112,58,0.10);
+      --ok: #3da35f; --warn: #d0a045; --crit: #e0705f;
+      --halo: rgba(239,236,227,0.12); --edge: rgba(224,112,58,0.55);
+      --sel: rgba(224,112,58,0.35);
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #131110; --fill: #1c1916; --rule: #2a2620; --rule-2: #3a342b;
+    --ink: #efece3; --ink-2: #b3ac9c; --ink-3: #7c7566;
+    --s5m: #6aa3ef; --s1h: #e0703a; --band: rgba(224,112,58,0.10);
+    --ok: #3da35f; --warn: #d0a045; --crit: #e0705f;
+    --halo: rgba(239,236,227,0.12); --edge: rgba(224,112,58,0.55);
+    --sel: rgba(224,112,58,0.35);
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-font-smoothing: antialiased; }
+  @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
+  html.theming, html.theming *, html.theming *::before, html.theming *::after {
+    transition: background-color .25s ease, color .25s ease,
+      border-color .25s ease, fill .25s ease, stroke .25s ease !important; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 400 18px/1.68 var(--text); }
+  ::selection { background: var(--sel); color: var(--ink); }
+  :where(a, button, input, select, textarea):focus-visible {
+    outline: 2px solid var(--s5m); outline-offset: 2px; border-radius: 2px; }
+  .page { max-width: 1080px; margin: 0 auto; padding: 0 40px 150px; }
+  .col { max-width: 640px; }
+
+  /* wayfinding */
+  #prog { position: fixed; top: 0; left: 0; z-index: 30; height: 2px; width: 100%;
+    background: var(--s1h); transform: scaleX(0); transform-origin: 0 50%; }
+  .rail { display: none; position: fixed; left: 30px; top: 50%; transform: translateY(-50%);
+    z-index: 15; flex-direction: column; gap: 13px; }
+  .rail .rt { font: 500 9.5px/1.5 var(--mono); letter-spacing: .16em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 10px; }
+  .rail a { display: flex; align-items: center; gap: 9px; text-decoration: none;
+    font: 500 10px/1 var(--mono); letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink-3); transition: color .15s; }
+  .rail a i { display: block; width: 12px; height: 1px; background: var(--rule-2);
+    transition: width .2s, background .2s; }
+  .rail a:hover { color: var(--ink); }
+  .rail a.on { color: var(--ink); }
+  .rail a.on i { width: 22px; background: var(--s1h); }
+  @media (min-width: 1300px) { .rail { display: flex; } }
+
+  /* reveal on scroll (JS adds the attribute; never under reduced motion) */
+  [data-reveal] { opacity: 0; transform: translateY(14px);
+    transition: opacity .55s ease, transform .55s ease; }
+  [data-reveal].in { opacity: 1; transform: none; }
+
+  .sec { border-top: 1px solid var(--rule); margin-top: 108px; padding-top: 16px;
+    scroll-margin-top: 44px; }
+  .lab, .kicker { font: 500 11px/1.6 var(--mono); letter-spacing: .15em;
+    text-transform: uppercase; color: var(--ink-3); }
+  .lab { margin-bottom: 42px; }
+
+  h1 { font-family: var(--serif); font-optical-sizing: auto;
+    font-size: clamp(44px, 6.9vw, 82px); line-height: 1.0; letter-spacing: -0.02em;
+    font-weight: 480; margin: 0 0 34px; max-width: 15.5ch; }
+  h1 em { font-style: italic; font-weight: 420; }
+  h2 { font-family: var(--serif); font-optical-sizing: auto;
+    font-size: clamp(27px, 3.2vw, 34px); line-height: 1.16; letter-spacing: -0.014em;
+    font-weight: 480; margin: 0 0 22px; max-width: 26ch; }
+  h3 { font-family: var(--serif); font-optical-sizing: auto; font-size: 21px;
+    line-height: 1.25; letter-spacing: -0.008em; font-weight: 500;
+    margin: 52px 0 16px; color: var(--ink); max-width: 30ch; }
+  p { margin: 0 0 20px; color: var(--ink-2); }
+  .col p { max-width: 62ch; }
+  .lead { font-size: 22px; line-height: 1.6; max-width: 620px; }
+  .lead::first-letter { font-family: var(--serif); font-weight: 560; font-style: normal;
+    font-size: 3.15em; line-height: .8; float: left; padding: 7px 12px 0 0; color: var(--ink); }
+  strong { color: var(--ink); font-weight: 600; }
+  a { color: var(--ink); text-decoration-color: var(--rule-2); text-underline-offset: 3px;
+    transition: text-decoration-color .15s; }
+  a:hover { text-decoration-color: currentColor; }
+  code { font: 13px/1.5 var(--mono); color: var(--ink); background: var(--fill);
+    border-radius: 3px; padding: 2px 6px; }
+
+  .pull { font-family: var(--serif); font-style: italic; font-weight: 420;
+    font-size: 25px; line-height: 1.38; letter-spacing: -0.008em;
+    color: var(--ink); max-width: 25ch; margin: 46px 0 8px;
+    padding-left: 26px; border-left: 2px solid var(--s1h); }
+
+  header { padding: 152px 0 0; position: relative; }
+  header .kicker { margin-bottom: 34px; }
+  .dateline { font: 500 10.5px/1.8 var(--mono); letter-spacing: .13em;
+    text-transform: uppercase; color: var(--ink-3); margin-top: 36px;
+    padding-top: 18px; border-top: 1px solid var(--rule); max-width: 640px; }
+
+  #themeToggle { position: fixed; top: 20px; right: 24px; z-index: 25;
+    font: 500 10px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase;
+    cursor: pointer; color: var(--ink-3); background: var(--bg);
+    border: 1px solid var(--rule); padding: 9px 13px; margin: 0;
+    transition: color .15s, border-color .15s; }
+  #themeToggle:hover { color: var(--ink); border-color: var(--ink-3); }
+
+  .prices { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px;
+    background: var(--rule); border: 1px solid var(--rule); margin: 44px 0 14px; }
+  .price { background: var(--bg); padding: 26px 24px 24px; transition: background .15s; }
+  .price:hover { background: var(--fill); }
+  .price .k { font: 500 10.5px/1.5 var(--mono); letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-3); margin-bottom: 14px; }
+  .price .n { font-family: var(--serif); font-size: 36px; font-weight: 500;
+    letter-spacing: -0.02em; display: block; line-height: 1; }
+  .price:first-child .n { color: var(--ok); }
+  .price .d { font-size: 14.5px; color: var(--ink-2); margin-top: 10px; line-height: 1.55; }
+
+  .ctls { display: flex; flex-wrap: wrap; gap: 30px 36px; align-items: flex-end;
+    padding-bottom: 28px; border-bottom: 1px solid var(--rule); margin-top: 50px; }
+  .ctl { display: flex; flex-direction: column; gap: 9px; }
+  .ctl > span:first-child { font: 500 10.5px/1 var(--mono); letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-3); }
+  .val { font: 400 14px/1.4 var(--mono); color: var(--ink); }
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 260px;
+    max-width: 100%; height: 2px; background: var(--rule-2); outline: none; cursor: pointer; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px; height: 15px;
+    border-radius: 50%; background: var(--ink); cursor: pointer; border: none;
+    transition: box-shadow .15s; }
+  input[type=range]::-moz-range-thumb { width: 15px; height: 15px; border-radius: 50%;
+    background: var(--ink); cursor: pointer; border: none; transition: box-shadow .15s; }
+  input[type=range]:hover::-webkit-slider-thumb,
+  input[type=range]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 7px var(--halo); }
+  input[type=range]:hover::-moz-range-thumb,
+  input[type=range]:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 7px var(--halo); }
+  input[type=range]:focus-visible { outline: none; }
+  input[type=number], select { font: 400 15px/1.4 var(--mono); color: var(--ink);
+    background: transparent; border: 0; border-bottom: 1px solid var(--rule-2);
+    padding: 4px 0; width: 120px; transition: border-color .15s; }
+  input[type=number]:hover, select:hover { border-bottom-color: var(--ink-3); }
+  select { width: 150px; -webkit-appearance: none; appearance: none; border-radius: 0;
+    padding-right: 18px; cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23968f7e' stroke-width='1.5' fill='none'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 2px center; }
+
+  .legend { display: flex; flex-wrap: wrap; row-gap: 8px; gap: 8px 22px;
+    font: 400 12.5px/1.5 var(--mono); color: var(--ink-2); margin: 24px 0 6px; }
+  .key { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .sw { width: 15px; height: 2.5px; }
+
+  #chart { cursor: ew-resize; user-select: none; -webkit-user-select: none;
+    touch-action: none; display: block; }
+
+  .out { display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding-top: 26px; border-top: 1px solid var(--rule); }
+  .out .big { font-family: var(--serif); font-size: 42px; font-weight: 500;
+    letter-spacing: -0.02em; line-height: 1; transition: color .2s; }
+  #winner.w1 { color: var(--s1h); }
+  #winner.w5 { color: var(--s5m); }
+  .tag { font: 500 10px/1 var(--mono); letter-spacing: .12em; text-transform: uppercase;
+    padding: 6px 9px; border: 1px solid var(--rule); color: var(--ink-3); }
+  .tag.m { color: var(--ok); }
+
+  table { border-collapse: collapse; width: 100%; max-width: 640px; font-size: 16px; }
+  th { text-align: left; padding: 0 16px 11px 0; font: 500 10.5px/1 var(--mono);
+    letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3);
+    border-bottom: 1px solid var(--rule); }
+  td { padding: 13px 16px 13px 0; border-bottom: 1px solid var(--rule); color: var(--ink-2); }
+  td:first-child { color: var(--ink); font-family: var(--mono); font-size: 14px; }
+  tbody tr { transition: background .12s; }
+  tbody tr:hover { background: var(--fill); }
+  .hit { color: var(--ok); }
+  .miss { color: var(--crit); }
+  .runner { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 26px 0 0; }
+  .out-pre { margin-top: 22px; padding: 20px; background: var(--fill); border: 1px solid var(--rule);
+    font: 400 12.5px/1.65 var(--mono); color: var(--ink); white-space: pre-wrap;
+    overflow-x: auto; max-height: 520px; }
+  /* Abstain is not a failure. Colouring it like one contradicts the point
+     that a checker which cannot tell should say so. */
+  .abst { color: var(--warn); }
+
+  textarea { width: 100%; max-width: 640px; min-height: 148px; display: block;
+    font: 13px/1.65 var(--mono); padding: 16px; color: var(--ink);
+    background: var(--fill); border: 1px solid var(--rule); resize: vertical;
+    transition: border-color .15s; }
+  textarea:hover { border-color: var(--ink-3); }
+  button { font: 500 12px/1 var(--mono); letter-spacing: .09em; text-transform: uppercase;
+    padding: 13px 22px; cursor: pointer; margin: 18px 8px 0 0;
+    color: var(--bg); background: var(--ink); border: 1px solid var(--ink);
+    transition: opacity .15s, background .15s, color .15s, border-color .15s; }
+  button:hover { opacity: .82; }
+  button:active { opacity: .7; }
+  button.g { color: var(--ink); background: transparent; border-color: var(--rule-2); }
+  button.g:hover { opacity: 1; border-color: var(--ink-3); background: var(--fill); }
+
+  .find { display: flex; gap: 15px; padding: 17px 0; border-bottom: 1px solid var(--rule);
+    font-size: 15.5px; max-width: 640px; }
+  .find b { display: block; color: var(--ink); font-weight: 600; margin-bottom: 4px; }
+  .find span.t { color: var(--ink-2); font-size: 15px; line-height: 1.6; }
+  .bar { width: 3px; flex: none; border-radius: 2px; }
+  .note { font-size: 14.5px; color: var(--ink-3); max-width: 62ch; }
+  ul { padding-left: 0; list-style: none; max-width: 62ch; }
+  li { color: var(--ink-2); padding: 15px 0; border-bottom: 1px solid var(--rule); }
+
+  footer { border-top: 1px solid var(--rule); margin-top: 120px; padding-top: 26px;
+    font-size: 15px; color: var(--ink-3); display: grid; gap: 26px; }
+  footer .colophon { font: 500 10.5px/2 var(--mono); letter-spacing: .12em;
+    text-transform: uppercase; }
+  @media (min-width: 760px) { footer { grid-template-columns: 1.6fr 1fr; } }
+
+  @media (max-width: 720px) {
+    .page { padding: 0 22px 100px; } header { padding-top: 96px; }
+    .prices { grid-template-columns: 1fr; }
+    .lead::first-letter { font-size: 2.8em; }
+    .pull { font-size: 22px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { transition: none !important; }
+    [data-reveal] { opacity: 1 !important; transform: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div id="prog" aria-hidden="true"></div>
+<button id="themeToggle" aria-label="Toggle color theme">Dark</button>
+
+<nav class="rail" aria-label="Sections">
+  <span class="rt">Cache<br>economics</span>
+  <a href="#s1"><i></i>01 · Pricing</a>
+  <a href="#s2"><i></i>02 · Findings</a>
+  <a href="#s3"><i></i>03 · Model</a>
+  <a href="#s4"><i></i>04 · Evidence</a>
+  <a href="#s5"><i></i>05 · Comparison</a>
+  <a href="#s6"><i></i>06 · Method</a>
+  <a href="#s7"><i></i>07 · Instrument</a>
+  <a href="#s8"><i></i>08 · Your prompt</a>
+  <a href="#s9"><i></i>09 · Contact</a>
+</nav>
+
+<div class="page">
+
+<header>
+  <div class="kicker">Cache economics &middot; a field note</div>
+  <h1>Prompt caching only pays when the <em>cache gets read.</em></h1>
+  <p class="lead">The first request is not a discount. You pay extra to write a stable prefix into the cache, then you hope later requests read it cheaply. If they do not, caching is just a premium. Most teams cannot tell which side they are on, because the proof is buried in API usage fields nobody tracks.</p>
+  <div class="dateline">KCG Consulting &middot; July 2026 &middot; 5 min read</div>
+</header>
+
+<section class="sec" id="s1">
+  <div class="lab">01 &middot; How the pricing works</div>
+  <h2>Every cached token follows one of three paths.</h2>
+  <div class="col"><p>The bill depends on what happened to the prefix before this request arrived: no cache, a fresh write, or a cheap read.</p></div>
+  <div class="prices">
+    <div class="price"><div class="k">Read</div><span class="n">0.1&times;</span>
+      <div class="d">The prefix was already there. This is the payoff.</div></div>
+    <div class="price"><div class="k">Write &middot; 5 min</div><span class="n">1.25&times;</span>
+      <div class="d">Store it for five minutes. Pay 25% more than normal input.</div></div>
+    <div class="price"><div class="k">Write &middot; 1 hour</div><span class="n">2&times;</span>
+      <div class="d">Store it for an hour. Pay double, and keep it twelve times longer.</div></div>
+  </div>
+  <div class="col">
+    <p class="note">Multipliers on the base input rate, checked against Anthropic's published pricing on 28 July 2026.</p>
+    <p class="pull">The real question is not whether caching is enabled. It is whether requests arrive soon enough to reuse what you already paid to store.</p>
+  </div>
+</section>
+
+<section class="sec" id="s2">
+  <div class="lab">02 &middot; What we found</div>
+  <h2>Three popular agents leave the long cache unused.</h2>
+  <div class="col">
+    <p>We read the source for OpenHands, SWE-agent, and browser-use. All three use prompt caching. None of them can write the one-hour cache. Every call site emits <code>{"type":"ephemeral"}</code> with no <code>ttl</code> field, which means five minutes. There is no code path to the longer option.</p>
+    <p>That does not automatically make them expensive. It makes their cost depend on one thing: the gap between requests.</p>
+  </div>
+</section>
+
+<section class="sec" id="s3">
+  <div class="lab">03 &middot; When it matters</div>
+  <h2>One hour only wins between five minutes and one hour.</h2>
+  <div class="col"><p>Move the gap between requests. Under five minutes, both caches survive and the cheaper write wins. Over an hour, both caches expire and the cheaper write wins again. In the middle, the one-hour cache keeps reading while the five-minute cache keeps rebuilding.</p></div>
+
+  <div class="ctls">
+    <label class="ctl"><span>Gap between requests</span>
+      <input type="range" id="gap" min="0" max="100" value="27" step="1">
+      <span class="val" id="gapLabel">6.8 min</span></label>
+    <label class="ctl"><span>Stable prefix</span>
+      <input type="number" id="prefix" value="20000" min="512" max="500000" step="1000">
+      <span class="val">tokens</span></label>
+    <label class="ctl"><span>Requests per session</span>
+      <input type="number" id="nreq" value="50" min="2" max="100000" step="10">
+      <span class="val">requests</span></label>
+    <label class="ctl"><span>Model</span>
+      <select id="model">
+        <option value="claude-sonnet-4-6">Sonnet 4.6</option>
+        <option value="claude-sonnet-5">Sonnet 5</option>
+        <option value="claude-opus-4-8">Opus 4.8</option>
+        <option value="claude-haiku-4-5">Haiku 4.5</option>
+      </select>
+      <span class="val" id="rateLabel"></span></label>
+  </div>
+
+  <div class="legend">
+    <span class="key"><span class="sw" style="background:var(--s5m)"></span>Five minute</span>
+    <span class="key"><span class="sw" style="background:var(--s1h)"></span>One hour</span>
+    <span class="key" style="color:var(--ink-3)">Shaded: one hour is cheaper &middot; drag the chart</span>
+  </div>
+  <svg id="chart" viewBox="0 0 1000 320" width="100%" role="img"
+    aria-label="Cost per request against the gap between requests, comparing five-minute and one-hour cache lifetimes"></svg>
+
+  <div class="out">
+    <span class="big" id="winner">&mdash;</span>
+    <span id="detail" class="note" style="color:var(--ink-2)"></span>
+    <span class="tag">Modeled</span>
+  </div>
+  <p class="note" id="guard" style="margin-top:16px"></p>
+  <p class="note" style="margin-top:34px">The chart averages cost across the session, so the first write is counted. That is why the lines separate even when both caches are warm: the one-hour cache paid more up front, and below five minutes it never uses the extra life it bought.</p>
+  <p class="note">Changing the model changes the dollars, not the timing window. The boundaries come from cache lifetime, not the price list.</p>
+  <p class="note">This is arithmetic, not measurement. It assumes steady traffic and a stable prompt, and real traffic is neither. If your requests are almost always less than five minutes apart, the default cache is already doing the job and none of this applies to you.</p>
+</section>
+
+<section class="sec" id="s4">
+  <div class="lab">04 &middot; Evidence</div>
+  <h2>We measured the boundary.</h2>
+  <div class="col"><p>Same 16,429-token block. Same schedule. One copy stored for five minutes, one for an hour. Nothing else changed.</p></div>
+
+  <table>
+    <thead><tr><th>Elapsed</th><th>Five minute</th><th>One hour</th></tr></thead>
+    <tbody>
+      <tr><td>0 sec</td><td>stored</td><td>stored</td></tr>
+      <tr><td>420 sec</td><td><span class="miss">gone, paid again</span></td><td><span class="hit">still there</span></td></tr>
+      <tr><td>480 sec</td><td><span class="hit">still there</span></td><td><span class="hit">still there</span></td></tr>
+      <tr><td>900 sec</td><td><span class="miss">gone, paid again</span></td><td><span class="hit">still there</span></td></tr>
+    </tbody>
+  </table>
+
+  <div class="out" style="max-width:640px">
+    <span class="big">40.2%</span>
+    <span class="note" style="color:var(--ink-2)">cheaper across the run. $0.190 fell to $0.114. The harness was hash-pinned, and an earlier run matched to four significant figures.</span>
+    <span class="tag m">Measured</span>
+  </div>
+  <p class="note" style="margin-top:22px">The 480-second row matters. A miss at 420 seconds could mean expiry, or it could mean the two prompts were not byte-identical. A hit sixty seconds later rules out the second explanation.</p>
+  <p class="note">That 40.2% came from filler text on a fixed schedule. It establishes the mechanism and the boundary, not your savings.</p>
+</section>
+
+<section class="sec" id="s5">
+  <div class="lab">05 &middot; The comparison</div>
+  <h2>The honest question is not whether caching beats no caching.</h2>
+  <div class="col"><p>Gateways already place cache markers for you. LiteLLM will put one on the system prompt and one on the newest turn, automatically, from a config flag. Any tool claiming to help has to beat that, not beat an agent with caching switched off. Comparing against nothing is how &ldquo;up to 90%&rdquo; gets printed.</p></div>
+
+  <div class="col"><p>So we built the placement work as four arms over the same requests, replayed against a cache model whose lifetime we measured directly. The agent as it ships. The gateway doing it automatically. Our marker placement. And our placement plus one reordering.</p></div>
+
+  <table>
+    <thead><tr><th>Arm</th><th>What it answers</th><th>Cost to deploy</th></tr></thead>
+    <tbody>
+      <tr><td>As shipped</td><td>What the code does today</td><td>&mdash;</td></tr>
+      <tr><td>Gateway automatic</td><td>The baseline worth beating</td><td>One config flag</td></tr>
+      <tr><td>Marker placement</td><td>Does deliberate placement beat automatic?</td><td>Config change</td></tr>
+      <tr><td>Placement + reorder</td><td>Does moving one block beat it further?</td><td>Needs a behavioural eval</td></tr>
+    </tbody>
+  </table>
+
+  <p class="note" style="margin-top:22px">The last two are kept apart on purpose. Rolled together they produce one number that answers neither question, and they are not the same thing to ship: one is a setting, the other changes what the model reads first.</p>
+
+  <div class="col"><p>On our test workload, placement alone recovered 20%. Adding a single reordering &mdash; moving a session header below the stable text instead of above it &mdash; took it to 69%. That gap is the whole point: the marker had nowhere useful to go until the volatile block moved.</p></div>
+
+  <div class="out" style="max-width:640px">
+    <span class="big">69%</span>
+    <span class="note" style="color:var(--ink-2)">pessimistic end of a 69&ndash;75% range, on a synthetic workload built to contain the failure.</span>
+    <span class="tag">Modeled</span>
+  </div>
+  <p class="note" style="margin-top:22px">Not a client result, and not a promise about yours. It shows the method finds a failure it was pointed at.</p>
+
+  <div class="col" style="margin-top:30px"><p>We set the threshold before running it. If deliberate placement cannot beat the automatic baseline by ten percent, then what we have built is a linter rather than a compiler, and we say so and price it as one. On one of the three test workloads it came in at 1.2%, which is exactly that verdict.</p></div>
+</section>
+
+<section class="sec" id="s6">
+  <div class="lab">06 &middot; Method</div>
+  <h2>Two rules that make a number worth reading.</h2>
+  <div class="col"><p>Every model here guesses in a few places: how long an entry really survives, whether an identical prefix reaches a machine that holds it, when a write becomes readable. Each guess is defensible on its own. The trouble is that all of them lean the same way, toward more cache hits, which flatters whoever is selling the cache advice.</p></div>
+
+  <div class="col"><p>So every projection runs twice, once with those guesses set generously and once set against us, and the headline is always the pessimistic end. A single number from a model that leans one way is not a finding.</p></div>
+
+  <div class="col"><p>The second rule is that a dollar figure cannot be printed until it has been reconciled against a real invoice. Not warned about, not footnoted &mdash; withheld. Our own reports render an unreconciled figure as <code>[withheld]</code>, and the code physically refuses to turn one into a number. That rule exists because we kept catching ourselves publishing figures through paths that had skipped the check.</p></div>
+
+  <p class="note" style="margin-top:22px">Both rules cost us headline numbers. That is what they are for.</p>
+</section>
+
+<section class="sec" id="s7">
+  <div class="lab">07 &middot; The instrument</div>
+  <h2>None of this is judgement calls in a spreadsheet.</h2>
+  <div class="col"><p>The rules above are enforced by a working harness, not by remembering to apply them. It runs on your machine, reads usage fields and prompt structure rather than prompt text, and produces the report at the end of this section.</p></div>
+
+  <h3>A capability registry, dated and sourced</h3>
+  <div class="col"><p>Cache behaviour is not one thing. Bedrock wants longer-lived checkpoints before shorter ones; the direct API does not care. Minimum cacheable length moves between model generations and does not move in one direction &mdash; 512 tokens on Opus 5, 1,024 on Opus 4.8, 4,096 on Opus 4.6 and Haiku 4.5. Below that line the request is processed uncached and no error is returned. You cannot reason your way to these; they have to be looked up.</p></div>
+
+  <div class="prices">
+    <div class="price"><div class="k">Surfaces</div><span class="n">6</span>
+      <div class="d">API surfaces recorded, each with a source URL, a quote, and the date it was checked.</div></div>
+    <div class="price"><div class="k">Minimums</div><span class="n">14</span>
+      <div class="d">models with a verified minimum cacheable length.</div></div>
+    <div class="price"><div class="k">Withheld</div><span class="n">2</span>
+      <div class="d">rows two sources disagreed on, not published as fact.</div></div>
+  </div>
+  <p class="note">Those two withheld rows are the part that matters. One wrong entry discredits the other twenty, so a disputed fact does not ship until someone confirms it against the provider.</p>
+
+  <h3>Three checks that need nothing from you</h3>
+  <div class="col"><p>No traffic, no logs, no API key. They read a request you are about to send and answer whether the provider will silently ignore your markers. Real output:</p></div>
+
+  <table>
+    <thead><tr><th>Check</th><th>Verdict</th></tr></thead>
+    <tbody>
+      <tr><td>Minimum length</td><td><span class="abst">ABSTAIN</span> &mdash; estimated 3,900 tokens sits within 10% of the 4,096 minimum. Count exactly before trusting either answer.</td></tr>
+      <tr><td>Marker budget</td><td><span class="miss">FAIL</span> &mdash; 5 markers exceeds the limit of 4 on this surface.</td></tr>
+      <tr><td>Lifetime ordering</td><td><span class="miss">FAIL</span> &mdash; a one-hour checkpoint appears after a five-minute one, which this surface rejects.</td></tr>
+    </tbody>
+  </table>
+
+  <p class="note" style="margin-top:22px">The first one is the point. A checker that answers confidently when it cannot tell gets switched off within a week, and then catches nothing. Abstaining is a result.</p>
+
+  <h3>What the report looks like</h3>
+  <div class="col"><p>Coverage before any number. Every figure tagged measured or modeled. The reconciliation stated up front, and if it misses five percent the dollar figures do not print at all.</p></div>
+
+  <div class="out" style="max-width:640px">
+    <span class="big"><a href="sample-report.html">Sample report</a></span>
+    <span class="note" style="color:var(--ink-2)">generated from a synthetic workload, not a client. Same code path as a real engagement.</span>
+    <span class="tag">Synthetic</span>
+  </div>
+
+  <p class="note" style="margin-top:22px">There is nothing here to install. This is the instrument we run during an assessment, not a product you configure yourself, and we are not asking you to adopt a tool.</p>
+
+  <h3>Watch it run</h3>
+  <div class="col"><p>The same analyzer, compiled to WebAssembly and running in this tab against a sample trace. Not a JavaScript restatement of it &mdash; the actual code that produces a paid report, which is why its output here matches the sample report above exactly.</p></div>
+
+  <div class="col"><p>It deliberately does not take your file. Python comes from a public CDN, so it is third-party code, and it runs in a worker rather than on this page &mdash; a worker has no document, no window, and no way to reach the textarea further down where you might paste a real prompt. That is a property of where the code executes, not a promise about the CDN. The demo still runs only on data we ship, and your traces never enter a browser tab at all.</p></div>
+
+  <div class="col"><p>For your own traces, run it locally. Same code, no network, and that is how it runs during an engagement.</p></div>
+
+  <div class="col"><p>Note what it refuses to say. No invoice has been supplied, so it publishes no dollar figures &mdash; only ratios, coverage and structural findings. That is the same rule a paid report runs under, and watching it withhold is a better demonstration than reading about it.</p></div>
+
+  <div class="runner">
+    <button id="loadPy">Run the analyzer (~12&nbsp;MB of Python, once)</button>
+    <span id="pyState" class="note"></span>
+  </div>
+  <pre id="pyOut" class="out-pre" hidden></pre>
+
+  <p class="note" style="margin-top:18px">The download is Python itself, fetched once and cached by your browser. It buys something worth the wait: one implementation instead of two. The checker further down this page is the second implementation, and it shipped a bug this one never had.</p>
+</section>
+
+<section class="sec" id="s8">
+  <div class="lab">08 &middot; Your own prompt</div>
+  <h2>Stable text goes first. Moving text goes last.</h2>
+  <div class="col"><p>Cache matching starts at the top. Put a timestamp first and everything below it gets treated as new, even if it never changes. Paste your prompt sections in send order, one per line. This runs in your browser and sends nothing anywhere.</p></div>
+
+  <textarea id="sections" spellcheck="false">CURRENT TIME: 2026-07-28T18:03:41Z
+TOOL DEFINITIONS (6000 tokens)
+SYSTEM INSTRUCTIONS (8000 tokens)
+COMPANY POLICIES (20000 tokens)
+session_id: 4f2c-90ab
+conversation history
+user request</textarea>
+  <button id="run">Check order</button><button class="g" id="reset">Clear</button>
+  <div id="results" style="margin-top:22px"></div>
+</section>
+
+
+<section class="sec" id="s9">
+  <div class="lab">09 &middot; The real number</div>
+  <h2>The number that matters is yours.</h2>
+  <div class="col">
+    <p>Give us exported request traces and one provider invoice for the same window. We reconcile them against the rate you actually paid, not list price.</p>
+    <p>If traces and invoice do not agree within five percent, we do not invent a number. If your cache is already close to right, that is the result. The point is not to sell a fix. The point is to know.</p>
+    <p><a href="https://tanishakatara.com/contact">Talk to us</a>, or take the method and run it yourself.</p>
+  </div>
+</section>
+
+<footer>
+  <div>Findings filed publicly against
+    <a href="https://github.com/OpenHands/software-agent-sdk/issues/4292">OpenHands</a>,
+    <a href="https://github.com/SWE-agent/SWE-agent/issues/1481">SWE-agent</a> and
+    <a href="https://github.com/browser-use/browser-use/issues/5321">browser-use</a>,
+    with source references, measurement data, and clear limits on what each result establishes.</div>
+  <div class="colophon">KCG Consulting LLC<br>Set in Fraunces, Newsreader<br>&amp; IBM Plex Mono</div>
+</footer>
+</div>
+
+<script>
+const M = { W5: 1.25, W1: 2.00, R: 0.10, TTL5: 300, TTL1: 3600 };
+const MODELS = {
+  "claude-sonnet-4-6": { min: 1024, rates: [["1970-01-01", 3.00]] },
+  "claude-sonnet-5":   { min: 1024, rates: [["1970-01-01", 2.00], ["2026-09-01", 3.00]] },
+  "claude-opus-4-8":   { min: 1024, rates: [["1970-01-01", 5.00]] },
+  "claude-haiku-4-5":  { min: 4096, rates: [["1970-01-01", 1.00]] },
+};
+const TODAY = new Date().toISOString().slice(0, 10);
+const rateFor = (m,d) => { const t = MODELS[m].rates.filter(([f]) => f <= d);
+  return t.length ? t[t.length-1][1] : MODELS[m].rates[0][1]; };
+const rateNote = (m,d) => { const up = MODELS[m].rates.find(([f]) => f > d);
+  return up ? `$${rateFor(m,d).toFixed(2)}/Mtok to ${up[0]}, then $${up[1].toFixed(2)}`
+            : `$${rateFor(m,d).toFixed(2)}/Mtok`; };
+
+const $ = id => document.getElementById(id);
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+const pos2sec = p => Math.round(1 + Math.pow(p/100, 2.2) * 7199);
+const fmtGap = s => s < 90 ? `${s} sec` : s < 5400 ? `${(s/60).toFixed(s<600?1:0)} min` : `${(s/3600).toFixed(1)} hr`;
+const T5 = { life: M.TTL5, write: M.W5 }, T1 = { life: M.TTL1, write: M.W1 };
+// Amortised cost per request over a session of n requests: one write, then n-1
+// reads if the entry survives the gap; pure writes once the gap exceeds the TTL.
+const costPer = (gap, tok, rate, t, n) => {
+  const per = tok * (rate / 1e6);
+  if (gap >= t.life) return per * t.write;
+  return per * (t.write + (n - 1) * M.R) / n;
+};
+
+let D = { W: 1000, H: 320, L: 64, R: 22, pw: 914 };
+
+function draw(gap, tokens, rate, n) {
+  const svg = $('chart');
+  const cw = Math.round(svg.clientWidth) || 1000;
+  const W = Math.max(300, Math.min(1000, cw));
+  const small = W < 560;
+  const H = small ? 340 : 320;
+  const L = small ? 54 : 64, R = small ? 12 : 22, T = 18, B = 42, pw = W-L-R, ph = H-T-B;
+  D = { W, H, L, R, pw };
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  const xs = i => L + (i/100)*pw, maxY = tokens*(rate/1e6)*M.W1*1.18, ys = v => T+ph-(v/maxY)*ph;
+  const pts = Array.from({length:101}, (_,i) => ({ i, g: pos2sec(i) }));
+  const path = t => pts.map((p,k)=>`${k?'L':'M'}${xs(p.i).toFixed(1)},${ys(costPer(p.g,tokens,rate,t,n)).toFixed(1)}`).join('');
+  const inBand = pts.filter(p => costPer(p.g,tokens,rate,T1,n) < costPer(p.g,tokens,rate,T5,n));
+  const band = inBand.length
+    ? `<rect x="${xs(inBand[0].i)}" y="${T}" width="${xs(inBand[inBand.length-1].i)-xs(inBand[0].i)}" height="${ph}" fill="var(--band)"/>` : '';
+  const invert = s => { for (let i=0;i<=100;i++) if (pos2sec(i)>=s) return i; return 100; };
+
+  const mono = "'IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,monospace";
+  const gridY = [0,.25,.5,.75,1].map(f => { const y=(T+ph-f*ph).toFixed(1);
+    return `<line x1="${L}" x2="${W-R}" y1="${y}" y2="${y}" stroke="var(--rule)" stroke-width="1"/>
+      <text x="${L-12}" y="${+y+4}" text-anchor="end" fill="var(--ink-3)" font-size="11.5"
+        font-family="${mono}">$${(maxY*f).toFixed(3)}</text>`; }).join('');
+  const xTicks = small ? [60,900,3600] : [60,300,900,3600,7200];
+  const gridX = xTicks.map(s => `<text x="${xs(invert(s))}" y="${H-14}" text-anchor="middle"
+      fill="var(--ink-3)" font-size="11.5" font-family="${mono}">${fmtGap(s)}</text>`).join('');
+
+  const bnd = [300, 3600].map(s => { const x = xs(invert(s));
+    return `<line x1="${x}" x2="${x}" y1="${T}" y2="${T+ph}" stroke="var(--edge)" stroke-width="1" stroke-dasharray="1 3"/>
+      <text x="${x+5}" y="${T+11}" fill="var(--ink-3)" font-size="10" font-family="${mono}"
+        letter-spacing=".08em">${s===300?'5 MIN':'1 HR'}</text>`; }).join('');
+
+  const lab = (x,y,color,txt) => { const w = txt.length*6.9+18, lx = Math.min(Math.max(x,L), W-R-w);
+    return `<rect x="${lx-4}" y="${y-11}" width="${w}" height="17" fill="var(--bg)" opacity="0.9"/>
+      <rect x="${lx+1}" y="${y-6}" width="8" height="2.5" fill="${color}"/>
+      <text x="${lx+14}" y="${y+1}" fill="var(--ink-2)" font-size="11.5"
+        font-family="${mono}">${txt}</text>`; };
+  const cx = xs(invert(gap));
+
+  svg.innerHTML = `${band}${gridY}${gridX}${bnd}
+    <line x1="${L}" x2="${W-R}" y1="${T+ph}" y2="${T+ph}" stroke="var(--rule)"/>
+    <path d="${path(T5)}" fill="none" stroke="var(--s5m)" stroke-width="2"/>
+    <path d="${path(T1)}" fill="none" stroke="var(--s1h)" stroke-width="2"/>
+    <line x1="${cx}" x2="${cx}" y1="${T}" y2="${T+ph}" stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="2 4"/>
+    <circle cx="${cx}" cy="${ys(costPer(gap,tokens,rate,T5,n))}" r="4.5" fill="var(--s5m)" stroke="var(--bg)" stroke-width="2"/>
+    <circle cx="${cx}" cy="${ys(costPer(gap,tokens,rate,T1,n))}" r="4.5" fill="var(--s1h)" stroke="var(--bg)" stroke-width="2"/>
+    ${lab(xs(invert(1500)), ys(costPer(1500,tokens,rate,T5,n))-10, 'var(--s5m)', '$'+costPer(1500,tokens,rate,T5,n).toFixed(4))}
+    ${lab(xs(invert(1500)), ys(costPer(1500,tokens,rate,T1,n))-10, 'var(--s1h)', '$'+costPer(1500,tokens,rate,T1,n).toFixed(4))}
+    ${lab(xs(invert(6000)), ys(costPer(6000,tokens,rate,T1,n))-10, 'var(--s1h)', '$'+costPer(6000,tokens,rate,T1,n).toFixed(4))}
+    <text x="${W-R}" y="${T-4}" text-anchor="end" fill="var(--ink-3)" font-size="11.5"
+      font-family="${mono}">cost per request</text>`;
+}
+
+// Animated chart state: controls set targets, the drawing eases toward them.
+const cur = { pos: 27, tokens: 20000, n: 50, rate: 3.00 };
+let anim = null;
+const renderFrame = () => draw(pos2sec(Math.round(cur.pos)), cur.tokens, cur.rate, Math.max(2, Math.round(cur.n)));
+function tweenTo(target) {
+  if (reducedMotion) { Object.assign(cur, target); renderFrame(); return; }
+  const from = { ...cur }, t0 = performance.now(), dur = 210;
+  cancelAnimationFrame(anim);
+  const step = t => {
+    const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3);
+    for (const key in target) cur[key] = from[key] + (target[key] - from[key]) * e;
+    renderFrame();
+    if (k < 1) anim = requestAnimationFrame(step);
+  };
+  anim = requestAnimationFrame(step);
+}
+
+function update() {
+  const pos = +$('gap').value, tokens = Math.max(1, +$('prefix').value || 0);
+  const model = $('model').value, rate = rateFor(model, TODAY), min = MODELS[model].min;
+  const n = Math.max(2, +$('nreq').value || 2);
+  const gap = pos2sec(pos);
+  $('gapLabel').textContent = fmtGap(gap);
+  $('rateLabel').textContent = rateNote(model, TODAY);
+  tweenTo({ pos, tokens, n, rate });
+
+  const c5 = costPer(gap,tokens,rate,T5,n), c1 = costPer(gap,tokens,rate,T1,n), d = c5-c1;
+  const w = $('winner');
+  if (Math.abs(d) < 1e-12) {
+    w.textContent = 'No difference'; w.className = 'big';
+    $('detail').textContent = `At ${fmtGap(gap)} apart both caches are still warm, so the longer lifetime adds no value.`;
+  } else if (d > 0) {
+    w.textContent = 'One hour'; w.className = 'big w1';
+    $('detail').textContent = `${(100*d/c5).toFixed(1)}% cheaper at ${fmtGap(gap)} apart. $${c5.toFixed(5)} drops to $${c1.toFixed(5)} per request.`;
+  } else {
+    w.textContent = 'Five minutes'; w.className = 'big w5';
+    $('detail').textContent = `At ${fmtGap(gap)} apart the longer cache does not earn back its higher write cost. $${c5.toFixed(5)} beats $${c1.toFixed(5)} per request.`;
+  }
+  $('guard').innerHTML = tokens < min
+    ? `<span style="color:var(--crit)">${tokens.toLocaleString()} tokens is below this model's ${min.toLocaleString()} token cache minimum. Nothing is cached. The request bills at full price.</span>` : '';
+}
+['gap','prefix','model','nreq'].forEach(id => $(id).addEventListener('input', update));
+
+(() => {
+  const svg = $('chart');
+  const scrub = e => {
+    const r = svg.getBoundingClientRect();
+    const i = Math.round(((e.clientX - r.left) / r.width * D.W - D.L) / D.pw * 100);
+    $('gap').value = Math.max(0, Math.min(100, i));
+    update();
+  };
+  svg.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    svg.setPointerCapture(e.pointerId);
+    scrub(e);
+    const mv = ev => scrub(ev);
+    const up = () => { svg.removeEventListener('pointermove', mv); svg.removeEventListener('pointerup', up); };
+    svg.addEventListener('pointermove', mv);
+    svg.addEventListener('pointerup', up);
+  });
+})();
+
+let rz; addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() => renderFrame(), 120); });
+
+// Theme toggle with persisted choice and a brief cross-fade.
+(() => {
+  const root = document.documentElement, btn = $('themeToggle');
+  const isDark = () => getComputedStyle(root).colorScheme === 'dark';
+  const sync = () => btn.textContent = isDark() ? 'Light' : 'Dark';
+  btn.addEventListener('click', () => {
+    root.classList.add('theming');
+    root.dataset.theme = isDark() ? 'light' : 'dark';
+    try { localStorage.setItem('ce-theme', root.dataset.theme); } catch (e) {}
+    sync();
+    setTimeout(() => root.classList.remove('theming'), 350);
+  });
+  sync();
+})();
+
+// Scroll progress hairline.
+(() => {
+  const prog = $('prog'); let tick = false;
+  addEventListener('scroll', () => {
+    if (tick) return; tick = true;
+    requestAnimationFrame(() => {
+      const h = document.documentElement, max = h.scrollHeight - h.clientHeight;
+      prog.style.transform = `scaleX(${max ? h.scrollTop / max : 0})`;
+      tick = false;
+    });
+  }, { passive: true });
+})();
+
+// Left rail: highlight the section currently being read.
+(() => {
+  const links = [...document.querySelectorAll('.rail a')];
+  if (!links.length || !('IntersectionObserver' in window)) return;
+  const io = new IntersectionObserver(es => {
+    es.forEach(e => { if (e.isIntersecting)
+      links.forEach(l => l.classList.toggle('on', l.hash === '#' + e.target.id)); });
+  }, { rootMargin: '-38% 0px -55% 0px' });
+  document.querySelectorAll('.sec[id]').forEach(s => io.observe(s));
+  // Above the first section nothing is current.
+  new IntersectionObserver(es => {
+    if (es[0].isIntersecting) links.forEach(l => l.classList.remove('on'));
+  }, { rootMargin: '-30% 0px 0px 0px' }).observe(document.querySelector('header'));
+})();
+
+// Reveal on scroll: staggered fade-and-rise, skipped for reduced motion.
+(() => {
+  if (reducedMotion || !('IntersectionObserver' in window)) return;
+  const els = [...document.querySelectorAll('header > *, .sec > *')];
+  els.forEach(el => el.setAttribute('data-reveal', ''));
+  const show = el => {
+    if (el.classList.contains('in')) return;
+    const sibs = [...el.parentNode.children].filter(c => c.hasAttribute('data-reveal'));
+    el.style.transitionDelay = Math.min(Math.max(sibs.indexOf(el), 0), 5) * 55 + 'ms';
+    el.classList.add('in');
+    el.addEventListener('transitionend', () => el.style.transitionDelay = '', { once: true });
+  };
+  const io = new IntersectionObserver(es => es.forEach(e => {
+    if (e.isIntersecting) { show(e.target); io.unobserve(e.target); }
+  }), { rootMargin: '0px 0px -8% 0px' });
+  els.forEach(el => io.observe(el));
+  // Safety net: fast flicks, anchor jumps and find-in-page can outrun IO frames —
+  // reveal anything already above the fold line.
+  let tick = false;
+  addEventListener('scroll', () => {
+    if (tick) return; tick = true;
+    requestAnimationFrame(() => {
+      els.forEach(el => {
+        if (!el.classList.contains('in') && el.getBoundingClientRect().top < innerHeight * 0.92) {
+          show(el); io.unobserve(el);
+        }
+      });
+      tick = false;
+    });
+  }, { passive: true });
+})();
+
+const VOLATILE = [
+  [/\b\d{4}-\d{2}-\d{2}T?[\d:]*Z?\b/, 'a timestamp'],
+  [/\b(current[_ ]?time|now|today|timestamp|date)\b/i, 'a time reference'],
+  [/\b[0-9a-f]{8}-?[0-9a-f]{4}\b/i, 'something shaped like an ID'],
+  [/\b(session|request|trace|user|customer|tenant)[_ ]?id\b/i, 'a per-session identifier'],
+  [/\b(working memory|scratchpad|progress|step \d+)\b/i, 'working memory'],
+];
+const STABLE = /\b(tool|system|instruction|polic|guardrail|constitution|reference|schema)/i;
+
+$('run').onclick = () => {
+  const lines = $('sections').value.split('\n').map(s=>s.trim()).filter(Boolean);
+  const out = [];
+  // The blocker is the FIRST moving line with anything static behind it, not
+  // the last moving line overall. Tracking the last one let a late session id
+  // hide an early timestamp: on the sample above, line 1 sits over three static
+  // sections, and this reported "the stable prefix is protected" — the exact
+  // failure the rest of the page is about.
+  const isVol = l => VOLATILE.some(([re]) => re.test(l));
+  const anyVol = lines.findIndex(isVol);
+  let blocker = -1, stableAfter = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (!isVol(lines[i])) continue;
+    const j = lines.findIndex((l,k) => k > i && STABLE.test(l));
+    if (j >= 0) { blocker = i; stableAfter = j; break; }
+  }
+
+  if (blocker >= 0) {
+    const what = VOLATILE.find(([re]) => re.test(lines[blocker]))[1];
+    const trapped = lines.filter((l,i) => i > blocker && STABLE.test(l)).length;
+    out.push(['var(--crit)', 'A moving line is blocking the cache.',
+      `Line ${blocker+1} holds ${what}, and ${trapped} static section${trapped===1?'':'s'} sit${trapped===1?'s':''} behind it, starting at line ${stableAfter+1}. Because matching starts at the top, all of it is re-read and re-billed on every request. Move changing fields to the bottom.`]);
+  } else if (anyVol >= 0) {
+    out.push(['var(--ok)', 'The moving parts are low enough.',
+      `Line ${anyVol+1} changes each request, but nothing obviously static sits behind it. The stable prefix is protected.`]);
+  } else {
+    out.push(['var(--ok)', 'Nothing obviously volatile near the top.',
+      `This reads the labels you pasted. It is a wording check, not an inspection of your live requests.`]);
+  }
+  const n = lines.filter(l => STABLE.test(l)).length;
+  if (n >= 3) out.push(['var(--warn)', `${n} static sections, four markers available.`,
+    `Anthropic allows four cache markers per request. A rolling marker for conversation history takes two of them, so your static sections are competing for the remaining two. Sections that change at different speeds may have to be merged.`]);
+  out.push(['var(--ink-3)', 'This reads your text. It does not measure anything.',
+    `It cannot see whether your JSON serializes in a stable order, whether your tools arrive in the same sequence each time, or what your hit rate is. Your usage figures are the answer.`]);
+
+  $('results').innerHTML = out.map(([c,t,b]) =>
+    `<div class="find"><span class="bar" style="background:${c}"></span>
+      <span><b>${t}</b><span class="t">${b}</span></span></div>`).join('');
+};
+$('reset').onclick = () => $('results').innerHTML = '';
+update();
+</script>
+
+<script type="module">
+// The analyzer, compiled to WASM and run in this tab. Loaded only when asked:
+// Python is ~12 MB, and making every visitor pay that to read an article would
+// be a poor trade for a capability most of them will not use.
+const $$ = id => document.getElementById(id);
+const state = $$('pyState'), out = $$('pyOut');
+
+const say = t => { state.textContent = t; };
+const show = t => { out.hidden = false; out.textContent = t; };
+
+// Python runs in a worker, not here.
+//
+// It is third-party code from a public CDN, and this document contains a
+// textarea people are invited to paste their own prompt into. A worker has no
+// DOM at all -- no document, no window, no way to reach an input element -- so
+// "this runs in your browser and sends nothing anywhere" stops depending on
+// trusting jsdelivr and starts being a property of where the code executes.
+// It costs nothing: the only data the worker ever sees is a sample trace we
+// ship ourselves.
+$$('loadPy').addEventListener('click', () => {
+  $$('loadPy').disabled = true;
+  let worker;
+  try {
+    worker = new Worker('./analyzer-worker.js', { type: 'module' });
+  } catch (e) {
+    say('load failed');
+    show('Could not start the analyzer worker.\n\n' + (e && (e.message || String(e))));
+    return;
+  }
+  worker.onmessage = ({ data }) => {
+    if (data.type === 'status') say(data.text);
+    else if (data.type === 'ready') { $$('loadPy').hidden = true; say('ready \u00b7 build ' + data.build); }
+    else if (data.type === 'report') { show(data.report); say('done \u00b7 this ran entirely in your browser'); }
+    else if (data.type === 'error') { say('failed'); show(data.text + '\n\n' + data.detail); }
+  };
+  worker.onerror = e => {
+    say('failed');
+    show('The analyzer worker failed to load.\n\n' + (e && (e.message || String(e))));
+  };
+  worker.postMessage('start');
+});
+
+</script>
+</body>
+</html>

@@ -1,0 +1,393 @@
+"""Load and query the provider registry.
+
+The registry is the point of the whole exercise: machine-readable, dated,
+sourced facts about what each provider surface can actually do. Instrumentation
+and prefix linting already exist elsewhere. A capability registry with
+provenance and a contested-row rule does not.
+
+Two rules are enforced here rather than left to callers:
+
+1. A contested row cannot be read without asking for it. `target()` refuses to
+   return a row flagged contested unless `allow_contested=True`, because the
+   failure mode this guards against is one wrong row quietly discrediting the
+   other twenty.
+
+2. Pricing is date-effective. `base_rate()` requires a date. There is no
+   "current price" API, because a static answer to that question goes stale
+   silently and every downstream dollar figure inherits the error.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import os
+from datetime import date, datetime, timezone
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# Inside the package, not beside it. This used to be `../registry`, which works
+# from a checkout and breaks the moment the package is installed: `..` from
+# site-packages/cacheeconomics is site-packages, so a wheel that did not also
+# ship a top-level `registry/` raised "registry file missing" on first use. It is
+# `data/` rather than `registry/` because `registry.py` already owns that name in
+# this package and a directory beside it would shadow the module.
+REGISTRY_DIR = os.path.join(HERE, "data")
+
+STALE_AFTER_DAYS = 90
+
+
+class RegistryError(Exception):
+    pass
+
+
+class ContestedRow(RegistryError):
+    """Raised when a caller reads a disputed fact without acknowledging it."""
+
+
+class UnpriceableSurface(RegistryError):
+    """Raised when the rate table does not cover the surface being priced.
+
+    Distinct from a missing model row because the remedy is different and the
+    caller reports it to a client. "No pricing recorded for claude-haiku-4-5"
+    sends them to add a registry row that is already there; the real answer is
+    that their surface is invoiced by AWS or Google and the rate has to come
+    from that bill.
+    """
+
+
+def _load(name):
+    path = os.path.join(REGISTRY_DIR, name)
+    if not os.path.exists(path):
+        raise RegistryError(f"registry file missing: {path}")
+    with open(path) as f:
+        return json.load(f)
+
+
+_PROVIDERS = None
+_PRICING = None
+
+
+def providers():
+    global _PROVIDERS
+    if _PROVIDERS is None:
+        _PROVIDERS = _load("providers.json")
+    return _PROVIDERS
+
+
+def pricing():
+    global _PRICING
+    if _PRICING is None:
+        _PRICING = _load("pricing.json")
+    return _PRICING
+
+
+def target_ids(include_contested=False):
+    return [t["id"] for t in providers()["targets"]
+            if include_contested or not t["provenance"].get("contested")]
+
+
+def target(target_id, allow_contested=False):
+    """Return one target row.
+
+    Refuses contested rows by default. A disputed capability published as fact
+    is worse than an absent one: it discredits every row beside it.
+    """
+    for t in providers()["targets"]:
+        if t["id"] != target_id:
+            continue
+        prov = t["provenance"]
+        if prov.get("contested") and not allow_contested:
+            raise ContestedRow(
+                f"{target_id} is flagged contested and must not be treated as "
+                f"fact.\n  reason: {prov.get('contested_reason', 'unspecified')}\n"
+                f"  pass allow_contested=True only to inspect it, never to "
+                f"publish from it."
+            )
+        return t
+    raise RegistryError(f"unknown target: {target_id!r}. "
+                        f"known: {', '.join(target_ids())}")
+
+
+def capability(target_id, name, allow_contested=False):
+    t = target(target_id, allow_contested)
+    caps = t.get("capabilities", {})
+    if name not in caps:
+        raise RegistryError(f"{target_id} records no capability {name!r}")
+    return caps[name]
+
+
+def multipliers(target_id):
+    t = target(target_id)
+    m = t.get("multipliers")
+    if not m:
+        raise RegistryError(f"{target_id} records no multipliers")
+    return m
+
+
+def min_cacheable_tokens(target_id, model):
+    """Minimum prefix that will actually cache, for this target and model.
+
+    Deliberately has no default. Guessing a minimum is how the silent failure
+    this function exists to prevent gets reintroduced: below the threshold the
+    provider processes the request uncached and returns no error at all.
+    """
+    t = target(target_id)
+    # Followed to the end, with a cycle guard. One level was assumed, so a chain
+    # silently stopped short and a row inheriting from itself recursed until the
+    # error a caller saw had nothing to do with the registry.
+    src, seen = t, {target_id}
+    while "inherits_minimums_from" in src:
+        nxt = src["inherits_minimums_from"]
+        if nxt in seen:
+            raise RegistryError(
+                f"inherits_minimums_from forms a cycle: "
+                f"{' -> '.join(list(seen) + [nxt])}. A minimum has to come from "
+                f"somewhere; a loop means no row actually records one.")
+        seen.add(nxt)
+        src = target(nxt)
+    mins = src.get("min_cacheable_tokens", {})
+    if model in mins:
+        return mins[model]
+    if "_default" in mins:
+        return mins["_default"]
+    raise RegistryError(
+        f"no minimum recorded for {model!r} on {target_id}. The registry does "
+        f"not guess: minimums are non-monotonic across model generations "
+        f"(512 on Opus 5, 4096 on Opus 4.6 and Haiku 4.5), so an inferred "
+        f"value would be wrong in exactly the cases that matter."
+    )
+
+
+def supported_ttls(target_id: str, model: str | None = None) -> list:
+    """Lifetimes this surface accepts, narrowed to the model when it matters.
+
+    `supported_ttls` is the surface's maximum. On Bedrock the 1h lifetime went
+    GA for three models only, which the row's provenance note recorded in prose
+    while the capability stayed surface-wide -- so the linter blessed a 1h
+    marker on a model that would reject it. A per-model map is consulted when
+    the row carries one.
+    """
+    surface = capability(target_id, "supported_ttls") or []
+    if model is None:
+        return list(surface)
+    try:
+        by_model = capability(target_id, "supported_ttls_by_model")
+    except RegistryError:
+        return list(surface)
+    if not isinstance(by_model, dict):
+        return list(surface)
+    bare, _date = normalize_model(model, target_id)
+    allowed = by_model.get(bare, by_model.get(model, by_model.get("_default")))
+    if not isinstance(allowed, list):
+        return list(surface)
+    # Never wider than the surface itself.
+    return [t for t in surface if t in allowed]
+
+
+_DATE_SUFFIX = re.compile(r"^(?P<base>.+?)-(?P<date>\d{8})$")
+
+
+def normalize_model(model: str, target_id: str | None = None) -> tuple[str, str | None]:
+    """Strip a trailing date snapshot from a model id.
+
+    Real traces carry ids like `claude-haiku-4-5-20251001` alongside bare ones
+    like `claude-haiku-4-5`, sometimes in the same file. The registry is keyed
+    on the bare id, so an unnormalised trace prices as an unknown model and the
+    request drops out of the total — silently understating spend.
+
+    Deliberately not folded into `base_rate`. A lookup that quietly rewrites its
+    own argument cannot tell a known model with a date suffix from a genuinely
+    unknown one, and the second case has to keep failing. Callers normalise on
+    purpose and report that they did.
+
+    Returns (bare id, stripped date or None).
+    """
+    model = model or ""
+    # Strip the surface's own id prefix. Bedrock records
+    # `model_id_prefix: "anthropic."`, and a trace carrying `anthropic.claude-…`
+    # priced fine under an invoice rate while min_cacheable_tokens rejected it
+    # -- so the minimum guard was skipped on exactly the reports that publish
+    # dollar figures.
+    prefix = None
+    if target_id:
+        try:
+            prefix = target(target_id).get("model_id_prefix")
+        except RegistryError:
+            prefix = None
+
+    def _strip_surface(value):
+        if prefix and value.startswith(prefix):
+            stripped = value[len(prefix):]
+            if stripped in pricing()["models"] or _DATE_SUFFIX.match(stripped):
+                return stripped
+        return value
+
+    model = _strip_surface(model)
+
+    # Then a gateway routing prefix. LiteLLM and friends address models as
+    # `anthropic/claude-opus-5`, which is a routing decision rather than a
+    # provider model id, so no target's `model_id_prefix` covers it. Left
+    # unstripped it reached min_cacheable_tokens as an unknown model, and the
+    # live plugin -- whose ids come from a gateway by definition -- then had no
+    # minimum to check a marker against.
+    #
+    # Only accepted when what follows the slash is a model the registry already
+    # knows, or a known model wearing a date. This recognises a known model
+    # behind a prefix; it never invents one.
+    #
+    # `_DATE_SUFFIX.match(candidate)` alone used to be enough, which stripped
+    # unknown ids that merely looked date-stamped:
+    # `anthropic/not-a-real-model-20250101` came back as
+    # `not-a-real-model-20250101`, so the RegistryError downstream quoted an id
+    # the caller never sent. The comment above promises this never invents a
+    # model, and half-rewriting an unknown one is a smaller version of the same
+    # broken promise.
+    # The two prefixes compose, and each pass alone could not see past the
+    # other. LiteLLM addresses Bedrock as `bedrock/anthropic.claude-haiku-4-5`:
+    # the surface pass could not match because the id starts with `bedrock/`,
+    # and this pass rejected `anthropic.claude-haiku-4-5` because that is not a
+    # registry model. Each half worked in isolation and the combination -- the
+    # shape LiteLLM actually emits for the surface whose prefix this is -- fell
+    # through unnormalised, so Bedrock traffic lost its minimum check, its
+    # bake-off modelling and its live marker placement.
+    #
+    # So the candidate is tested with the surface prefix removed as well. Still
+    # never invents a model: every branch requires what remains to be an id the
+    # registry already knows, or one wearing a date.
+    if "/" in model and model not in pricing()["models"]:
+        candidate = model.rsplit("/", 1)[-1]
+        for form in (candidate, _strip_surface(candidate)):
+            dated = _DATE_SUFFIX.match(form)
+            bare = dated.group("base") if dated else form
+            if form in pricing()["models"] or bare in pricing()["models"]:
+                model = form
+                break
+
+    m = _DATE_SUFFIX.match(model)
+    if not m:
+        return model, None
+    base = m.group("base")
+    return (base, m.group("date")) if base in pricing()["models"] else (model, None)
+
+
+def _as_date(value, what="date"):
+    """Parse strictly, or refuse.
+
+    Rates were selected by comparing raw strings, so anything sorting after an
+    effective date silently selected the later tier. `2026-8-1` is August, and
+    it sorts after `2026-09-01`: claude-sonnet-5 priced at the post-September
+    $3.00 instead of $2.00, a 50% overstatement on a report whose whole point is
+    date-effective pricing. `not-a-date` did the same, without failing.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        raise RegistryError(
+            f"{what} must be an ISO yyyy-mm-dd date, got {value!r}. Rates are "
+            f"selected by comparing dates, and a string that merely sorts is "
+            f"not a date -- '2026-8-1' sorts after '2026-09-01' and would have "
+            f"picked the wrong rate tier without failing.") from None
+
+
+def base_rate(model, on_date):
+    """Base input USD/Mtok effective on `on_date` (ISO yyyy-mm-dd or date)."""
+    when = _as_date(on_date, "on_date")
+    models = pricing()["models"]
+    if model not in models:
+        raise RegistryError(f"no pricing recorded for {model!r}")
+    applicable = [r for start, r in sorted(models[model]["rates"])
+                  if _as_date(start, "rate effective date") <= when]
+    if not applicable:
+        raise RegistryError(f"no rate for {model!r} effective on {when}")
+    return applicable[-1]
+
+
+def rate_scope():
+    """Which surfaces the base rate table is valid for."""
+    return pricing().get("rate_scope") or {}
+
+
+def rates_apply_to(target_id):
+    """True if `target_id` is billed at the rates in the pricing table.
+
+    Default-deny. The table holds Anthropic first-party list prices, and a
+    surface earns them by being named, not by being absent from an exclusion
+    list -- otherwise every surface added later inherits Anthropic pricing by
+    silence, which is how this got wrong in the first place.
+    """
+    return target_id in set(rate_scope().get("applies_to") or ())
+
+
+def require_priceable(target_id):
+    """Raise unless the base rate table may be used for `target_id`.
+
+    Refusing is the whole point. A partner-operated surface priced at
+    first-party rates does not fail loudly -- it publishes a dollar figure that
+    looks right and does not match the invoice the client is holding.
+    """
+    if rates_apply_to(target_id):
+        return
+    scope = rate_scope()
+    detail = (scope.get("unpriced_surfaces") or {}).get(target_id) or {}
+    official = detail.get("official_pricing")
+    where = f" Its published rates are at {official}." if official else ""
+    raise UnpriceableSurface(
+        f"{target_id} is not covered by the recorded rate table, which holds "
+        f"Anthropic first-party list prices ({', '.join(scope.get('applies_to') or ['none'])})."
+        f"{where} Pricing this surface at first-party rates would produce a "
+        f"figure that does not match the bill the customer actually receives, "
+        f"so it is refused rather than estimated. Supply the rate from their "
+        f"invoice with --effective-rate to analyse this trace.")
+
+
+def upcoming_rate_change(model, on_date):
+    """The next scheduled rate change after `on_date`, or None."""
+    if isinstance(on_date, (date, datetime)):
+        on_date = on_date.strftime("%Y-%m-%d")
+    for start, rate in sorted(pricing()["models"][model]["rates"]):
+        if start > on_date:
+            return {"effective": start, "rate": rate}
+    return None
+
+
+def staleness_report(as_of=None):
+    """Rows whose provenance is older than the staleness window.
+
+    A hand-verified capability table decays like any other fact. This project
+    has already been caught by that twice: a landscape check missed two
+    competitors published before the check date, and a registry row recorded
+    the opposite of what the vendor docs said.
+    """
+    as_of = as_of or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    as_of_d = datetime.strptime(as_of, "%Y-%m-%d").date()
+    rows = []
+    # `pricing/rate-scope` ages separately from the rates themselves. It records
+    # which surfaces those rates are *valid for*, and that is a commercial
+    # arrangement between Anthropic and two cloud providers, not a number on a
+    # page -- it can change without any rate changing. Left out of this report it
+    # would be the one dated claim in the registry that never came up for review,
+    # while silently deciding whether a client's traffic gets priced at all.
+    scope_rows = ([{"id": "pricing/rate-scope", "provenance": rate_scope()["provenance"]}]
+                  if rate_scope().get("provenance") else [])
+    for t in (providers()["targets"]
+              + [{"id": "pricing", "provenance": pricing()["provenance"]}]
+              + scope_rows):
+        p = t["provenance"]
+        checked = p.get("checked_on")
+        if not checked:
+            rows.append({"id": t["id"], "age_days": None, "stale": True,
+                         "reason": "no checked_on date"})
+            continue
+        age = (as_of_d - datetime.strptime(checked, "%Y-%m-%d").date()).days
+        rows.append({
+            "id": t["id"], "checked_on": checked, "age_days": age,
+            "stale": age > STALE_AFTER_DAYS,
+            "confidence": p.get("confidence"),
+            "contested": bool(p.get("contested")),
+            "live_canary": p.get("verified_by", {}).get("live_canary", False),
+        })
+    return rows

@@ -1,0 +1,58 @@
+[
+  {
+    "local": "openhands/llm_message.py",
+    "repo": "OpenHands/software-agent-sdk",
+    "commit": "1f9f0b1aa0356e082d971e8a5cf82256d67fe576",
+    "path": "openhands-sdk/openhands/sdk/llm/message.py",
+    "sha256": "aa18869b482f2eea942c4b444ab84ff7aaf6434dd043cfbea68b406fd435c457"
+  },
+  {
+    "local": "openhands/llm_llm.py",
+    "repo": "OpenHands/software-agent-sdk",
+    "commit": "1f9f0b1aa0356e082d971e8a5cf82256d67fe576",
+    "path": "openhands-sdk/openhands/sdk/llm/llm.py",
+    "sha256": "45f483ab6c3277fb842fb8b0f2e63c6c3806d70fba96ef483f629e438fa45773"
+  },
+  {
+    "local": "openhands/utils_model_features.py",
+    "repo": "OpenHands/software-agent-sdk",
+    "commit": "1f9f0b1aa0356e082d971e8a5cf82256d67fe576",
+    "path": "openhands-sdk/openhands/sdk/llm/utils/model_features.py",
+    "sha256": "802bd6befb124da7c10b7baae2f847addac0ed7d8bfd04250895bbec1c298afa"
+  },
+  {
+    "local": "openhands/llm_convertible_system.py",
+    "repo": "OpenHands/software-agent-sdk",
+    "commit": "1f9f0b1aa0356e082d971e8a5cf82256d67fe576",
+    "path": "openhands-sdk/openhands/sdk/event/llm_convertible/system.py",
+    "sha256": "d28a1c618e3e0cd659cb68551e5b593f0d49d40f08e2b8975bce2f3c1b34d44d"
+  },
+  {
+    "local": "swe-agent/models.py",
+    "repo": "SWE-agent/SWE-agent",
+    "commit": "3ea751c087f32b16e039a2233dd6eefecef325d5",
+    "path": "sweagent/agent/models.py",
+    "sha256": "91a8cb62703d7db656b0e615811ff0b9eedd51cd3ea89a6eeb2393f1d35c6cce"
+  },
+  {
+    "local": "swe-agent/history_processors.py",
+    "repo": "SWE-agent/SWE-agent",
+    "commit": "3ea751c087f32b16e039a2233dd6eefecef325d5",
+    "path": "sweagent/agent/history_processors.py",
+    "sha256": "8e3621a9b7d94761d184c57dc2ab1028f7eb04b01fdfcbe8ba122977d19e477a"
+  },
+  {
+    "local": "browser-use/chat.py",
+    "repo": "browser-use/browser-use",
+    "commit": "f0aa3a8bb03779c71a5aa262d389e3bfe6b77cdc",
+    "path": "browser_use/llm/anthropic/chat.py",
+    "sha256": "cdd9d9b91e2d2865e3d3eae857142da1510a60f936cb579a2846349a362adb6d"
+  },
+  {
+    "local": "browser-use/serializer.py",
+    "repo": "browser-use/browser-use",
+    "commit": "f0aa3a8bb03779c71a5aa262d389e3bfe6b77cdc",
+    "path": "browser_use/llm/anthropic/serializer.py",
+    "sha256": "50b0621b4bbf245b977a5fe378f6bc3e75011f143e319fcef65cf2138002ee61"
+  }
+]

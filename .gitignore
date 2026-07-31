@@ -1,0 +1,36 @@
+# Third-party sources fetched as evidence for Tier A analysis.
+# NOT our code — do not vendor. Provenance is recorded in tier-a/SOURCES.md
+# (URL + fetch date + sha256), which is reproducible without copying
+# other projects' MIT/Apache-licensed source into this repo.
+tier-a/openhands/
+tier-a/swe-agent/
+tier-a/browser-use/
+
+# Raw experiment output stays untracked: on a real workload these rows could
+# carry account-specific volume. Must match the filenames ttl_experiment.py
+# actually writes (ttl_run_<id>.jsonl).
+tier-b/ttl_run_*.jsonl
+tier-b/foundry_run_*.jsonl
+
+# ...but the auditable subset IS tracked. Published dollar claims are only
+# checkable if the per-call rows behind them travel with them.
+!tier-b/evidence/
+!tier-b/evidence/*.json
+
+# Never commit credentials
+.env
+*.key
+
+# Real-trace analysis output. Transcript-derived data never enters the repo,
+# even in aggregate — the adapter reads only usage fields, but the safe default
+# is that nothing derived from a session transcript is tracked.
+harness/out/
+*claude-code-trace*
+
+# Build artifacts from `pip install .` / `python -m build`. The package source
+# is harness/cacheeconomics; these are generated copies of it.
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc

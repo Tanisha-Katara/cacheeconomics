@@ -1,0 +1,96 @@
+name: ci
+
+# Three guards in this repository only fire when somebody remembers to run
+# pytest: the bundle digest, and the two sample-report parity checks. All three
+# exist because a published artifact makes a claim about what the code produces,
+# so "we forgot to run the tests" and "the public page is wrong" are the same
+# event. That is what this workflow is for.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The floor and the ceiling. 3.9 is what pyproject promises and the
+        # oldest thing the annotations survive; 3.13 catches deprecations before
+        # a client's newer interpreter does.
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest only
+        # The package itself has no dependencies and that is a claim worth
+        # testing, not just stating. Nothing else is installed here, so an
+        # accidental third-party import fails the run rather than passing
+        # because a transitive dependency happened to be present.
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run the suite
+        run: python -m pytest -q
+
+      - name: Check the browser bundle is not stale
+        # test_bundle.py already asserts this, so a failure here means the
+        # generator and its test disagree -- which is worth knowing separately.
+        run: |
+          python web/build_bundle.py
+          git diff --exit-code -- web/harness-bundle.js
+
+  package:
+    # Installability is a separate question from correctness, and it broke once
+    # already: the registry lived beside the package rather than inside it, so
+    # the source tree worked and a wheel raised "registry file missing" on first
+    # use. Nothing in the test suite could have caught that.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Build a wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Install it somewhere the source tree is not importable
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+
+      - name: The installed package must find its own registry
+        working-directory: /tmp
+        run: |
+          /tmp/venv/bin/cacheeconomics --version
+          /tmp/venv/bin/cacheeconomics registry
+          /tmp/venv/bin/python -c "
+          from cacheeconomics.cost import Usage, price
+          assert price(Usage(uncached_input=1_000_000), 'claude-opus-5').usd == 5.0
+          print('registry resolved and priced from site-packages')
+          "
+
+      - name: Dollar figures stay withheld without an invoice
+        # The property the whole tool is sold on, asserted against the artifact
+        # a client would actually install rather than the source tree.
+        working-directory: /tmp
+        run: |
+          /tmp/venv/bin/cacheeconomics analyze \
+            "$GITHUB_WORKSPACE/harness/fixtures/demo-traces.jsonl" > out.txt
+          grep -q "FIGURES WITHHELD" out.txt
+          grep -q "\[figure withheld\]" out.txt
+          echo "withheld by default, as shipped"

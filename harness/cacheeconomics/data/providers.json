@@ -1,0 +1,326 @@
+{
+  "schema_version": 1,
+  "generated": "2026-07-29",
+  "note": "Capability-atomic registry keyed by provider x api_surface x model_family x region x date. Every row carries provenance. A row two sources dispute may only publish with live_canary true or contested true.",
+  "control_models": {
+    "explicit_breakpoint": "Developer annotates spans with cache markers. Full placement control.",
+    "checkpoint_backward_search": "Developer places a checkpoint; provider searches backward for the longest match.",
+    "implicit_prefix": "No developer control at all. Ordering and routing affinity are the only levers.",
+    "named_resource": "Cache is a server-side object with its own lifecycle, id and storage billing. Not a span you annotate."
+  },
+  "targets": [
+    {
+      "id": "anthropic/direct",
+      "provider": "anthropic",
+      "api_surface": "messages",
+      "control_model": "explicit_breakpoint",
+      "capabilities": {
+        "explicit_breakpoints": true,
+        "max_breakpoints": 4,
+        "automatic_prefix_cache": true,
+        "named_cache_resource": false,
+        "supported_ttls": [
+          "5m",
+          "1h"
+        ],
+        "ttl_ordering_constraint": null,
+        "lookback_blocks": 20,
+        "hit_refreshes_ttl": true,
+        "batch_compatible": true,
+        "counterfactual_simulatable": true
+      },
+      "multipliers": {
+        "write_5m": 1.25,
+        "write_1h": 2.0,
+        "read": 0.1
+      },
+      "min_cacheable_tokens": {
+        "claude-opus-5": 512,
+        "claude-fable-5": 512,
+        "claude-mythos-5": 512,
+        "claude-opus-4-8": 1024,
+        "claude-sonnet-5": 1024,
+        "claude-sonnet-4-6": 1024,
+        "claude-sonnet-4-5": 1024,
+        "claude-opus-4-1": 1024,
+        "claude-sonnet-4": 1024,
+        "claude-opus-4-7": 2048,
+        "claude-haiku-3-5": 2048,
+        "claude-opus-4-6": 4096,
+        "claude-opus-4-5": 4096,
+        "claude-haiku-4-5": 4096
+      },
+      "authority_preserving_relocation": {
+        "supported": true,
+        "mechanism": "role:system message inside messages[]",
+        "models": [
+          "claude-opus-5",
+          "claude-opus-4-8",
+          "claude-fable-5",
+          "claude-mythos-5"
+        ],
+        "excluded": [
+          "claude-sonnet-5"
+        ]
+      },
+      "provenance": {
+        "source_url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+        "source_quote": "Automatic caching is available on the Claude API, Claude Platform on AWS, Google Cloud, and Microsoft Foundry. Amazon Bedrock does not support automatic caching.",
+        "source_location": "Automatic caching section",
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": true,
+          "fixture": true,
+          "live_canary": true
+        },
+        "confidence": "high",
+        "contested": false,
+        "canary_note": "Multipliers, the 300s TTL and hit-refreshes-TTL confirmed by direct measurement on 2026-07-28 (runs 20260728T182814Z, 20260728T194028Z). 1h survival confirmed at 56 minutes."
+      }
+    },
+    {
+      "id": "anthropic/claude-platform-on-aws",
+      "provider": "anthropic",
+      "api_surface": "claude-platform-on-aws",
+      "control_model": "explicit_breakpoint",
+      "capabilities": {
+        "explicit_breakpoints": true,
+        "max_breakpoints": 4,
+        "automatic_prefix_cache": true,
+        "named_cache_resource": false,
+        "supported_ttls": [
+          "5m",
+          "1h"
+        ],
+        "ttl_ordering_constraint": null,
+        "lookback_blocks": 20,
+        "hit_refreshes_ttl": true,
+        "batch_compatible": true,
+        "counterfactual_simulatable": true
+      },
+      "multipliers": {
+        "write_5m": 1.25,
+        "write_1h": 2.0,
+        "read": 0.1
+      },
+      "inherits_minimums_from": "anthropic/direct",
+      "provenance": {
+        "source_url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+        "source_quote": "Automatic caching is available on the Claude API, Claude Platform on AWS, Google Cloud, and Microsoft Foundry.",
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": true,
+          "fixture": false,
+          "live_canary": false
+        },
+        "confidence": "medium",
+        "contested": false,
+        "note": "Anthropic-operated with same-day API parity. Bare model ids, no anthropic. prefix."
+      }
+    },
+    {
+      "id": "amazon-bedrock/converse",
+      "provider": "amazon_bedrock",
+      "api_surface": "converse",
+      "control_model": "checkpoint_backward_search",
+      "capabilities": {
+        "explicit_breakpoints": true,
+        "max_breakpoints": 4,
+        "automatic_prefix_cache": false,
+        "named_cache_resource": false,
+        "supported_ttls": [
+          "5m",
+          "1h"
+        ],
+        "supported_ttls_by_model": {
+          "_comment": "supported_ttls above is the surface maximum. This row's own provenance note records that 1h went GA on 2026-01-26 for these three models only; every other model here is 5m. The note said so in prose while the capability stayed surface-wide, so the linter blessed a 1h marker on a model that would reject it.",
+          "_default": ["5m"],
+          "claude-sonnet-4-5": ["5m", "1h"],
+          "claude-haiku-4-5": ["5m", "1h"],
+          "claude-opus-4-5": ["5m", "1h"]
+        },
+        "ttl_ordering_constraint": "longest_first",
+        "lookback_blocks": null,
+        "hit_refreshes_ttl": true,
+        "batch_compatible": false,
+        "counterfactual_simulatable": true
+      },
+      "multipliers": {
+        "write_5m": 1.25,
+        "write_1h": 2.0,
+        "read": 0.1
+      },
+      "inherits_minimums_from": "anthropic/direct",
+      "model_id_prefix": "anthropic.",
+      "provenance": {
+        "source_url": "https://aws.amazon.com/about-aws/whats-new/2026/01/amazon-bedrock-one-hour-duration-prompt-caching",
+        "source_quote": "Supported TTL values are 5m and 1h. When mixing TTLs in a single request, longer TTL checkpoints must appear before shorter ones.",
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": true,
+          "fixture": true,
+          "live_canary": false
+        },
+        "confidence": "medium",
+        "contested": false,
+        "note": "1h TTL GA 2026-01-26 for Sonnet 4.5, Haiku 4.5, Opus 4.5. Automatic caching explicitly unsupported. Simplified cache management searches backward over recent blocks."
+      }
+    },
+    {
+      "id": "google-cloud/vertex",
+      "provider": "google_cloud",
+      "api_surface": "vertex",
+      "control_model": "explicit_breakpoint",
+      "capabilities": {
+        "explicit_breakpoints": true,
+        "max_breakpoints": 4,
+        "automatic_prefix_cache": true,
+        "named_cache_resource": false,
+        "supported_ttls": [
+          "5m",
+          "1h"
+        ],
+        "ttl_ordering_constraint": null,
+        "lookback_blocks": 20,
+        "hit_refreshes_ttl": true,
+        "batch_compatible": false,
+        "counterfactual_simulatable": true
+      },
+      "multipliers": {
+        "write_5m": 1.25,
+        "write_1h": 2.0,
+        "read": 0.1
+      },
+      "inherits_minimums_from": "anthropic/direct",
+      "provenance": {
+        "source_url": "https://platform.claude.com/docs/en/build-with-claude/prompt-caching",
+        "source_quote": "Automatic caching is available on the Claude API, Claude Platform on AWS, Google Cloud, and Microsoft Foundry.",
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": true,
+          "fixture": true,
+          "live_canary": false
+        },
+        "confidence": "high",
+        "contested": false,
+        "note": "RESOLVED 2026-07-28. Google Cloud IS Vertex AI in Anthropic's taxonomy: the docs link Google Cloud directly to claude-on-vertex-ai. A prior draft of this registry wrongly recorded automatic caching as unsupported here."
+      }
+    },
+    {
+      "id": "openai/direct",
+      "provider": "openai",
+      "api_surface": "responses",
+      "control_model": "explicit_breakpoint",
+      "capabilities": {
+        "explicit_breakpoints": true,
+        "explicit_breakpoints_from_model_family": "gpt-5.6",
+        "max_breakpoints": null,
+        "automatic_prefix_cache": true,
+        "named_cache_resource": false,
+        "supported_ttls": [
+          "30m"
+        ],
+        "ttl_ordering_constraint": null,
+        "lookback_blocks": null,
+        "hit_refreshes_ttl": null,
+        "routing_hash_prefix_tokens": 256,
+        "cache_key_param": "prompt_cache_key",
+        "counterfactual_simulatable": "explicit_only"
+      },
+      "multipliers": {
+        "write_pre_5_6": 1.0,
+        "write_5_6_plus": 1.25,
+        "read": null
+      },
+      "min_cacheable_tokens": {
+        "_default": 1024
+      },
+      "provenance": {
+        "source_url": "https://developers.openai.com/api/docs/guides/prompt-caching",
+        "source_quote": "On GPT-5.6 models and later model families, cache writes cost 1.25x the uncached input token rate.",
+        "source_location": "Pricing section",
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": true,
+          "fixture": false,
+          "live_canary": false
+        },
+        "confidence": "medium",
+        "contested": false,
+        "note": "RESOLVED 2026-07-28 as direct-API. Two reviews disagreed on whether explicit breakpoints and the write premium were direct or Bedrock-only; the OpenAI docs page establishes direct and does not mention Bedrock. Silence is not disproof, so openai/bedrock remains unknown rather than unsupported."
+      }
+    },
+    {
+      "id": "openai/bedrock",
+      "provider": "amazon_bedrock",
+      "api_surface": "converse",
+      "model_family": "openai",
+      "control_model": "unknown",
+      "capabilities": {
+        "_unknown": true
+      },
+      "provenance": {
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": false,
+          "fixture": false,
+          "live_canary": false
+        },
+        "confidence": "none",
+        "contested": true,
+        "contested_reason": "One review asserted OpenAI explicit breakpoints and the write premium apply here rather than on the direct API. The OpenAI docs establish the direct API and are silent on Bedrock. No source consulted confirms or denies this surface. Must not be published without a live canary."
+      }
+    },
+    {
+      "id": "deepseek/direct",
+      "provider": "deepseek",
+      "api_surface": "chat",
+      "control_model": "implicit_prefix",
+      "capabilities": {
+        "explicit_breakpoints": false,
+        "max_breakpoints": 0,
+        "automatic_prefix_cache": true,
+        "named_cache_resource": false,
+        "supported_ttls": [],
+        "developer_controls": "none",
+        "counterfactual_simulatable": false,
+        "ttl_ordering_constraint": null
+      },
+      "provenance": {
+        "source_url": "https://api-docs.deepseek.com/news/news0802/",
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": true,
+          "fixture": false,
+          "live_canary": false
+        },
+        "confidence": "medium",
+        "contested": false,
+        "note": "Disk-based, best effort, no cache_control parameter and no separate write charge. Ordering is the only lever. Counterfactual not simulatable: server-side eviction is opaque."
+      }
+    },
+    {
+      "id": "google/gemini-explicit",
+      "provider": "google",
+      "api_surface": "generateContent",
+      "control_model": "named_resource",
+      "capabilities": {
+        "explicit_breakpoints": false,
+        "named_cache_resource": true,
+        "storage_billed_hourly": true,
+        "counterfactual_simulatable": false
+      },
+      "provenance": {
+        "checked_on": "2026-07-28",
+        "verified_by": {
+          "docs": false,
+          "fixture": false,
+          "live_canary": false
+        },
+        "confidence": "low",
+        "contested": true,
+        "contested_reason": "Could not verify from primary source. The docs page consulted covers the Interactions API, which supports implicit caching only and defers explicit caching to the generateContent version. Out of scope for v1; recorded so the gap is visible rather than absent."
+      }
+    }
+  ]
+}

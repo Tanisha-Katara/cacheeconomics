@@ -1,0 +1,142 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diagnostic cache economics assessment</title>
+<style>
+:root{color-scheme:light;--bg:#fbfbf9;--panel:#fff;--ink:#111110;--ink2:#4d4b46;
+--ink3:#7c7972;--rule:#dfddd6;--fill:#f2f1ed;--ok:#0b7f37;--okbg:#eaf5ee;
+--warn:#9b6b0b;--warnbg:#fff5df;--crit:#b63229;--critbg:#fff0ee;--accent:#2457a6}
+*{box-sizing:border-box}
+html{-webkit-font-smoothing:antialiased}
+body{margin:0;background:var(--bg);color:var(--ink);
+font:400 16px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+.report{max-width:1060px;margin:0 auto;padding:68px 34px 110px}
+.hero{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:34px;align-items:end;
+padding-bottom:28px}
+.eyebrow,.label{font:600 11px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+letter-spacing:.12em;text-transform:uppercase;color:var(--ink3)}
+h1{font-size:clamp(38px,5vw,58px);line-height:1.02;letter-spacing:-.035em;
+font-weight:560;margin:12px 0 16px;max-width:13ch}
+h2{font-size:clamp(24px,3vw,32px);line-height:1.15;letter-spacing:-.025em;
+font-weight:560;margin:0}
+h3{font-size:18px;line-height:1.25;font-weight:650;margin:0;color:var(--ink)}
+p{margin:0;color:var(--ink2);max-width:68ch}
+.lede{font-size:19px;line-height:1.55;color:var(--ink2);max-width:58ch}
+.meta{display:grid;gap:10px;border:1px solid var(--rule);background:var(--panel);
+padding:18px;border-radius:6px}
+.meta div{display:flex;justify-content:space-between;gap:16px;border-bottom:1px solid var(--rule);
+padding-bottom:9px}
+.meta div:last-child{border-bottom:0;padding-bottom:0}
+.meta span:first-child{color:var(--ink3)}
+.meta span:last-child{font-weight:560;color:var(--ink);text-align:right}
+.verdict{border:1px solid var(--rule);background:var(--panel);border-radius:6px;padding:22px;
+display:grid;grid-template-columns:minmax(0,1.3fr) minmax(220px,.7fr);gap:24px;margin:12px 0 28px}
+.verdict strong{display:block;color:var(--ink);font-size:22px;line-height:1.25;margin-top:8px}
+.impact{border-left:3px solid var(--crit);padding-left:16px}
+.impact.ok{border-left-color:var(--ok)}
+.impact .amount{font-size:42px;line-height:1;font-weight:560;letter-spacing:-.035em;
+font-variant-numeric:tabular-nums;color:var(--ink)}
+.impact .caption{margin-top:8px;color:var(--ink3);font-size:14px}
+.status{display:flex;align-items:center;gap:10px;margin-top:16px;color:var(--ink2)}
+.dot{width:9px;height:9px;border-radius:99px;background:var(--ok);flex:none}
+.dot.warn{background:var(--warn)}.dot.crit{background:var(--crit)}
+.section{border-top:1px solid var(--rule);padding-top:18px;margin-top:54px}
+.section-head{display:flex;justify-content:space-between;gap:24px;align-items:end;margin-bottom:22px}
+.section-head p{font-size:15px;max-width:46ch}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--rule);
+border:1px solid var(--rule);border-radius:6px;overflow:hidden}
+.kpi{background:var(--panel);padding:20px 18px;min-height:126px}
+.kpi .value{font-size:31px;line-height:1.1;font-weight:560;letter-spacing:-.025em;
+font-variant-numeric:tabular-nums;margin:15px 0 7px}
+.kpi .help{font-size:14px;color:var(--ink2)}
+.strip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px}
+.strip .box{border:1px solid var(--rule);background:var(--panel);border-radius:6px;padding:17px}
+.box strong{display:block;margin-bottom:6px;color:var(--ink)}
+.findings{display:grid;gap:16px}
+.finding{border:1px solid var(--rule);border-left-width:4px;background:var(--panel);
+border-radius:6px;padding:20px}
+.finding.high{border-left-color:var(--crit)}.finding.medium{border-left-color:var(--warn)}
+.finding.low{border-left-color:var(--ink3)}
+.finding-head{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:start}
+.badges{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:10px}
+.tag{font:600 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.09em;
+text-transform:uppercase;padding:6px 8px;border:1px solid var(--rule);border-radius:999px;
+color:var(--ink3);background:var(--bg);white-space:nowrap}
+.tag.measured{color:var(--ok);background:var(--okbg);border-color:transparent}
+.tag.modeled{color:var(--warn);background:var(--warnbg);border-color:transparent}
+.tag.risk{color:var(--ink2)}
+.finding-money{text-align:right;min-width:138px;font-variant-numeric:tabular-nums}
+.finding-money b{display:block;font-size:24px;line-height:1.1;font-weight:560;color:var(--ink)}
+.finding-money span{display:block;font-size:12px;color:var(--ink3);margin-top:5px}
+.finding-body{display:grid;grid-template-columns:minmax(0,1fr) minmax(220px,.42fr);gap:24px;
+margin-top:16px}
+.block-label{font:600 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.1em;
+text-transform:uppercase;color:var(--ink3);margin-bottom:8px}
+.fix{border-left:2px solid var(--accent);padding-left:14px;color:var(--ink2);font-size:15px}
+.total{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;border-top:1px solid var(--rule);
+padding-top:20px;margin-top:4px}
+.total .amount{font-size:42px;line-height:1;font-weight:560;letter-spacing:-.035em}
+.note{font-size:14px;color:var(--ink3)}
+table{border-collapse:collapse;width:100%;font-size:15px;background:var(--panel);
+border:1px solid var(--rule);border-radius:6px;overflow:hidden}
+th{text-align:left;font:600 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.1em;
+text-transform:uppercase;color:var(--ink3);padding:13px 16px;border-bottom:1px solid var(--rule)}
+td{padding:14px 16px;border-bottom:1px solid var(--rule);color:var(--ink2)}
+tr:last-child td{border-bottom:0}td:first-child{color:var(--ink);font-weight:560}
+.gate{padding:16px 18px;border:1px solid var(--crit);background:var(--critbg);border-radius:6px}
+footer{border-top:1px solid var(--rule);margin-top:72px;padding-top:18px;font-size:13px;color:var(--ink3)}
+@media(max-width:850px){.report{padding:48px 22px 80px}.hero,.verdict,.finding-body{grid-template-columns:1fr}
+.kpis,.strip{grid-template-columns:1fr 1fr}.finding-head{grid-template-columns:1fr}
+.finding-money{text-align:left}.section-head{display:block}.section-head p{margin-top:10px}}
+@media(max-width:560px){.kpis,.strip{grid-template-columns:1fr}.meta div{display:block}
+.meta span:last-child{text-align:left;display:block;margin-top:3px}}
+</style></head><body><main class=report>
+<header class=hero><div>
+<div class=eyebrow>Cache economics assessment</div>
+<h1>What your prompt cache is actually doing.</h1>
+<p class=lede>Caching added $0.83 during the measured window. The cache is being written more often than it is being read. Until the prefix is stable, caching can cost more than plain input.</p>
+</div><div class=meta>
+<div><span>Client</span><span>Diagnostic</span></div>
+<div><span>Window</span><span>Not specified</span></div>
+<div><span>Generated</span><span>2026-07-31</span></div>
+<div><span>Ingest tier</span><span>instrumented</span></div>
+</div></header>
+<section class=verdict><div>
+<div class=label>Executive readout</div>
+<strong>Caching added $0.83 during the measured window.</strong>
+<p style='margin-top:10px'>The cache is being written more often than it is being read. Until the prefix is stable, caching can cost more than plain input.</p>
+<div class=status><span class='dot'></span><span>Reconciliation: Passed. Coverage: 286 of 286 requests analyzed (100%).</span></div>
+</div><div class='impact'>
+<div class=label>Recoverable upper bound</div>
+<div class=amount>$229</div>
+<div class=caption>per month, modeled pessimistically. Findings overlap, so this is an upper bound on the sum, not a promise.</div>
+</div></section>
+<section class=section><div class=section-head>
+<div><div class=label>01 / Data quality</div><h2>Can we trust the numbers?</h2></div>
+<p>Coverage and invoice reconciliation are shown before any recommendation, because a cost figure without those checks is just arithmetic.</p></div>
+<div class=strip>
+<div class=box><strong>Coverage</strong><p>286 of 286 requests analyzed (100%).</p></div>
+<div class=box><strong>Reconciliation: Passed</strong><p style='margin-top:6px'>Computed input spend $16.97 against invoice $17.45. Difference: 2.7%, inside the 5% publication gate.</p></div>
+</div>
+</section>
+<section class=section><div class=section-head>
+<div><div class=label>02 / Current position</div><h2>The cache is active, but underused.</h2></div>
+<p>These are the ratios finance and engineering can both read: how much input came from cache, how often writes paid off, and what the run costs at your rate.</p>
+</div><div class=kpis>
+<div class=kpi><div class=label>Input from cache</div><div class=value>17%</div><div class=help>Share of input tokens served at the cheap read rate.</div></div>
+<div class=kpi><div class=label>Prefix efficiency</div><div class=value>17%</div><div class=help>Of every token written to cache, the share later read.</div></div>
+<div class=kpi><div class=label>Requests</div><div class=value>286</div><div class=help>Observed over 1.7 days.</div></div>
+<div class=kpi><div class=label>Input spend</div><div class=value>$299</div><div class=help>Per month, extrapolated from this window.</div></div>
+</div></section>
+<section class=section><div class=section-head>
+<div><div class=label>03 / Findings - 4</div><h2>Fix the prefix before changing lifetime.</h2></div>
+<p>Findings are ranked by severity and monthly impact. Each one names the mechanism, the evidence class, and the safest next action.</p></div>
+<div class=findings>
+<article class='finding high'><div class=finding-head><div><div class=badges><span class=tag>TTL-1</span><span class='tag modeled'>modeled</span><span class='tag risk'>quality risk: low</span></div><h3>&#x27;research-agent&#x27; request cadence sits inside the one-hour window</h3></div><div class=finding-money><b>~$214</b><span>avoidable / month</span></div></div><div class=finding-body><div><div class=block-label>Evidence</div><p>100% of gaps between requests fall between five minutes and one hour (median 11.2 min across 126 requests). In that band a five-minute cache expires before the next request and rewrites at 1.25x, while a one-hour cache would have read at 0.1x.</p></div><div><div class=block-label>Action</div><div class=fix>Set a one-hour TTL on the static prefix for this agent. Outside the five-minute-to-one-hour band the five-minute default is cheaper, so this is not a blanket change.</div></div></div></article>
+<article class='finding high'><div class=finding-head><div><div class=badges><span class=tag>EFF-1</span><span class='tag measured'>measured</span><span class='tag risk'>quality risk: low</span></div><h3>Cache writes are largely not being read</h3></div><div class=finding-money><b>~$14.60</b><span>avoidable / month</span></div></div><div class=finding-body><div><div class=block-label>Evidence</div><p>Prefix efficiency is 17%: of every 100 tokens written to cache, 17 are later read. A write bills above the standard input rate, so the unread remainder is a pure premium paid for nothing.</p></div><div><div class=block-label>Action</div><div class=fix>Find what invalidates the prefix between requests before changing any TTL. A longer lifetime on an unstable prefix buys nothing.</div></div></div></article>
+<article class='finding high'><div class=finding-head><div><div class=badges><span class=tag>CAC-1</span><span class='tag measured'>measured</span><span class='tag risk'>quality risk: low</span></div><h3>Caching costs more here than sending the prompts uncached</h3></div></div><div class=finding-body><div><div class=block-label>Evidence</div><p>Cache reads and writes are 99% of input spend across 286 priced requests. That share on its own says nothing about whether caching is working -- reads bill at a tenth of the input rate, so they dominate a bill only when the volume behind them is large. The counterfactual is what settles it: the same traffic sent uncached would cost 1.0x what it does now, so caching is adding 5% to input spend. Of the cache spend itself, 2% is reads. A session that extends its prefix rather than rebuilding it tends to run near 75%, so a lower share is worth looking into -- but it is a hint and not a finding, because a workload whose turns add a lot relative to the prefix (large tool results) moves toward even without rebuilding anything. REB-1 counts rebuilds directly and is what settles it.</p></div><div><div class=block-label>Action</div><div class=fix>Stop writing caches that nothing reads before tuning anything else.</div></div></div></article>
+<article class='finding medium'><div class=finding-head><div><div class=badges><span class=tag>MIN-1</span><span class='tag measured'>measured</span><span class='tag risk'>quality risk: low</span></div><h3>Cache markers on prefixes below the model minimum</h3></div></div><div class=finding-body><div><div class=block-label>Evidence</div><p>40 requests carry a cache marker on a prefix shorter than the 4,096-token minimum for claude-haiku-4-5, and returned zero cached tokens in both directions. The provider processes these uncached and reports no error, so nothing surfaces this in normal monitoring.</p></div><div><div class=block-label>Action</div><div class=fix>Either lengthen the cached prefix past 4,096 tokens or drop the marker. Minimums are not monotonic across model generations, so this must be looked up per model rather than reasoned about.</div></div></div></article>
+<div class=total><span class=amount>$229</span><span class=note>per month, modeled pessimistically. Findings overlap, so this is an upper bound on the sum, not a promise.</span><span class='tag modeled'>modeled</span></div>
+</div></section>
+<section class=section><div class=section-head><div><div class=label>04 / Standing</div><h2>What each number means.</h2></div><p>The report separates observations from projections. A modeled number is useful, but it is not proof that savings appeared after a change.</p></div><table><thead><tr><th>Class</th><th>Means</th></tr></thead><tbody><tr><td>Measured</td><td>Computed from usage fields actually returned by the API.</td></tr><tr><td>Modeled</td><td>Projected from those measurements under stated assumptions.</td></tr><tr><td>Verified</td><td>Observed in production after a change shipped. No figure in this report is verified, because this engagement changed nothing.</td></tr></tbody></table>
+</section>
+<footer>Analysis ran locally. No prompt content left the environment; segments are identified by keyed hash, not content. KCG Consulting LLC</footer></main></body></html>

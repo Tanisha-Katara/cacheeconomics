@@ -1,0 +1,173 @@
+{
+  "artifact": "ttl-experiment-evidence",
+  "artifact_version": 1,
+  "run_id": "20260728T182814Z",
+  "started": "2026-07-28T18:28:14.904779+00:00",
+  "script": "ttl_experiment.py",
+  "script_sha256": null,
+  "script_hash_provenance": "UNVERIFIABLE: this run predates run-time script hashing, so the code that produced these rows cannot be identified",
+  "model": "claude-sonnet-4-6",
+  "prefix_tokens_requested": 20000,
+  "prefix_tokens_cached": 16442,
+  "min_cacheable_tokens": 1024,
+  "base_rate_usd_per_mtok": 3.0,
+  "base_rate_priced_on": "2026-07-28",
+  "base_rate_source": "date-effective table",
+  "multipliers": {
+    "write_5m": 1.25,
+    "write_1h": 2.0,
+    "read": 0.1
+  },
+  "schedule": [
+    [
+      "t0-write",
+      0,
+      "WRITE",
+      "WRITE"
+    ],
+    [
+      "expiry-1",
+      420,
+      "MISS",
+      "HIT"
+    ],
+    [
+      "control",
+      480,
+      "HIT",
+      "HIT"
+    ],
+    [
+      "expiry-2",
+      900,
+      "MISS",
+      "HIT"
+    ]
+  ],
+  "validation": {
+    "timing_violations": [],
+    "expectation_anomalies": [],
+    "valid": true
+  },
+  "calls": [
+    {
+      "tag": "t0-write",
+      "ttl": "5m",
+      "expected": "WRITE",
+      "verdict": "WRITE",
+      "planned_offset_s": null,
+      "actual_offset_s": 0.0,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 16442,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 1.974,
+      "cost_usd": 0.061676
+    },
+    {
+      "tag": "t0-write",
+      "ttl": "1h",
+      "expected": "WRITE",
+      "verdict": "WRITE",
+      "planned_offset_s": null,
+      "actual_offset_s": 1.975,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 16442,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 1.335,
+      "cost_usd": 0.09867
+    },
+    {
+      "tag": "expiry-1",
+      "ttl": "5m",
+      "expected": "MISS",
+      "verdict": "MISS",
+      "planned_offset_s": null,
+      "actual_offset_s": 420.013,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 16442,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 2.39,
+      "cost_usd": 0.061676
+    },
+    {
+      "tag": "expiry-1",
+      "ttl": "1h",
+      "expected": "HIT",
+      "verdict": "HIT",
+      "planned_offset_s": null,
+      "actual_offset_s": 422.405,
+      "cache_read_input_tokens": 16442,
+      "cache_creation_input_tokens": 0,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 1.164,
+      "cost_usd": 0.004951
+    },
+    {
+      "tag": "control",
+      "ttl": "5m",
+      "expected": "HIT",
+      "verdict": "HIT",
+      "planned_offset_s": null,
+      "actual_offset_s": 480.005,
+      "cache_read_input_tokens": 16442,
+      "cache_creation_input_tokens": 0,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 1.183,
+      "cost_usd": 0.004951
+    },
+    {
+      "tag": "control",
+      "ttl": "1h",
+      "expected": "HIT",
+      "verdict": "HIT",
+      "planned_offset_s": null,
+      "actual_offset_s": 481.19,
+      "cache_read_input_tokens": 16442,
+      "cache_creation_input_tokens": 0,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 1.17,
+      "cost_usd": 0.004951
+    },
+    {
+      "tag": "expiry-2",
+      "ttl": "5m",
+      "expected": "MISS",
+      "verdict": "MISS",
+      "planned_offset_s": null,
+      "actual_offset_s": 900.063,
+      "cache_read_input_tokens": 0,
+      "cache_creation_input_tokens": 16442,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 2.323,
+      "cost_usd": 0.061676
+    },
+    {
+      "tag": "expiry-2",
+      "ttl": "1h",
+      "expected": "HIT",
+      "verdict": "HIT",
+      "planned_offset_s": null,
+      "actual_offset_s": 902.388,
+      "cache_read_input_tokens": 16442,
+      "cache_creation_input_tokens": 0,
+      "input_tokens": 6,
+      "output_tokens": 0,
+      "latency_s": 1.726,
+      "cost_usd": 0.004951
+    }
+  ],
+  "totals_usd": {
+    "5m": 0.189977,
+    "1h": 0.113522
+  },
+  "delta_usd": 0.076455,
+  "delta_pct": 40.24,
+  "scope": "Measured for this gap schedule and prefix size only. Extrapolation to any real workload is modeled, not measured."
+}
