@@ -240,6 +240,16 @@ class TraceSet:
     # take part in a counterfactual; anything less means some cannot, and the
     # difference has to be stated rather than averaged away.
     structural_coverage: float = 1.0
+    # Share of structured requests whose segment tokens were *counted* rather
+    # than divided up by byte share. See `tokens_are_counted`.
+    #
+    # Defaults to counted because estimation happens in the *loaders* and
+    # nowhere else: a TraceSet built directly carries whatever tokens its caller
+    # put in the segments, and inventing doubt about those would be the tool
+    # second-guessing its own input. Both loaders set this from evidence --
+    # `segment_tokens` on the body path, a per-row flag on the trace path -- and
+    # both default it to zero when the evidence is absent.
+    tokens_counted: float = 1.0
     # False when segment token sums do not agree with the tokens the provider
     # billed. Structure is still usable for identity; it is not usable for money.
     token_sums_reconciled: bool = True
@@ -262,6 +272,31 @@ class TraceSet:
     @property
     def analysable(self) -> list[Request]:
         return [r for r in self.requests if r.has_usage and r.status == 200]
+
+    @property
+    def tokens_are_counted(self) -> bool:
+        """Whether segment sizes are counted, or divided up by byte share.
+
+        `_scale_to_measured` splits the billed input total between segments in
+        proportion to their bytes. Measured against the provider's own
+        tokenizer, that split lands at 19.2% median error per segment and 181%
+        at worst, because dense JSON tool schemas run about 2.74 bytes per token
+        where English prose runs 5.22.
+
+        Every structural finding is costed from those sizes, and this package
+        refuses to publish spend that reconciles worse than 5%. Holding the
+        invoice to 5% while costing a recommendation from a 19% split is not a
+        standard, it is two standards. `checks.ESTIMATE_BAND` already made the
+        same call for the static linter: inside the band an estimate cannot
+        decide the question, so it abstains.
+
+        Both loaders estimate, so this is not an INFERRED-only concern -- the
+        recorder runs `_scale_to_measured` on its own captures too.
+
+        A trace that does not say is treated as estimated, because that is what
+        every trace written before counting existed actually is.
+        """
+        return self.tokens_counted >= PUBLISH_TOLERANCE_COUNTED
 
     @property
     def excluded_billed(self) -> dict:
@@ -478,6 +513,12 @@ TOKEN_SUM_FACTOR = 2.0
 # sit at 1.000000. A ratio outside this band means the structure and the usage
 # counters are describing different prompts, and only one of them can be right.
 PUBLISH_TOLERANCE = 0.05
+
+# Share of structured requests that must carry counted tokens before a
+# structural figure is money. Effectively all of them: a trace where some
+# requests are counted and some are guessed produces a figure that is part
+# measurement and part 19% error, with nothing saying which part.
+PUBLISH_TOLERANCE_COUNTED = 0.99
 
 
 def _billed_input(usage: dict) -> int:
@@ -1074,8 +1115,23 @@ def load_jsonl(path: str, key: bytes | None = None, *,
             f"{unparseable} line(s) could not be parsed as JSON and are not represented "
             f"anywhere below. Figures describe the {len(requests):,} rows that did parse.")
 
+    # A normalised trace says so per row, and the recorder has been saying it
+    # since it was written: `tokens_are_estimated: True` is stamped on every row
+    # it emits, with a comment explaining that nothing downstream should mistake
+    # a proportional estimate for a counted quantity. Nothing downstream read
+    # it. An explicit denial wins over an explicit affirmation, and absent means
+    # estimated -- which is what every trace written before counting existed
+    # actually is.
+    def _counted(r):
+        if r.get("tokens_are_estimated") is True:
+            return False
+        return r.get("tokens_counted") is True
+
+    counted_rows = sum(1 for r in rows if _counted(r))
+    structured_rows = sum(1 for r in rows if _segment_list(r)) or 1
     return TraceSet(requests=requests, tier=tier, alignment=alignment,
                     source=path, notes=notes,
+                    tokens_counted=counted_rows / structured_rows,
                     structural_coverage=structural_coverage,
                     token_sums_reconciled=token_sums_reconciled,
                     token_sums_publishable=token_sums_publishable,

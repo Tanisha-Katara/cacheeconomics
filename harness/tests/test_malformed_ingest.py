@@ -258,7 +258,11 @@ class TestSegmentSizesMustAgreeWithWhatWasBilled(unittest.TestCase):
                       "cache_marked": False, "ttl": None},
                      {"id": self.HMAC + "b" * 64, "role": "system",
                       "tokens": seg_tokens, "index": 1, "label": "instructions",
-                      "cache_marked": True, "ttl": "5m"}]}
+                      "cache_marked": True, "ttl": "5m"}],
+                 # Authored sizes, so they are the ground truth here rather than
+                 # a byte-share guess. This suite is about sizes agreeing with
+                 # the billed total, not about where they came from.
+                 "tokens_counted": True}
                 for i in range(n)]
 
     def _analyse(self, seg_tokens):

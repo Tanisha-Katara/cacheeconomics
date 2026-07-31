@@ -292,6 +292,7 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
     return TraceSet(requests=requests, tier=Tier.INFERRED, alignment=None,
                     source=path, notes=notes,
                     structural_coverage=(segmented / len(requests)) if requests else 0.0,
+                    tokens_counted=(counted / segmented) if segmented else 0.0,
                     skipped_rows=unparseable + dropped_no_body)
 
 

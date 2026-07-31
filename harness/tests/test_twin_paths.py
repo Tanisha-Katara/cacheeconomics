@@ -1582,3 +1582,87 @@ class TestAKeyIsOnlyRequiredWhereSomethingIsHashed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStructuralMoneyNeedsCountedTokens(unittest.TestCase):
+    """The tool held its own spend to 5% and costed recommendations from 19%.
+
+    `_scale_to_measured` divides the billed input total between segments by byte
+    share. Measured against the provider's own tokenizer: 19.2% median error per
+    segment, 181% worst. Every structural finding is costed from that split,
+    while `PUBLISH_TOLERANCE` refuses to publish spend reconciling worse than
+    5%. Two standards, and the looser one was on the number nobody could check.
+
+    Not an INFERRED-only problem: the recorder runs the same estimator over its
+    own captures, and had been stamping `tokens_are_estimated: True` on every
+    row it wrote since it was written. Nothing read it.
+    """
+
+    def _trace(self, **kw):
+        segs = [Segment(id=f"vol{{i}}", role="system", tokens=400, index=0),
+                Segment(id="tools", role="tools", tokens=30000, index=1,
+                        cache_marked=True, ttl="5m"),
+                Segment(id="turn", role="user", tokens=200, index=2)]
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
+                        model="claude-opus-5", agent="a", session="s",
+                        ttl_requested="5m",
+                        usage={"input_tokens": 200, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 30400},
+                        segments=[replace(s, id=f"{s.id}{i}" if s.index == 0 else s.id)
+                                  for s in segs])
+                for i in range(40)]
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x", **kw)
+
+    def _vol(self, ts):
+        a = analyze(ts, allow_unreconciled=True)
+        return next((f for f in a.findings if f.code == "VOL-1"), None)
+
+    def test_estimated_tokens_carry_no_dollar_figure(self):
+        fig = self._vol(self._trace(tokens_counted=0.0)).avoidable_usd_month
+        self.assertFalse(fig.released)
+        self.assertIn("19.2%", fig.withheld_because)
+
+    def test_counted_tokens_do(self):
+        self.assertTrue(self._vol(self._trace(tokens_counted=1.0))
+                        .avoidable_usd_month.released)
+
+    def test_the_finding_still_reports_without_the_figure(self):
+        """Withholding the number must not withhold the diagnosis. The volatile
+        block is real whether or not its size was counted, and a client who is
+        told nothing cannot act on it."""
+        v = self._vol(self._trace(tokens_counted=0.0))
+        self.assertIsNotNone(v)
+        self.assertTrue(v.detail)
+        self.assertIn("count_tokens", v.avoidable_usd_month.withheld_because)
+
+    def test_a_partly_counted_trace_does_not_qualify(self):
+        """Part measurement and part 19% error, with nothing saying which
+        finding drew from which."""
+        self.assertFalse(self._vol(self._trace(tokens_counted=0.5))
+                         .avoidable_usd_month.released)
+
+    def test_the_recorders_own_declaration_is_believed(self):
+        """It stamps `tokens_are_estimated: True` on every row and always has.
+        A loader that ignored it was overriding the only component that knows."""
+        import json
+        import tempfile
+
+        from cacheeconomics.trace import load_jsonl
+        row = {"request_id": "r", "sent_at": T0.isoformat(), "model": "claude-opus-5",
+               "usage": {"input_tokens": 100, "cache_read_input_tokens": 0,
+                         "cache_creation_input_tokens": 9000},
+               "segments": [{"id": "hmac:" + "a" * 64, "role": "system",
+                             "tokens": 9000, "index": 0, "cache_marked": True,
+                             "ttl": "5m"}]}
+        for flags, expected in (({"tokens_are_estimated": True}, False),
+                                ({"tokens_counted": True}, True),
+                                ({}, False),
+                                # An explicit denial beats an affirmation.
+                                ({"tokens_are_estimated": True,
+                                  "tokens_counted": True}, False)):
+            with self.subTest(flags=flags):
+                fh = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+                fh.write(json.dumps(dict(row, **flags)) + "\n")
+                fh.close()
+                self.addCleanup(os.unlink, fh.name)
+                self.assertIs(load_jsonl(fh.name).tokens_are_counted, expected)

@@ -1407,8 +1407,16 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     # Reading the coarse flag here was the same defect as the bake-off's, one
     # module along.
     sums_ok = getattr(ts, "token_sums_publishable", True)
+    # Segment sizes have to be counted, not guessed, before they are money.
+    # `_scale_to_measured` divides the billed total by byte share, which
+    # measured at 19.2% median error per segment and 181% worst against the
+    # provider's own tokenizer. This package refuses to publish spend that
+    # reconciles worse than 5%; costing a recommendation from a 19% split while
+    # holding the invoice to 5% is two standards, not one.
+    tokens_counted = getattr(ts, "tokens_are_counted", False)
     structure_trusted = (aligned and covered >= ALIGNMENT_FLOOR
-                         and covered_billed >= ALIGNMENT_FLOOR and sums_ok)
+                         and covered_billed >= ALIGNMENT_FLOOR and sums_ok
+                         and tokens_counted)
     struct_why = ""
     if not sums_ok:
         struct_why = (
@@ -1425,6 +1433,16 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             f"only {covered:.0%} of requests carry prompt structure, below the "
             f"{ALIGNMENT_FLOOR:.0%} floor. The requests without it cannot support a "
             f"structural claim, and they may be the ones that would change it")
+    elif not tokens_counted:
+        struct_why = (
+            "segment token counts are estimated rather than counted: the billed "
+            "total is divided between segments in proportion to their bytes, which "
+            "measures 19.2% off at the median and 181% at worst against the "
+            "provider's own tokenizer, because dense JSON tool schemas run about "
+            "2.74 bytes per token where prose runs 5.22. Every figure here would be "
+            "costed from that split, and this report will not publish spend that "
+            "reconciles worse than 5%. Run tier-b/count_tokens.py over the export "
+            "and the same figures become measurements")
     elif not structure_trusted:
         # Rows look fine and the money does not. This is the branch a row count
         # cannot reach, and the one worth spelling out: the reader is holding a
