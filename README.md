@@ -52,20 +52,12 @@ class split the tool will tell you it cannot read the rows rather than guess.
 
 Request bodies your gateway already logs. Langfuse, Helicone and the LiteLLM
 proxy all keep full bodies. This is the first path that can answer "what would a
-different prompt layout have cost", because it can see prompt structure.
-
-On this path the tool has to say how many tokens each part of your prompt is
-worth, and it cannot count them offline: there is no local tokenizer for these
-models. By default it divides your billed total between the segments in
-proportion to their bytes, and measured against the provider's own tokenizer
-that split is off by 19.2% at the median and 181% at worst, because dense JSON
-tool schemas run about 2.74 bytes per token where English prose runs 5.22. Every
-structural finding is costed from it. `tier-b/count_tokens.py` replaces the
-estimate with exact counts and brings the same measurement to 0.2%; it is a
-separate script because it talks to the provider and the analyzer does not.
+different prompt layout have cost", because it can see prompt structure. It
+needs the counting step below before those answers carry dollar figures.
 
 An instrumented capture, using the recorder in this package. Needs a small code
-change on your side and gives the strongest answers.
+change on your side and gives the strongest answers about structure. It needs
+the counting step too: the recorder measures bytes like everything else.
 
 The file you have decides what the tool will claim. It works this out from the
 contents, not from what you tell it, so an export cannot ask for more confidence
@@ -118,6 +110,58 @@ check" is not "this passed", and collapsing them gives you a green build where
 the check that catches silently-ignored cache markers never ran. Exit 1 means the
 tool itself broke.
 
+## Counting the tokens
+
+Skip this and you still get every finding. You just will not get a dollar figure
+on the ones about prompt structure.
+
+Here is why. To say "34,000 tokens sit behind that volatile block" the tool has
+to know how many tokens each part of your prompt is worth, and it cannot count
+them on your machine: there is no local tokenizer for these models. So by
+default it takes the input total your provider billed and divides it between the
+segments in proportion to their bytes.
+
+That split is worse than it sounds. Measured against the provider's own
+tokenizer, it is off by 19.2% at the median and 181% at worst, because
+bytes-per-token is not one number: dense JSON tool schemas run about 2.74 bytes
+per token where English prose runs 5.22. A prompt mixing them, which is every
+agent prompt, gets the prose over-allocated and the tools starved at the same
+time. The per-segment rows are in `tier-b/evidence/inferred-token-split.json`.
+
+This report will not publish spend that reconciles worse than 5% against your
+invoice. Costing a recommendation from a 19% split while holding the invoice to
+5% would be two standards, so structural findings arrive without figures until
+the sizes are counted.
+
+Counting them takes one command:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+python3 tier-b/count_tokens.py bodies.jsonl -o bodies-counted.jsonl
+cacheeconomics analyze bodies-counted.jsonl --from bodies --invoice-usd 4820.16
+```
+
+The same measurement against the same tokenizer then lands at 0.2%.
+
+Three things worth knowing before you run it.
+
+It is free and it is fast, because the endpoint costs nothing and the work is
+cached on the prefix. Counting a prefix once covers every request that shares
+it, which is every request, because a prefix that is not shared is not being
+cached in the first place. On the demo trace 286 requests needed 345 calls. The
+cache is written next to the output, so a second run costs nothing at all.
+
+It sends prompt content to Anthropic. If your workload already runs on Anthropic
+that is the same content over the same wire to the same company. If it runs on
+Bedrock or Vertex it is a new egress path to a different vendor, and that is a
+decision to make on purpose rather than discover afterwards.
+
+It is a separate script rather than a flag, deliberately. The installed package
+imports no network library at all and a test asserts it, because zero egress is
+the thing a client is trusting when they hand over a trace, and they can check
+it by grepping the wheel. A flag would have made that claim depend on reading
+the flag's implementation.
+
 ## What it refuses to tell you
 
 This part matters more than the analysis, because it is what makes the analysis
@@ -145,6 +189,11 @@ so the rates are not ours to publish and we do not borrow Anthropic's. Pass
 `--effective-rate` from your own cloud bill, which is the better number anyway:
 partner rates vary by region and endpoint type, and nobody at your volume pays
 list.
+
+Structural findings need counted sizes. A recommendation to move a block of
+your prompt is costed from how many tokens that block is, and a byte-share
+estimate of that is 19.2% off at the median. Those findings still report; their
+dollar figures wait for `tier-b/count_tokens.py`.
 
 Every number says what kind of number it is. Measured means observed in usage
 fields. Modeled means projected, always as a range, with the pessimistic end as
