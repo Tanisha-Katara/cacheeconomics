@@ -1,0 +1,232 @@
+{
+  "artifact": "inferred-token-split",
+  "artifact_version": 1,
+  "model": "claude-haiku-4-5",
+  "method": "count_tokens at segment boundaries",
+  "cases": [
+    {
+      "case": "prose-heavy system, no tools",
+      "real_total": 999,
+      "estimated_total": 999,
+      "segments": [
+        {
+          "index": 0,
+          "role": "system",
+          "label": "system[0]",
+          "estimated_tokens": 995,
+          "real_tokens": 985
+        },
+        {
+          "index": 1,
+          "role": "user",
+          "label": "user",
+          "estimated_tokens": 4,
+          "real_tokens": 8
+        }
+      ]
+    },
+    {
+      "case": "dense JSON tools beside prose",
+      "real_total": 2095,
+      "estimated_total": 2095,
+      "segments": [
+        {
+          "index": 0,
+          "role": "tools",
+          "label": "tool[0]",
+          "estimated_tokens": 356,
+          "real_tokens": 845
+        },
+        {
+          "index": 1,
+          "role": "tools",
+          "label": "tool[1]",
+          "estimated_tokens": 342,
+          "real_tokens": 335
+        },
+        {
+          "index": 2,
+          "role": "tools",
+          "label": "tool[2]",
+          "estimated_tokens": 250,
+          "real_tokens": 239
+        },
+        {
+          "index": 3,
+          "role": "system",
+          "label": "system[0]",
+          "estimated_tokens": 1139,
+          "real_tokens": 658
+        },
+        {
+          "index": 4,
+          "role": "user",
+          "label": "user",
+          "estimated_tokens": 8,
+          "real_tokens": 12
+        }
+      ]
+    },
+    {
+      "case": "tools dominate",
+      "real_total": 3591,
+      "estimated_total": 3591,
+      "segments": [
+        {
+          "index": 0,
+          "role": "tools",
+          "label": "tool[0]",
+          "estimated_tokens": 538,
+          "real_tokens": 982
+        },
+        {
+          "index": 1,
+          "role": "tools",
+          "label": "tool[1]",
+          "estimated_tokens": 538,
+          "real_tokens": 486
+        },
+        {
+          "index": 2,
+          "role": "tools",
+          "label": "tool[2]",
+          "estimated_tokens": 538,
+          "real_tokens": 486
+        },
+        {
+          "index": 3,
+          "role": "tools",
+          "label": "tool[3]",
+          "estimated_tokens": 538,
+          "real_tokens": 486
+        },
+        {
+          "index": 4,
+          "role": "tools",
+          "label": "tool[4]",
+          "estimated_tokens": 538,
+          "real_tokens": 486
+        },
+        {
+          "index": 5,
+          "role": "tools",
+          "label": "tool[5]",
+          "estimated_tokens": 538,
+          "real_tokens": 486
+        },
+        {
+          "index": 6,
+          "role": "system",
+          "label": "system[0]",
+          "estimated_tokens": 354,
+          "real_tokens": 166
+        },
+        {
+          "index": 7,
+          "role": "user",
+          "label": "user",
+          "estimated_tokens": 9,
+          "real_tokens": 7
+        }
+      ]
+    },
+    {
+      "case": "long identifiers, low bytes-per-token",
+      "real_total": 3429,
+      "estimated_total": 3429,
+      "segments": [
+        {
+          "index": 0,
+          "role": "system",
+          "label": "system[0]",
+          "estimated_tokens": 925,
+          "real_tokens": 329
+        },
+        {
+          "index": 1,
+          "role": "system",
+          "label": "system[1]",
+          "estimated_tokens": 2491,
+          "real_tokens": 3082
+        },
+        {
+          "index": 2,
+          "role": "user",
+          "label": "user",
+          "estimated_tokens": 13,
+          "real_tokens": 12
+        }
+      ]
+    },
+    {
+      "case": "multi-turn with tool results",
+      "real_total": 1509,
+      "estimated_total": 1509,
+      "segments": [
+        {
+          "index": 0,
+          "role": "tools",
+          "label": "tool[0]",
+          "estimated_tokens": 341,
+          "real_tokens": 795
+        },
+        {
+          "index": 1,
+          "role": "system",
+          "label": "system[0]",
+          "estimated_tokens": 959,
+          "real_tokens": 494
+        },
+        {
+          "index": 2,
+          "role": "user",
+          "label": "user",
+          "estimated_tokens": 6,
+          "real_tokens": 7
+        },
+        {
+          "index": 3,
+          "role": "assistant",
+          "label": "assistant:text",
+          "estimated_tokens": 20,
+          "real_tokens": 12
+        },
+        {
+          "index": 4,
+          "role": "user",
+          "label": "user:text",
+          "estimated_tokens": 175,
+          "real_tokens": 188
+        },
+        {
+          "index": 5,
+          "role": "user",
+          "label": "user",
+          "estimated_tokens": 8,
+          "real_tokens": 7
+        }
+      ]
+    },
+    {
+      "case": "tiny prompt, near the minimum",
+      "real_total": 91,
+      "estimated_total": 91,
+      "segments": [
+        {
+          "index": 0,
+          "role": "system",
+          "label": "system[0]",
+          "estimated_tokens": 91,
+          "real_tokens": 83
+        },
+        {
+          "index": 1,
+          "role": "user",
+          "label": "user",
+          "estimated_tokens": 0,
+          "real_tokens": 2
+        }
+      ]
+    }
+  ]
+}
