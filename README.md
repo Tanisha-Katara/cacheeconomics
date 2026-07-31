@@ -273,13 +273,19 @@ the Anthropic table and produced a confident total no AWS bill would match.
 `plugin.py` can sit inside a LiteLLM proxy and place cache markers on outgoing
 requests. It observes by default and only mutates when you ask.
 
-The observing half is tested here. The mutating half is not: nothing in this
-repository has watched a real LiteLLM proxy forward one of these requests, so we
-do not know whether `cache_control` on a message content block survives LiteLLM's
-translation to the Anthropic wire format. If it gets stripped you would get churn
-and no cache writes while the plugin's own counters cheerfully reported
-placements that never arrived. That is why `mutate` defaults to False and why
-this paragraph exists.
+Both halves have now been watched against a real LiteLLM. The worry was that
+LiteLLM normalises Anthropic-shaped bodies through an OpenAI-shaped intermediate
+and drops `cache_control`, which would give you churn and no cache writes while
+the plugin's own counters cheerfully reported placements that never arrived.
+
+It does not. On litellm 1.83.9, an unmarked control writes nothing, a marked
+call writes 15,624 tokens, the same body a moment later reads all 15,624 back,
+and a request routed through the handler with `mutate=True` writes too. The runs
+are in `tier-b/evidence/litellm-marker-survival.json` and the script starts cold
+each time, so you can repeat it.
+
+`mutate` still defaults to False. Knowing the mechanism works is not the same as
+deciding to rewrite somebody's live traffic, and that second decision is yours.
 
 ## Development
 

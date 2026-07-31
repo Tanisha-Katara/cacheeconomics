@@ -1,0 +1,64 @@
+{
+  "artifact": "litellm-marker-survival",
+  "artifact_version": 1,
+  "litellm": "1.83.9",
+  "model": "claude-haiku-4-5",
+  "marker_survives": true,
+  "entry_readable": true,
+  "calls": [
+    {
+      "tag": "1 control, no marker",
+      "at": "2026-07-31T21:32:54.489491+00:00",
+      "usage": {
+        "prompt_tokens": 15635,
+        "completion_tokens": 16,
+        "cached_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      },
+      "creation": 0,
+      "read": 0
+    },
+    {
+      "tag": "2 marked",
+      "at": "2026-07-31T21:32:55.754104+00:00",
+      "usage": {
+        "prompt_tokens": 15635,
+        "completion_tokens": 16,
+        "cached_tokens": 0,
+        "cache_creation_tokens": 15624,
+        "cache_creation_input_tokens": 15624,
+        "cache_read_input_tokens": 0
+      },
+      "creation": 15624,
+      "read": 0
+    },
+    {
+      "tag": "3 marked again (reuse)",
+      "at": "2026-07-31T21:33:00.087727+00:00",
+      "usage": {
+        "prompt_tokens": 15635,
+        "completion_tokens": 16,
+        "cached_tokens": 15624,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 15624
+      },
+      "creation": 0,
+      "read": 15624
+    },
+    {
+      "tag": "4 via plugin, sent",
+      "at": "2026-07-31T21:33:46.322104+00:00",
+      "usage": {
+        "prompt_tokens": 15635,
+        "completion_tokens": 16,
+        "cached_tokens": 15624,
+        "cache_creation_tokens": 8,
+        "cache_creation_input_tokens": 8,
+        "cache_read_input_tokens": 15624
+      },
+      "creation": 8,
+      "read": 15624
+    }
+  ]
+}

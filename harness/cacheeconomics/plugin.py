@@ -667,18 +667,24 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
     monitor raises -- and hands LiteLLM back the request it was given. That half
     is verified here and cannot break a request, because it changes nothing.
 
-    `mutate=True` puts `cache_control` on the wire, and that half is not
-    verified. Nothing in this repository has watched a real LiteLLM proxy
-    forward one of these requests. Two things have to be confirmed before it is
-    worth enabling: whether `cache_control` on a message content block survives
-    LiteLLM's translation to the Anthropic wire format, and what `data` holds
-    for a passthrough Anthropic call. If the field is stripped, the result is
-    churn and no cache writes, while the plugin's own effectiveness counters
-    report confidently on placements that never reached the provider.
+    `mutate=True` puts `cache_control` on the wire. That half was unverified
+    for most of this file's life, on the specific worry that LiteLLM normalises
+    Anthropic-shaped bodies through an OpenAI-shaped intermediate and might drop
+    the field -- which would mean churn, no cache writes, and effectiveness
+    counters reporting confidently on placements that never arrived.
 
-    Defaulting to mutate would mean shipping a live request rewriter on a path
-    this file's own docstring says is unconfirmed. The tests here prove a dict
-    comes back, which is not the same as proving a marker arrives.
+    It has now been watched. `tier-b/litellm_marker_survival.py` sends four real
+    calls through litellm 1.83.9 and reads the provider's own counters back: an
+    unmarked control writes nothing, a marked call writes 15,624 tokens, the
+    same body a moment later reads 15,624, and a request that went through this
+    handler with `mutate=True` also writes. Evidence in
+    `tier-b/evidence/litellm-marker-survival.json`, and the script starts from a
+    cold cache on every run so it can be repeated.
+
+    So the marker survives, and the entry it writes is readable. `mutate` still
+    defaults to False, because that is a decision about rewriting somebody's
+    live traffic rather than a question about whether the mechanism works, and
+    the answer to the second one does not settle the first.
 
     Markers are placed on `messages` only. LiteLLM carries OpenAI-shaped tool
     definitions and translates them, and whether a `cache_control` key survives
