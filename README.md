@@ -54,6 +54,16 @@ Request bodies your gateway already logs. Langfuse, Helicone and the LiteLLM
 proxy all keep full bodies. This is the first path that can answer "what would a
 different prompt layout have cost", because it can see prompt structure.
 
+On this path the tool has to say how many tokens each part of your prompt is
+worth, and it cannot count them offline: there is no local tokenizer for these
+models. By default it divides your billed total between the segments in
+proportion to their bytes, and measured against the provider's own tokenizer
+that split is off by 19.2% at the median and 181% at worst, because dense JSON
+tool schemas run about 2.74 bytes per token where English prose runs 5.22. Every
+structural finding is costed from it. `tier-b/count_tokens.py` replaces the
+estimate with exact counts and brings the same measurement to 0.2%; it is a
+separate script because it talks to the provider and the analyzer does not.
+
 An instrumented capture, using the recorder in this package. Needs a small code
 change on your side and gives the strongest answers.
 

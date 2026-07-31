@@ -30,8 +30,9 @@ from datetime import datetime
 from ..segment import (_billed_input, _requested_ttl, _scale_to_measured,
                        segments_from_request, usage_from_response)
 
-from ..trace import (Segment, Tier, TraceSet, _parse_ts, request_from_row,
-                     resolve_tenant)
+from ..tokenizer import apply_counts
+from ..trace import (Segment, Tier, TraceSet, _is_token_count, _parse_ts,
+                     request_from_row, resolve_tenant)
 
 # Where the request body and the response live in each export shape. Checked in
 # order; the first that yields a dict with `messages` wins. Adding a format is a
@@ -144,6 +145,8 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
 
     requests, notes = [], []
     skipped_no_body = unparseable = dropped_no_body = 0
+    counted = uncounted = 0
+    count_errors: list = []
     renamed: dict = {}
     with open(path) as f:
         rows = []
@@ -198,6 +201,25 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
             # prompts shared an id -- the leak the scoping exists to close,
             # reintroduced by the commit that closed it.
             segs = segments_from_request(body, key, resolve_tenant(row, tenant))
+            # Exact counts when the operator asked for them. Without this the
+            # split is by byte share, which measured at 19.2% median error per
+            # segment against the provider's own tokenizer -- dense tool schemas
+            # starved, prose over-allocated, in opposite directions inside one
+            # request. `_scale_to_measured` still runs afterwards, so the billed
+            # total stays the authority; counting only makes the division right.
+            # Exact counts, if the export was enriched with them. `count_tokens.py`
+            # writes `segment_tokens` after asking the provider's own tokenizer
+            # what each prefix costs; this package never makes that call itself.
+            # Without them the split is by byte share, which measured at 19.2%
+            # median error per segment -- dense tool schemas starved, prose
+            # over-allocated, in opposite directions inside one request.
+            pre = row.get("segment_tokens")
+            if isinstance(pre, list) and len(pre) == len(segs) and all(
+                    _is_token_count(n) for n in pre):
+                apply_counts(segs, pre)
+                counted += 1
+            elif pre is not None:
+                uncounted += 1
             _scale_to_measured(segs, _billed_input(usage) if usage else None)
         requests.append(request_from_row(
             row,
@@ -229,9 +251,33 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
         f"{segmented:,} of {len(requests):,} requests carried a body and were segmented "
         f"post hoc. Segment boundaries are inferred from the logged body, not recorded "
         f"at source.")
-    notes.append(
-        "Token counts are proportional estimates scaled to the billed input total, not "
-        "counted. Structural findings inherit that.")
+    if counted and not uncounted:
+        notes.append(
+            f"Segment token counts are exact for all {counted:,} request(s): each was "
+            f"counted by the provider's own tokenizer in the context it appears in, "
+            f"then scaled to the billed input total. Structural findings inherit that "
+            f"rather than the proportional estimate, whose median error measured 19.2% "
+            f"per segment.")
+    # Reported whenever any row carried counts that could not be used, not only
+    # when some other row's did. A `segment_tokens` array that matches nothing
+    # means the enrichment step ran and did not take -- and if every row is like
+    # that, `counted` is zero and this is the only thing that would say so.
+    if uncounted:
+        notes.append(
+            f"{uncounted:,} request(s) carried a `segment_tokens` array that did not "
+            f"match their segments -- wrong length, or a value that is not a token "
+            f"count -- so they were estimated instead. That usually means the export "
+            f"was re-segmented after counting; re-run tier-b/count_tokens.py against "
+            f"this file.")
+    if not counted:
+        notes.append(
+            "Token counts are proportional estimates scaled to the billed input total, "
+            "not counted: each segment gets a share of the billed total in proportion "
+            "to its bytes. Measured against the provider's tokenizer that split has a "
+            "median error of 19.2% per segment and a worst case of 181%, because dense "
+            "JSON tool schemas run about 2.74 bytes per token where English prose runs "
+            "5.22. Structural findings inherit that error. Run tier-b/count_tokens.py "
+            "to replace the estimate with exact counts.")
     if unparseable:
         notes.append(
             f"{unparseable} line(s) could not be parsed as JSON and are not represented "

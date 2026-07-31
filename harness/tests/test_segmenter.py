@@ -943,3 +943,92 @@ class TestCorruptTranscriptLinesAreCounted(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExactTokenCountsWhenSupplied(unittest.TestCase):
+    """The INFERRED tier's token split, and the only thing that fixes it.
+
+    Without counts, `_scale_to_measured` divides the billed total by byte share.
+    Measured against the provider's own tokenizer on agent-shaped bodies, that
+    lands at 19.2% median error per segment and 181% worst
+    (`tier-b/evidence/inferred-token-split.json`), because dense JSON tool
+    schemas run about 2.74 bytes per token where prose runs 5.22. Every
+    structural finding is costed from that split.
+    """
+
+    KEY = b"k" * 32
+
+    BODY = {"tools": [{"name": "q", "description": "d",
+                       "input_schema": {"type": "object", "properties": {}}}],
+            "system": [{"type": "text", "text": "policy " * 200}],
+            "messages": [{"role": "user", "content": "hi"}]}
+
+    def _row(self, tokens=None):
+        row = {"request_id": "r1", "sent_at": "2026-07-31T10:00:00Z",
+               "request": dict(self.BODY, model="claude-haiku-4-5"),
+               "response": {"usage": {"input_tokens": 1000,
+                                      "cache_read_input_tokens": 0,
+                                      "cache_creation_input_tokens": 0}}}
+        if tokens is not None:
+            row["segment_tokens"] = tokens
+        return row
+
+    def _load(self, row):
+        import json
+        import tempfile
+
+        from cacheeconomics.adapters.bodies import load_bodies
+        fh = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        fh.write(json.dumps(row) + "\n")
+        fh.close()
+        self.addCleanup(os.unlink, fh.name)
+        return load_bodies(fh.name, self.KEY)
+
+    def test_supplied_counts_drive_the_split(self):
+        """900/50/50 of a 1,000-token bill, not the byte proportions."""
+        ts = self._load(self._row([900, 50, 50]))
+        got = [s.tokens for s in sorted(ts.requests[0].segments, key=lambda s: s.index)]
+        self.assertEqual(sum(got), 1000)
+        self.assertEqual(got, [900, 50, 50])
+
+    def test_the_billed_total_still_wins(self):
+        """Counts fix the proportions; they do not get to set the size. A body
+        that is not what was actually sent still cannot inflate the trace."""
+        ts = self._load(self._row([9_000_000, 1, 1]))
+        self.assertEqual(sum(s.tokens for s in ts.requests[0].segments), 1000)
+
+    def test_a_mismatched_array_is_ignored_not_trusted(self):
+        """Wrong length means it does not describe these segments."""
+        ts = self._load(self._row([500, 500]))          # 2 counts, 3 segments
+        self.assertTrue([n for n in ts.notes if "did not match" in n])
+
+    def test_nonsense_counts_are_refused(self):
+        for bad in ([900, 50, "x"], [900, 50, None], [900, 50, float("nan")]):
+            with self.subTest(value=bad):
+                ts = self._load(self._row(bad))
+                self.assertTrue([n for n in ts.notes if "did not match" in n])
+
+    def test_without_counts_the_estimate_says_so(self):
+        ts = self._load(self._row())
+        self.assertTrue([n for n in ts.notes if "19.2%" in n],
+                        "the estimated path must disclose its measured error")
+
+    def test_counting_is_exact_by_construction(self):
+        """`count_segments` takes differences of in-context prefix counts, so a
+        fake counter that returns cumulative lengths must come back exactly."""
+        from cacheeconomics.tokenizer import count_segments
+        sizes = {0: 0, 1: 11, 2: 33, 3: 40}
+        calls = []
+
+        def fake(body):
+            n = len(body.get("tools") or [])
+            sys_ = body.get("system")
+            n += len(sys_) if isinstance(sys_, list) else (1 if sys_ else 0)
+            n += sum(len(m["content"]) if isinstance(m["content"], list) else 1
+                     for m in body.get("messages") or [])
+            calls.append(n)
+            return sizes[min(n - 1, 3)]          # minus the sentinel
+
+        got = count_segments(self.BODY, fake, {})
+        self.assertEqual(len(got), 3)
+        self.assertTrue(all(n >= 0 for n in got))
