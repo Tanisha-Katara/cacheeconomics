@@ -6,6 +6,7 @@ Stdlib unittest, no pytest dependency. Run: python3 -m unittest discover tests
 import os
 import sys
 import unittest
+from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -366,6 +367,72 @@ class TestUnpriceableSurfacesAbstain(unittest.TestCase):
             cost.price(cost.Usage(uncached_input=1), "claude-nonexistent-9",
                        target_id="anthropic/direct", on_date="2026-07-29")
         self.assertNotIsInstance(ctx.exception, registry.UnpriceableSurface)
+
+
+class TestDateParsingDoesNotDependOnThePythonVersion(unittest.TestCase):
+    """The same trace must price the same way on every interpreter.
+
+    `_as_date` ran `date.fromisoformat(str(value))`. Python 3.11 taught
+    `fromisoformat` the compact ISO basic form, so the integer 20260801 was
+    refused on 3.9 and parsed as 2026-08-01 on 3.13 -- two different prices for
+    one trace, decided by which Python happened to run it, inside the function
+    whose whole job is date-effective pricing. CI on 3.13 caught it the first
+    time this was pushed somewhere that runs both; 1011 local tests on 3.9 did
+    not.
+
+    So the accepted form is pinned by regex rather than delegated to whatever
+    the standard library accepts this release.
+    """
+
+    def test_only_the_explicit_hyphenated_form_is_a_date(self):
+        self.assertEqual(registry._as_date("2026-08-01"), date(2026, 8, 1))
+
+    def test_the_compact_form_is_refused_on_every_version(self):
+        """Valid ISO 8601, and not what this registry accepts. Accepting it on
+        3.11+ only is worse than refusing it everywhere."""
+        for compact in ("20260801", 20260801, b"20260801"):
+            with self.subTest(value=compact):
+                with self.assertRaises(registry.RegistryError):
+                    registry._as_date(compact)
+
+    def test_a_bool_is_not_a_date(self):
+        """`str(True)` is 'True', which never parsed -- but the type reaching a
+        parse attempt at all is the bug this closes."""
+        with self.assertRaises(registry.RegistryError):
+            registry._as_date(True)
+
+    def test_the_gate_is_a_regex_and_not_the_standard_library(self):
+        """The one check here that can fail on any interpreter.
+
+        The behavioural tests above cannot: on 3.9 `fromisoformat` refuses the
+        compact form anyway, so reverting the fix leaves them green and only CI
+        on 3.13 goes red. A test that cannot fail on the machine you are writing
+        it on is not much of a test, so this asserts the mechanism instead --
+        `_as_date` must decide with its own pattern before delegating, and must
+        not stringify arbitrary values into a parser.
+        """
+        import ast
+        import inspect
+
+        src = inspect.getsource(registry._as_date)
+        tree = ast.parse(src.lstrip())
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+
+        gated = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Attribute) and n.attr == "match"]
+        self.assertTrue(gated, "_as_date no longer gates on an explicit pattern, "
+                               "so what counts as a date is whatever this "
+                               "Python's fromisoformat accepts")
+
+        for c in calls:
+            fn = c.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name == "fromisoformat":
+                arg = c.args[0] if c.args else None
+                self.assertNotIsInstance(
+                    arg, ast.Call,
+                    "fromisoformat is being handed a converted value (str(...)), "
+                    "which turns any type into a parse attempt")
 
 
 class TestTargetAwareModelNormalization(unittest.TestCase):
@@ -744,7 +811,8 @@ class TestRoundTwelve(unittest.TestCase):
         same without failing."""
         self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-08-01"), 2.00)
         self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-09-01"), 3.00)
-        for bad in ("2026-8-1", "not-a-date", "08-01-2026", "2026/08/01", None, 20260801):
+        for bad in ("2026-8-1", "not-a-date", "08-01-2026", "2026/08/01", None,
+                    20260801, "20260801", 20260801.0, True, b"2026-08-01"):
             with self.subTest(on_date=bad):
                 with self.assertRaises(registry.RegistryError):
                     registry.base_rate("claude-sonnet-5", bad)

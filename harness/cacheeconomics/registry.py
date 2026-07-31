@@ -186,6 +186,10 @@ def supported_ttls(target_id: str, model: str | None = None) -> list:
 
 _DATE_SUFFIX = re.compile(r"^(?P<base>.+?)-(?P<date>\d{8})$")
 
+# Exactly yyyy-mm-dd. Not a sorting heuristic, and not whatever the running
+# interpreter's `fromisoformat` happens to accept this release.
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def normalize_model(model: str, target_id: str | None = None) -> tuple[str, str | None]:
     """Strip a trailing date snapshot from a model id.
@@ -283,10 +287,24 @@ def _as_date(value, what="date"):
         return value.date()
     if isinstance(value, date):
         return value
-    try:
-        return date.fromisoformat(str(value))
-    except (ValueError, TypeError):
-        raise RegistryError(
+    # Only the explicit `yyyy-mm-dd` string, and only a string.
+    #
+    # `date.fromisoformat(str(value))` made this answer differ by interpreter.
+    # Python 3.11 taught `fromisoformat` the compact ISO basic form, so the
+    # integer 20260801 raised on 3.9 and parsed as 2026-08-01 on 3.13: the same
+    # trace priced two different ways depending on which Python ran it, in the
+    # one function whose entire job is date-effective pricing. CI caught it on
+    # 3.13 the first time this was pushed to a repo that runs both.
+    #
+    # `str(value)` was the other half of it -- it happily stringifies anything,
+    # so a type that has no business being a date got a parse attempt instead of
+    # a refusal.
+    if isinstance(value, str) and _ISO_DATE.match(value):
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            pass
+    raise RegistryError(
             f"{what} must be an ISO yyyy-mm-dd date, got {value!r}. Rates are "
             f"selected by comparing dates, and a string that merely sorts is "
             f"not a date -- '2026-8-1' sorts after '2026-09-01' and would have "
