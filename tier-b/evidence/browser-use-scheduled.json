@@ -1,0 +1,37 @@
+{
+  "artifact": "browser-use-scheduled",
+  "artifact_version": 1,
+  "project": "browser-use",
+  "version": "0.13.7",
+  "model": "claude-haiku-4-5",
+  "workload": "one monitoring task run on a timer, 7 cycles over 60.7 minutes",
+  "interval_seconds": 600,
+  "interval_is_a_choice": "600s was chosen because it is a plausible monitoring cadence AND sits inside the 300-3600s band by construction. Nothing here discovered that interval. A workload on a 90-second timer gets the opposite answer, which the interactive run measured directly: median gap 7.3s, zero of 26 gaps in band, no saving available.",
+  "requests": 26,
+  "gap_seconds": {
+    "median": 17.854945999999998,
+    "max": 1201.53914,
+    "n": 22,
+    "in_5m_1h_band": 10
+  },
+  "usage_totals": {
+    "input_tokens": 381706,
+    "cache_read_input_tokens": 126696,
+    "cache_creation_input_tokens": 106841
+  },
+  "measured_window_minutes": 60.7,
+  "measured_input_spend_usd": 0.53,
+  "finding": {
+    "code": "TTL-1",
+    "recoverable_share_of_input_spend": 0.17,
+    "monthly_projection_usd": 64.54,
+    "projection_caveat": "$64.54 is $0.53 of measured spend multiplied by 715. The share is what transfers between workloads; the dollar figure is an extrapolation from one hour and should not be quoted as a measurement."
+  },
+  "independent_check": {
+    "method": "bake-off, arms modelled separately",
+    "as_shipped_usd": 0.5251,
+    "allocator_lite_usd": 0.5014,
+    "note": "15.1% and 18.9% against the automatic baseline, consistent in direction with TTL-1"
+  },
+  "limits": "One agent, one task shape, one model, one hour, one chosen interval. It shows the mechanism is real and quantifies it for this workload. It does not establish what any other deployment would save, and the interactive run on the same software found nothing to save."
+}
