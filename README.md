@@ -168,15 +168,16 @@ invoice. Costing a recommendation from a 19% split while holding the invoice to
 5% would be two standards, so structural findings arrive without figures until
 the sizes are counted.
 
-Counting them takes one command:
+Counting them is the default path, and it is one command:
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...
-python3 tier-b/count_tokens.py bodies.jsonl -o bodies-counted.jsonl
-cacheeconomics analyze bodies-counted.jsonl --from bodies --invoice-usd 4820.16
+python3 tier-b/run_diagnostic.py bodies.jsonl --invoice-usd 4820.16
 ```
 
-The same measurement against the same tokenizer then lands at 0.2%.
+That counts, then analyses. The same measurement against the same tokenizer
+lands at 0.2%. Pass `--estimate-only` to skip it, which you have to type
+because skipping it is the choice worth making on purpose.
 
 Three things worth knowing before you run it.
 
@@ -203,8 +204,9 @@ either, deliberately: an earlier version wrote an output file full of zeroes
 that the analyzer then read as exact counts, which is the kind of
 authoritative-looking wrong answer the rest of this tool exists to refuse.
 
-And you can skip the whole step. Nothing breaks: you get every finding, and the
-ones about prompt structure arrive without dollar figures.
+And you can skip it entirely with `--estimate-only`. Nothing breaks: you get
+every finding, and the ones about prompt structure arrive without dollar
+figures.
 
 It is a separate script rather than a flag, deliberately. The installed package
 imports no network library at all and a test asserts it, because zero egress is

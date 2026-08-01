@@ -117,10 +117,19 @@ def main() -> int:
 
     cache_path = args.cache or (args.out + ".cache.json")
     cache = {}
-    if os.path.exists(cache_path):
+    if os.path.exists(cache_path) and not args.dry_run:
         with open(cache_path) as f:
             cache = json.load(f)
         print(f"  resumed from {len(cache):,} cached counts", file=sys.stderr)
+    elif args.dry_run and os.path.exists(cache_path):
+        # A dry run starts from an empty cache on purpose. The question it
+        # answers is "what would you send", and the honest answer is what a
+        # fresh machine would send. Consulting a warm cache reported "0 calls
+        # would go to api.anthropic.com" seconds after a real run had populated
+        # it -- true here, false everywhere the client would run it, and exactly
+        # the wrong thing to say while asking for permission to send anything.
+        print(f"  ({len(json.load(open(cache_path))):,} counts are cached locally; "
+              f"a dry run ignores them and reports a cold run)", file=sys.stderr)
 
     stats = {"calls": 0}
     count = counter(args.model, key, stats, args.endpoint, args.dry_run)
