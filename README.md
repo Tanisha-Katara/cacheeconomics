@@ -59,6 +59,12 @@ An instrumented capture, using the recorder in this package. Needs a small code
 change on your side and gives the strongest answers about structure. It needs
 the counting step too: the recorder measures bytes like everything else.
 
+Nothing at all, if your agent lets you change its base URL.
+`tier-b/capture_proxy.py` forwards to the provider and writes a bodies export as
+it goes, so you get the wire without exporting anything and without touching the
+agent's code. That is how the browser-use measurement below was done, on a
+project nobody instrumented for us.
+
 The file you have decides what the tool will claim. It works this out from the
 contents, not from what you tell it, so an export cannot ask for more confidence
 than it earns.
@@ -109,6 +115,35 @@ a model with no dated registry entry. That third code exists because "I did not
 check" is not "this passed", and collapsing them gives you a green build where
 the check that catches silently-ignored cache markers never ran. Exit 1 means the
 tool itself broke.
+
+## Measuring an agent you did not write
+
+Most agents let you point them at a different base URL, because that is how
+people use proxies and gateways. That is enough.
+
+```bash
+python3 tier-b/capture_proxy.py --out run.jsonl --port 8787 &
+# then start the agent with its base URL set to http://127.0.0.1:8787
+```
+
+It forwards every request to the provider byte for byte and writes each one to
+`run.jsonl` with the response beside it. Nothing is mutated, so what you measure
+is the agent's own behaviour rather than the behaviour of an agent with
+something in its path. The output is a bodies export, so it feeds
+`--from bodies` directly.
+
+It also stamps a session key derived from the stable prefix, because the wire
+does not carry one and the analysis needs it. Without that every request lands
+in one reuse chain, and a workload that interleaves call types reads as a single
+conversation whose tools keep changing. That produced a confident and completely
+wrong finding the first time this was run.
+
+We used it on browser-use 0.13.7. Three real browser tasks, 33 requests, and the
+result is in `tier-b/evidence/browser-use-interactive.json`: caching removes 54%
+of its input spend, four requests place markers on prefixes below the model
+minimum where the provider silently ignores them, and the one-hour TTL idea does
+not apply at that cadence at all. The last of those is a finding against our own
+hypothesis, which is why it is in the repository.
 
 ## Counting the tokens
 

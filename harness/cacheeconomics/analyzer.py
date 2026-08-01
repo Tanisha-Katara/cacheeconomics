@@ -851,7 +851,12 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
             affected_requests=len(reqs), avoidable_usd_month=None,
             confidence="high", quality_risk="low",
             fix="Export a session or conversation id alongside usage. Nothing "
-                "else about the ingest needs to change.")
+                "else about the ingest needs to change. If the agent does not "
+                "emit one, `tier-b/capture_proxy.py` derives a cache-pool key "
+                "from the stable prefix, which is the grouping every finding "
+                "here actually reasons about -- without it a workload that "
+                "interleaves call types reads as one conversation whose tools "
+                "keep changing, and VOL-1 fires on a prefix that never drifted.")
     rebuilds, extended, switched, tokens, expired = 0, 0, 0, 0, 0
     unprovable_turns = 0
     for group in sessions.values():
