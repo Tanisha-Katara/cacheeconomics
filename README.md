@@ -138,12 +138,12 @@ in one reuse chain, and a workload that interleaves call types reads as a single
 conversation whose tools keep changing. That produced a confident and completely
 wrong finding the first time this was run.
 
-We used it on browser-use 0.13.7. Three real browser tasks, 33 requests, and the
-result is in `tier-b/evidence/browser-use-interactive.json`: caching removes 54%
-of its input spend, four requests place markers on prefixes below the model
-minimum where the provider silently ignores them, and the one-hour TTL idea does
-not apply at that cadence at all. The last of those is a finding against our own
-hypothesis, which is why it is in the repository.
+We used it on browser-use 0.13.7, across five schedules, and the write-up is in
+[`case-studies/`](case-studies/schedule-decides-your-cache-bill.md): under a
+five-minute gap between runs its cache works and there is nothing to save, over
+five minutes it rewrites that cache every run and about 15% of input spend is
+recoverable. Same code, same task, only the clock. It also records the part of
+our own prediction the data refuted, which is why it is in the repository.
 
 ## Counting the tokens
 
