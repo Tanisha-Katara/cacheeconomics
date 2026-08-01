@@ -36,10 +36,13 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-UPSTREAM = "https://api.anthropic.com"
+# Overridable for the same reason the counter's endpoint is: a client behind a
+# gateway cannot reach this host, and the proxy exists precisely for clients who
+# cannot change their export pipeline.
+DEFAULT_UPSTREAM = "https://api.anthropic.com"
 
 _lock = threading.Lock()
-_state = {"n": 0, "out": None, "errors": 0}
+_state = {"n": 0, "out": None, "errors": 0, "upstream": DEFAULT_UPSTREAM}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -53,7 +56,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raw = self.rfile.read(length)
         sent_at = datetime.now(timezone.utc)
 
-        upstream = UPSTREAM + self.path
+        upstream = _state["upstream"] + self.path
         # `accept-encoding` is dropped so upstream replies uncompressed. urllib
         # does not decompress, and forwarding gzipped bytes with the
         # `content-encoding` header stripped hands the client a body it decodes
@@ -144,15 +147,18 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--out", required=True, help="where to write the bodies export")
     p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--upstream", default=DEFAULT_UPSTREAM,
+                   help=f"where to forward to (default: {DEFAULT_UPSTREAM})")
     args = p.parse_args()
 
     if not os.environ.get("ANTHROPIC_API_KEY"):
         print("ANTHROPIC_API_KEY is not set.", file=sys.stderr)
         return 2
 
+    _state["upstream"] = args.upstream.rstrip("/")
     _state["out"] = open(args.out, "a")
     server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    print(f"  forwarding 127.0.0.1:{args.port} -> {UPSTREAM}", file=sys.stderr)
+    print(f"  forwarding 127.0.0.1:{args.port} -> {_state['upstream']}", file=sys.stderr)
     print(f"  writing {args.out}", file=sys.stderr)
     try:
         server.serve_forever()

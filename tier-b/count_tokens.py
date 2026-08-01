@@ -53,15 +53,25 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
 from cacheeconomics.tokenizer import count_segments              # noqa: E402
 
-ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
+# Overridable, because the clients most likely to care about egress are the
+# ones who cannot reach this host. An enterprise gateway, a Bedrock or Vertex
+# deployment, or a self-hosted proxy all mean the counting call has to go
+# somewhere else, and a hard-coded host makes the answer "edit the source".
+DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
 
 
-def counter(model: str, key: str, stats: dict):
+def counter(model: str, key: str, stats: dict, endpoint: str = DEFAULT_ENDPOINT,
+            dry_run: bool = False):
     def count(body: dict) -> int:
+        if dry_run:
+            # Counts the calls and sends nothing, so an operator can see the
+            # exact egress volume before agreeing to any of it.
+            stats["calls"] += 1
+            return 0
         payload = dict(body)
         payload["model"] = model
         req = urllib.request.Request(
-            ENDPOINT, data=json.dumps(payload, default=str).encode(),
+            endpoint, data=json.dumps(payload, default=str).encode(),
             headers={"content-type": "application/json", "x-api-key": key,
                      "anthropic-version": "2023-06-01"})
         for attempt in range(5):
@@ -89,10 +99,17 @@ def main() -> int:
                    help="model whose tokenizer to ask (default: claude-haiku-4-5). "
                         "Claude models share a tokenizer, so this rarely matters")
     p.add_argument("--cache", help="cache file to read and write (default: <out>.cache.json)")
+    p.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
+                   help="where to send the counting calls. Point it at your own "
+                        "gateway to keep the egress inside your perimeter "
+                        f"(default: {DEFAULT_ENDPOINT})")
+    p.add_argument("--dry-run", action="store_true",
+                   help="report how many calls this would make and what host they "
+                        "would go to, and send nothing")
     args = p.parse_args()
 
     key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
+    if not key and not args.dry_run:
         print("ANTHROPIC_API_KEY is not set. This script is the one part of the "
               "toolchain that talks to the provider; the analyzer itself does not.",
               file=sys.stderr)
@@ -106,7 +123,10 @@ def main() -> int:
         print(f"  resumed from {len(cache):,} cached counts", file=sys.stderr)
 
     stats = {"calls": 0}
-    count = counter(args.model, key, stats)
+    count = counter(args.model, key, stats, args.endpoint, args.dry_run)
+    if args.dry_run:
+        print(f"  DRY RUN: nothing will be sent. Host that would receive the "
+              f"prompt content: {args.endpoint}", file=sys.stderr)
 
     rows, counted, skipped, failed = [], 0, 0, 0
     with open(args.path) as f:
@@ -141,6 +161,18 @@ def main() -> int:
                     json.dump(cache, cf)
                 print(f"  {counted:,} rows, {stats['calls']:,} calls, "
                       f"{len(cache):,} cached", file=sys.stderr)
+
+    if args.dry_run:
+        # Deliberately writes nothing. A dry run produced an output file whose
+        # `segment_tokens` were all zero, and the loader read that as *counted*
+        # -- `tokens_are_counted: True` on a file that had never spoken to a
+        # tokenizer, with every segment's size collapsed onto one. A file that
+        # looks authoritative and is not is the exact failure this toolchain
+        # exists to refuse, so the dry run reports and stops.
+        print(f"\n  DRY RUN: {stats['calls']:,} calls would go to {args.endpoint}")
+        print(f"  {counted:,} rows would be counted, {skipped:,} skipped.")
+        print("  Nothing was sent and nothing was written.")
+        return 0
 
     with open(args.out, "w") as f:
         f.write("\n".join(rows) + "\n")

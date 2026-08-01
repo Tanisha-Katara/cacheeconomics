@@ -186,10 +186,25 @@ it, which is every request, because a prefix that is not shared is not being
 cached in the first place. On the demo trace 286 requests needed 345 calls. The
 cache is written next to the output, so a second run costs nothing at all.
 
-It sends prompt content to Anthropic. If your workload already runs on Anthropic
-that is the same content over the same wire to the same company. If it runs on
-Bedrock or Vertex it is a new egress path to a different vendor, and that is a
-decision to make on purpose rather than discover afterwards.
+It sends prompt content to a tokenizer, and you choose which one. By default
+that is Anthropic. If your workload already runs there it is the same content
+over the same wire to the same company; if it runs on Bedrock or Vertex it is a
+new egress path to a different vendor. Either way `--endpoint` points it at your
+own gateway instead, so the egress can stay inside your perimeter.
+
+You can also see exactly what it would send before agreeing to any of it:
+
+```bash
+python3 tier-b/count_tokens.py bodies.jsonl -o counted.jsonl --dry-run
+```
+
+That reports the call count and the host and sends nothing. It writes nothing
+either, deliberately: an earlier version wrote an output file full of zeroes
+that the analyzer then read as exact counts, which is the kind of
+authoritative-looking wrong answer the rest of this tool exists to refuse.
+
+And you can skip the whole step. Nothing breaks: you get every finding, and the
+ones about prompt structure arrive without dollar figures.
 
 It is a separate script rather than a flag, deliberately. The installed package
 imports no network library at all and a test asserts it, because zero egress is
