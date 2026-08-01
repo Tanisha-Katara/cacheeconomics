@@ -1,0 +1,100 @@
+{
+  "artifact": "interval-sweep-report",
+  "artifact_version": 1,
+  "project": "browser-use",
+  "model": "claude-haiku-4-5",
+  "points": [
+    {
+      "label": "interactive",
+      "n": 26,
+      "median": 7.2567195,
+      "median_intra": 7.2567195,
+      "median_inter": 0.0,
+      "in_band": 0,
+      "band_share": 0.0,
+      "requests": 33,
+      "monthly_input_usd": 158.0,
+      "ttl1_usd_month": 0.0,
+      "recoverable_share": 0.0,
+      "ttl1_raised": false,
+      "window_days": 0.041666666666666664,
+      "measured_usd": "$0.22"
+    },
+    {
+      "label": "120s",
+      "n": 30,
+      "median": 41.24614,
+      "median_intra": 41.24614,
+      "median_inter": 0.0,
+      "in_band": 0,
+      "band_share": 0.0,
+      "requests": 32,
+      "monthly_input_usd": 34.23,
+      "ttl1_usd_month": 0.0,
+      "recoverable_share": 0.0,
+      "ttl1_raised": false,
+      "window_days": 0.041666666666666664,
+      "measured_usd": "$0.05"
+    },
+    {
+      "label": "420s",
+      "n": 19,
+      "median": 13.646071,
+      "median_intra": 9.2969185,
+      "median_inter": 400.968095,
+      "in_band": 9,
+      "band_share": 0.47368421052631576,
+      "requests": 22,
+      "monthly_input_usd": 309.0,
+      "ttl1_usd_month": 42.07,
+      "recoverable_share": 0.13614886731391587,
+      "ttl1_raised": true,
+      "window_days": 0.041666666666666664,
+      "measured_usd": "$0.43"
+    },
+    {
+      "label": "600s",
+      "n": 22,
+      "median": 17.854945999999998,
+      "median_intra": 9.2238495,
+      "median_inter": 585.8191815,
+      "in_band": 10,
+      "band_share": 0.45454545454545453,
+      "requests": 26,
+      "monthly_input_usd": 377.0,
+      "ttl1_usd_month": 64.54,
+      "recoverable_share": 0.17119363395225465,
+      "ttl1_raised": true,
+      "window_days": 0.04196831506944444,
+      "measured_usd": "$0.53"
+    },
+    {
+      "label": "900s",
+      "n": 18,
+      "median": 13.3583595,
+      "median_intra": 9.930583500000001,
+      "median_inter": 889.8278445000001,
+      "in_band": 8,
+      "band_share": 0.4444444444444444,
+      "requests": 22,
+      "monthly_input_usd": 298.0,
+      "ttl1_usd_month": 38.48,
+      "recoverable_share": 0.12912751677852347,
+      "ttl1_raised": true,
+      "window_days": 0.04199834219907408,
+      "measured_usd": "$0.42"
+    }
+  ],
+  "prediction_made_before_the_data": "Nothing below five minutes, rising through the band, gone again past an hour.",
+  "what_the_data_says": {
+    "confirmed": "The cliff at five minutes. Two schedules below it -- interactive at ~7s and a two-minute timer -- put 0 of 26 and 0 of 30 gaps in the band and recovered nothing. Three above it recovered 13-17%. That boundary is sharp, reproducible, and is where the default TTL starts costing money.",
+    "refuted": "The rise. 420s, 600s and 900s came back 14%, 17% and 13% -- a 4-point spread on samples of about twenty requests each, which is noise. The shape inside the band is not resolved by this data and the earlier 17% should not be read as a peak.",
+    "untested": "The far side. No schedule beyond an hour was run, so the prediction that the saving disappears again past 3600s is arithmetic, not measurement."
+  },
+  "honest_claim": "For this agent and this task: a schedule slower than five minutes makes roughly 13-17% of input spend recoverable by moving to a one-hour TTL; a schedule faster than five minutes makes none. The threshold transfers because it is a property of the five-minute lifetime. The magnitude is one agent, one task, one model, and should be measured per workload rather than quoted.",
+  "method": {
+    "capture": "tier-b/capture_proxy.py, forwarding unmodified",
+    "counting": "tier-b/count_tokens.py, exact per-segment counts",
+    "analysis": "cacheeconomics analyze --from bodies, unmodified"
+  }
+}
