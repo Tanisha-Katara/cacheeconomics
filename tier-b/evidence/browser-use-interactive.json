@@ -1,0 +1,28 @@
+{
+  "artifact": "browser-use-interactive-run",
+  "artifact_version": 1,
+  "project": "browser-use",
+  "version": "0.13.7",
+  "model": "claude-haiku-4-5",
+  "workload": "three interactive browser tasks, run back to back by a script",
+  "requests": 33,
+  "billed_input_tokens": 482294,
+  "usage_totals": {
+    "input_tokens": 189342,
+    "cache_read_input_tokens": 291653,
+    "cache_creation_input_tokens": 1299
+  },
+  "gap_seconds": {
+    "median": 7.2567195,
+    "max": 36.902331,
+    "n": 26,
+    "in_5m_1h_band": 0
+  },
+  "findings": {
+    "caching_works": "caching removes 54% of input spend versus sending the same traffic uncached",
+    "MIN-1": "4 requests place a cache marker on a prefix of ~810 tokens against a 4,096 minimum; all returned creation=0 and read=0",
+    "no_1h_path": "confirmed on 0.13.7: the Anthropic serializer emits ephemeral with no ttl key anywhere"
+  },
+  "conclusion": "The 1-hour TTL hypothesis does not apply to this workload. Median gap 7.3s, zero of 26 gaps in the 5m-1h band. At this cadence a 5-minute entry never expires between requests, so a 1h write at 2x would cost more than the 1.25x it replaces.",
+  "limits": "A short automated run of back-to-back tasks. It says nothing about a deployment whose cadence is human-paced or scheduled, which is the case the hypothesis was about."
+}
