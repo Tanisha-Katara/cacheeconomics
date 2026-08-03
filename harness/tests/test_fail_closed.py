@@ -359,6 +359,29 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         p = plugin.CachePlugin(key=b"k" * 32, warmup=2)
         return plugin.litellm_handler(p, mutate=False, target_id=target_id)
 
+    def _markers(self, h, model, calls=6, provider=None):
+        """Markers the hook decided on, read off its own placement record.
+
+        `mutate=False` by default, so the body is never rewritten -- the
+        decision is what matters here, and reading it avoids needing the
+        mutating path to test a budget guard.
+        """
+        import asyncio
+        placed = []
+
+        async def go():
+            for i in range(calls):
+                data = {"model": model, "litellm_call_id": f"c{i}",
+                        "messages": [{"role": "user", "content": "policy " * 3000}]}
+                if provider:
+                    data["custom_llm_provider"] = provider
+                await h.async_pre_call_hook(None, None, data, "completion")
+            for d in h._pending.values():
+                placed.append(getattr(d, "placements", None) or {})
+
+        asyncio.run(go())
+        return max((list(p) for p in placed), key=len, default=[])
+
     def _run(self, h, model, calls=6, provider=None):
         import asyncio
         scopes = []
@@ -397,21 +420,41 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
             {"amazon-bedrock/converse"})
 
     def test_the_budget_recheck_uses_the_resolved_surface(self):
-        """Structural: the guard between a miscount and a rejected request read
-        a literal, so it enforced Anthropic's budget on every provider."""
-        import ast
-        import inspect
+        """Behavioural, by observing which surface the registry was asked about.
 
-        from cacheeconomics import plugin
-        src = inspect.getsource(plugin.litellm_handler)
-        for node in ast.walk(ast.parse(src.lstrip())):
-            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "capability"):
-                first = node.args[0] if node.args else None
-                self.assertNotIsInstance(
-                    first, ast.Constant,
-                    "registry.capability is called with a literal surface in the "
-                    "live hook; it must use the resolved target")
+        This was an AST check with two holes: assigning the surface to a
+        variable first yielded an ast.Name and passed, and passing it by keyword
+        left `node.args` empty so `assertNotIsInstance(None, ast.Constant)`
+        passed trivially.
+
+        The obvious replacement -- drive a Vertex request and assert the marker
+        count respects Vertex's budget -- proves nothing, because every
+        Anthropic-family surface records `max_breakpoints: 4`. A literal
+        "anthropic/direct" produces an identical plan, and I confirmed that by
+        applying the mutation and watching the value-based version pass. So the
+        observable property is not the result but the question: which surface
+        did the guard actually ask about.
+        """
+        from cacheeconomics import registry
+        asked = []
+        real = registry.capability
+
+        def spy(target_id, name, *a, **kw):
+            asked.append((target_id, name))
+            return real(target_id, name, *a, **kw)
+
+        registry.capability = spy
+        try:
+            self._run(self._hook(), "claude-haiku-4-5", provider="vertex_ai")
+        finally:
+            registry.capability = real
+
+        budgets = [t for t, n in asked if n == "max_breakpoints"]
+        self.assertTrue(budgets, "the budget guard never ran")
+        self.assertNotIn("anthropic/direct", budgets,
+                         "the live hook enforced Anthropic's budget on a Vertex "
+                         "request; it must ask about the resolved surface")
+        self.assertIn("google-cloud/vertex", budgets)
 
 
 class TestSegmentIdsAreScopedToTheTenant(unittest.TestCase):

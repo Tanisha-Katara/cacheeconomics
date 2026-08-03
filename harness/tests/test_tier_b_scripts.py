@@ -291,18 +291,94 @@ class TestEveryCapturedRowCarriesASession(_ProxyCase):
 
 
 
-class TestTheDefaultPathCounts(unittest.TestCase):
-    """Counting was correct and optional, and optional meant skipped. Skipping
-    yields a report missing the half a client pays for, because the analyzer
-    refuses to cost a structural finding from a 19.2% split."""
+class _CountStub(http.server.BaseHTTPRequestHandler):
+    """A token-count endpoint, so the default path can be exercised offline."""
 
-    def test_opting_out_must_be_typed(self):
-        r = subprocess.run(
-            [sys.executable, os.path.join(TIER_B, "run_diagnostic.py"), "--help"],
-            capture_output=True, text=True)
-        self.assertIn("--estimate-only", r.stdout)
-        self.assertNotIn("--count-tokens", r.stdout,
-                         "counting should be the default, not a flag to enable")
+    hits = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        type(self).hits += 1
+        body = json.loads(self.rfile.read(
+            int(self.headers.get("content-length") or 0)) or b"{}")
+        # Proportional to content so the deltas count_segments takes are not
+        # all zero -- a stub returning a constant would let a broken
+        # differencing step pass.
+        n = len(json.dumps(body, default=str)) // 4
+        payload = json.dumps({"input_tokens": n}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class TestTheDefaultPathCounts(unittest.TestCase):
+    """Counting was correct and optional, and optional meant skipped.
+
+    The earlier version of this class asserted that `--estimate-only` appeared
+    in `--help` and `--count-tokens` did not. That is help text, not behaviour:
+    making estimate-only the default, so counting never runs at all, passed it.
+    Verified by mutation before rewriting.
+
+    These drive `run_diagnostic.py` against a local stub endpoint, so the
+    default path actually executes and its output can be read.
+    """
+
+    def setUp(self):
+        _CountStub.hits = 0
+        self.stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CountStub)
+        self.port = self.stub.server_address[1]
+        threading.Thread(target=self.stub.serve_forever, daemon=True).start()
+        self.addCleanup(self.stub.shutdown)
+        self.tmp = tempfile.mkdtemp()
+        self.src = os.path.join(self.tmp, "bodies.jsonl")
+        body = {"model": "claude-opus-5",
+                "system": [{"type": "text", "text": "s" * 4000,
+                            "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": "hello"}]}
+        with open(self.src, "w") as f:
+            for i in range(4):
+                f.write(json.dumps({
+                    "sent_at": f"2026-07-29T09:0{i}:00Z", "body": body,
+                    "usage": {"input_tokens": 100,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 1000,
+                              "cache_creation": {
+                                  "ephemeral_5m_input_tokens": 1000,
+                                  "ephemeral_1h_input_tokens": 0}}}) + "\n")
+
+    def _run(self, *extra):
+        return subprocess.run(
+            [sys.executable, os.path.join(TIER_B, "run_diagnostic.py"), self.src,
+             "--endpoint", f"http://127.0.0.1:{self.port}/v1/messages/count_tokens",
+             "--allow-unreconciled", *extra],
+            capture_output=True, text=True,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test",
+                     CACHEECONOMICS_HMAC_KEY="k" * 32))
+
+    def test_counting_happens_without_being_asked_for(self):
+        r = self._run()
+        self.assertGreater(_CountStub.hits, 0,
+                           f"the default path never counted.\n{r.stderr[-500:]}")
+
+    def test_estimate_only_actually_skips_it(self):
+        r = self._run("--estimate-only")
+        self.assertEqual(_CountStub.hits, 0,
+                         f"--estimate-only still counted.\n{r.stderr[-500:]}")
+        self.assertIn("counting skipped", r.stderr)
+
+    def test_the_counted_output_carries_segment_tokens(self):
+        """The point of counting: sizes the analyzer can attach money to."""
+        self._run()
+        out = self.src.replace(".jsonl", "-counted.jsonl")
+        self.assertTrue(os.path.exists(out), "no counted export was written")
+        rows = [json.loads(l) for l in open(out) if l.strip()]
+        self.assertTrue(rows)
+        self.assertTrue(any(r.get("segment_tokens") for r in rows),
+                        "counted export carries no segment_tokens")
 
 
 if __name__ == "__main__":

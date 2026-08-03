@@ -1096,24 +1096,97 @@ class TestEveryIngestBranchForwardsTheSurface(unittest.TestCase):
     SURFACE_KWARGS = {"default_target", "target_id"}
 
     def test_every_loader_call_in_load_is_given_a_surface(self):
+        """Structural on purpose: a fourth ingest mode fails here the day it is
+        added, which behaviour cannot do for code nobody has written yet.
+
+        Now also rejects a constant. The earlier version collected only keyword
+        *names*, so `target_id="anthropic/direct"` hard-coded passed it -- and
+        that mutation reopens partner traffic priced at first-party rates.
+        Verified by applying it before this was rewritten.
+        """
         import ast
         import inspect
 
         from cacheeconomics import cli
 
         tree = ast.parse(inspect.getsource(cli._load))
+        # Attribute callees too. `adapters.load_bodies(...)` was invisible to
+        # the old ast.Name-only filter, so a mode called that way skipped both
+        # the count check and the surface check.
+        def _name(fn):
+            return getattr(fn, "id", None) or getattr(fn, "attr", None) or ""
+
         calls = [n for n in ast.walk(tree)
-                 if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Name)
-                 and n.func.id.startswith("load_")]
+                 if isinstance(n, ast.Call) and _name(n.func).startswith("load_")]
         self.assertGreaterEqual(len(calls), 3, "expected one call per ingest mode")
         for c in calls:
-            passed = {k.arg for k in c.keywords}
+            passed = {k.arg: k.value for k in c.keywords}
+            named = self.SURFACE_KWARGS & set(passed)
             self.assertTrue(
-                passed & self.SURFACE_KWARGS,
-                f"{c.func.id} is called without a surface, so rows that carry "
-                f"none silently ingest as anthropic/direct whatever --target-id "
-                f"said. Pass one of {sorted(self.SURFACE_KWARGS)}.")
+                named,
+                f"{_name(c.func)} is called without a surface, so rows that "
+                f"carry none silently ingest as anthropic/direct whatever "
+                f"--target-id said. Pass one of {sorted(self.SURFACE_KWARGS)}.")
+            for kw in named:
+                self.assertNotIsInstance(
+                    passed[kw], ast.Constant,
+                    f"{_name(c.func)} is handed a hard-coded {kw}, which "
+                    f"ignores --target-id entirely")
+
+    def test_target_id_actually_reaches_the_trace_for_every_mode(self):
+        """The behavioural half. The structural check above cannot tell whether
+        the value forwarded is the operator's or something invented on the way."""
+        import json
+        import os
+        import tempfile
+
+        from cacheeconomics import cli
+
+        want = "amazon-bedrock/converse"
+        with tempfile.TemporaryDirectory() as tmp:
+            trace = os.path.join(tmp, "t.jsonl")
+            with open(trace, "w") as f:
+                f.write(json.dumps({
+                    "request_id": "r", "sent_at": "2026-07-29T09:00:00Z",
+                    "model": "claude-opus-5", "session": "s",
+                    "usage": {"input_tokens": 100,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0}}) + "\n")
+            bodies = os.path.join(tmp, "b.jsonl")
+            with open(bodies, "w") as f:
+                f.write(json.dumps({
+                    "sent_at": "2026-07-29T09:00:00Z",
+                    "body": {"model": "claude-opus-5",
+                             "messages": [{"role": "user", "content": "hi"}]},
+                    "usage": {"input_tokens": 100}}) + "\n")
+            lite = os.path.join(tmp, "l.jsonl")
+            with open(lite, "w") as f:
+                f.write(json.dumps({
+                    "id": "r", "startTime": 1_780_000_000, "model": "claude-opus-5",
+                    "response": {"usage": {
+                        "prompt_tokens": 100, "completion_tokens": 1,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0}}}) + "\n")
+
+            key = os.environ.get("CACHEECONOMICS_HMAC_KEY")
+            os.environ["CACHEECONOMICS_HMAC_KEY"] = "k" * 32
+            try:
+                for source, path in (("trace", trace), ("bodies", bodies),
+                                     ("litellm", lite)):
+                    with self.subTest(source=source):
+                        args = cli.build_parser().parse_args(
+                            ["analyze", path, "--from", source,
+                             "--target-id", want])
+                        ts = cli._load(args)
+                        self.assertTrue(ts.requests, f"{source} loaded nothing")
+                        self.assertEqual({r.target_id for r in ts.requests}, {want},
+                                         f"--target-id did not reach the {source} trace")
+            finally:
+                if key is None:
+                    os.environ.pop("CACHEECONOMICS_HMAC_KEY", None)
+                else:
+                    os.environ["CACHEECONOMICS_HMAC_KEY"] = key
 
 
 class TestEveryCliFlagIsRead(unittest.TestCase):
