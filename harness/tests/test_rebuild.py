@@ -82,15 +82,30 @@ class TestRebuildIsDistinguishedFromExtension(unittest.TestCase):
 
     def test_a_model_switch_is_attributed_not_blamed(self):
         """Switching model is a separate cache pool by design. Counting it as an
-        unexplained rebuild would send somebody hunting for a bug."""
+        unexplained rebuild would send somebody hunting for a bug.
+
+        Asserted on substance rather than on a sentence: the earlier version
+        pinned the exact clause "coincide with a model change" and failed on a
+        rewrite that changed nothing about the behaviour it guards.
+        """
         f = findings(session(turns=60, switch_every=10))["REB-1"]
-        self.assertIn("coincide with a model change", f.detail)
-        self.assertNotIn("The other", f.detail.split("coincide with a model change")[1][:40])
+        self.assertIn("model change", f.detail)
+        self.assertNotIn("no innocent explanation", f.detail)
 
     def test_rebuilds_with_no_model_change_are_called_unexplained(self):
         f = findings(session(rebuild_every=10))["REB-1"]
-        self.assertIn("do not, so something is changing the prefix", f.detail)
+        self.assertIn("no innocent explanation", f.detail)
+        self.assertIn("changing the prefix itself", f.detail)
         self.assertIn("compaction", f.fix.lower())
+
+    def test_the_count_and_the_cause_come_before_the_exclusions(self):
+        """The exclusions used to sit between the count and the conclusion, so
+        the sentence saying what is actually wrong landed last. Real caveats,
+        wrong position."""
+        f = findings(session(turns=120, rebuild_every=10, switch_every=30))["REB-1"]
+        self.assertLess(f.detail.index("no innocent explanation"),
+                        f.detail.index("Excluded:"),
+                        "the cause is buried behind the caveats again")
 
     def test_it_works_with_no_prompt_structure_at_all(self):
         """The reason this rule matters: it needs three usage counters."""

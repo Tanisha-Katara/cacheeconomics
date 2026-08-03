@@ -909,25 +909,33 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
         code="REB-1", title="The cached prefix is being rebuilt, not extended",
         severity="high" if interval < 15 else "medium",
         evidence_class=MEASURED,
+        # Structure: the number, what it costs, then what is causing it. The
+        # exclusions used to sit between the count and the conclusion, three
+        # subordinate clauses deep, so the sentence that says what is actually
+        # wrong arrived last and read as an afterthought. They are real and they
+        # stay; they go in a bracketed tail where a reader can skip them.
         detail=(f"{rebuilds:,} of {turns:,} in-session turns rewrote at least half the "
-                f"prefix they had already established -- about one rebuild every "
-                f"{interval:.0f} turns, covering {tokens:,} written tokens. A turn that "
-                f"extends the prefix writes only what was added and reads the rest at "
-                f"0.1x; a rebuild writes the lot at 1.25x or 2x. "
-                + (f"{switched} of those rebuilds coincide with a model change, which "
-                   f"is a separate cache pool and is expected. " if switched else "")
-                + (f"A further {expired:,} turn(s) rewrote a prefix whose entry had "
-                   f"already expired, which is a lifetime question rather than a "
-                   f"rebuild and is excluded here; TTL-1 covers those. "
-                   if expired else "")
-                + (f"{unprovable_turns:,} turn(s) are excluded because the previous "
-                   f"write's lifetime could not be established, so expiry and "
-                   f"rebuild cannot be told apart on them. "
-                   if unprovable_turns else "")
-                + (f"The other {unexplained:,} do not, so something is changing the "
-                   f"prefix itself -- context compaction, a rotating identifier, or "
-                   f"reordered tool definitions are the usual three."
-                   if unexplained else "")),
+                f"prefix they had already established, about one every "
+                f"{interval:.0f} turns, covering {tokens:,} written tokens. "
+                f"Extending a prefix writes only what was added and reads the rest "
+                f"at 0.1x. A rebuild writes the lot again at 1.25x or 2x."
+                + (f" {unexplained:,} of them have no innocent explanation, so "
+                   f"something is changing the prefix itself. Context compaction, a "
+                   f"rotating identifier and reordered tool definitions are what "
+                   f"this usually turns out to be."
+                   if unexplained else "")
+                + ((" Excluded: "
+                    + "; ".join(
+                        [f"{switched} rebuild(s) across a model change, which is a "
+                         f"separate cache pool and is expected"] * bool(switched)
+                        + [f"{expired:,} turn(s) whose entry had already expired, "
+                           f"which is a lifetime question and is TTL-1's, not this "
+                           f"finding's"] * bool(expired)
+                        + [f"{unprovable_turns:,} turn(s) whose previous write has no "
+                           f"known lifetime, so expiry and rebuild cannot be told "
+                           f"apart"] * bool(unprovable_turns))
+                    + ".")
+                   if (switched or expired or unprovable_turns) else "")),
         affected_requests=rebuilds,
         avoidable_usd_month=None,
         confidence="high", quality_risk="low",

@@ -281,7 +281,8 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
 
     # headline
     parts.append("<section class=section><div class=section-head>")
-    parts.append("<div><div class=label>02 / Current position</div><h2>The cache is active, but underused.</h2></div>")
+    parts.append(f"<div><div class=label>02 / Current position</div>"
+                 f"<h2>{e(_headline(a))}</h2></div>")
     parts.append("<p>These are the ratios finance and engineering can both read: how much input "
                  "came from cache, how often writes paid off, and what the run costs at your rate.</p>")
     parts.append("</div><div class=kpis>")
@@ -302,8 +303,12 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
 
     # findings
     parts.append("<section class=section><div class=section-head>")
+    # Was the literal "Fix the prefix before changing lifetime." on every report,
+    # which is advice and was wrong wherever the top finding was not a prefix
+    # one. The findings are already ranked; name the first one instead.
+    _top = a.findings[0].title if a.findings else "Nothing to act on."
     parts.append(f"<div><div class=label>03 / Findings - {len(a.findings)}</div>"
-                 "<h2>Fix the prefix before changing lifetime.</h2></div>")
+                 f"<h2>{e(_top)}</h2></div>")
     parts.append("<p>Findings are ranked by severity and monthly impact. Each one names the "
                  "mechanism, the evidence class, and the safest next action.</p></div>")
     parts.append("<div class=findings>")
@@ -352,6 +357,33 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
     return "\n".join(parts)
 
 
+def _headline(a: Analysis) -> str:
+    """One plain sentence saying how the cache is doing, before any percentage.
+
+    Both renderers used to open on an asserted headline -- the HTML one on the
+    literal string "The cache is active, but underused." -- which was written
+    once against one demo trace and then printed over every trace after it,
+    including runs where the cache was doing fine. An assertion that does not
+    read its own data is worse than no headline, because it looks like a
+    finding.
+
+    Efficiency rather than `input_from_cache`: the latter is near 100% on any
+    heavy cache user and says nothing about whether the caching worked, which is
+    the misreading CAC-1 exists to correct.
+    """
+    eff = a.ratios.get("prefix_efficiency")
+    if eff is None:
+        return "Not enough cache activity here to say whether caching is working."
+    if eff >= 0.75:
+        return ("Caching is working: most of what gets written to cache is read "
+                "back before it expires.")
+    if eff >= 0.5:
+        return (f"Caching is working, but {_pct(1 - eff)} of what gets written to "
+                f"cache expires or is discarded before anything reads it.")
+    return (f"Most of what gets written to cache is never read: {_pct(1 - eff)} of "
+            f"written tokens are paid for at a premium and then thrown away.")
+
+
 def render_text(a: Analysis) -> str:
     """The same gate as the HTML report, because the text one forwards just as easily.
 
@@ -369,11 +401,18 @@ def render_text(a: Analysis) -> str:
     # is exactly as wide as the hand-written column, so it rendered as
     # "prefix efficiency17%" with no gap at all.
     _w = len("prefix efficiency") + 1
-    out = [f"{'ingest tier':<{_w}}{a.tier}",
+    # Two bare percentages with no gloss, which is what this printed for a long
+    # time, are two numbers nobody can act on. The reader has to already know
+    # that a high `input from cache` is not itself good news.
+    _v = 8
+    out = [_headline(a), "",
+           f"{'ingest tier':<{_w}}{a.tier}",
            f"{'coverage':<{_w}}{a.coverage['analysed']}/{a.coverage['total']} "
            f"({_pct(a.coverage['fraction'])})",
-           f"{'input from cache':<{_w}}{_pct(a.ratios['input_from_cache'])}",
-           f"{'prefix efficiency':<{_w}}{_pct(a.ratios['prefix_efficiency'])}"]
+           f"{'input from cache':<{_w}}{_pct(a.ratios['input_from_cache']):<{_v}}"
+           f"share of input billed at the cheap read rate",
+           f"{'prefix efficiency':<{_w}}{_pct(a.ratios['prefix_efficiency']):<{_v}}"
+           f"of every token written to cache, the share later read"]
     if a.reconciliation:
         r = a.reconciliation
         pct = r.get("delta_pct")

@@ -97,7 +97,7 @@ footer{border-top:1px solid var(--rule);margin-top:72px;padding-top:18px;font-si
 </div><div class=meta>
 <div><span>Client</span><span>Diagnostic</span></div>
 <div><span>Window</span><span>Not specified</span></div>
-<div><span>Generated</span><span>2026-07-31</span></div>
+<div><span>Generated</span><span>2026-08-03</span></div>
 <div><span>Ingest tier</span><span>instrumented</span></div>
 </div></header>
 <section class=verdict><div>
@@ -119,7 +119,7 @@ footer{border-top:1px solid var(--rule);margin-top:72px;padding-top:18px;font-si
 </div>
 </section>
 <section class=section><div class=section-head>
-<div><div class=label>02 / Current position</div><h2>The cache is active, but underused.</h2></div>
+<div><div class=label>02 / Current position</div><h2>Most of what gets written to cache is never read: 83% of written tokens are paid for at a premium and then thrown away.</h2></div>
 <p>These are the ratios finance and engineering can both read: how much input came from cache, how often writes paid off, and what the run costs at your rate.</p>
 </div><div class=kpis>
 <div class=kpi><div class=label>Input from cache</div><div class=value>17%</div><div class=help>Share of input tokens served at the cheap read rate.</div></div>
@@ -128,7 +128,7 @@ footer{border-top:1px solid var(--rule);margin-top:72px;padding-top:18px;font-si
 <div class=kpi><div class=label>Input spend</div><div class=value>$299</div><div class=help>Per month, extrapolated from this window.</div></div>
 </div></section>
 <section class=section><div class=section-head>
-<div><div class=label>03 / Findings - 4</div><h2>Fix the prefix before changing lifetime.</h2></div>
+<div><div class=label>03 / Findings - 4</div><h2>&#x27;research-agent&#x27; request cadence sits inside the one-hour window</h2></div>
 <p>Findings are ranked by severity and monthly impact. Each one names the mechanism, the evidence class, and the safest next action.</p></div>
 <div class=findings>
 <article class='finding high'><div class=finding-head><div><div class=badges><span class=tag>TTL-1</span><span class='tag modeled'>modeled</span><span class='tag risk'>quality risk: low</span></div><h3>&#x27;research-agent&#x27; request cadence sits inside the one-hour window</h3></div><div class=finding-money><b>~$214</b><span>avoidable / month</span></div></div><div class=finding-body><div><div class=block-label>Evidence</div><p>100% of gaps between requests fall between five minutes and one hour (median 11.2 min across 126 requests). In that band a five-minute cache expires before the next request and rewrites at 1.25x, while a one-hour cache would have read at 0.1x.</p></div><div><div class=block-label>Action</div><div class=fix>Set a one-hour TTL on the static prefix for this agent. Outside the five-minute-to-one-hour band the five-minute default is cheaper, so this is not a blanket change.</div></div></div></article>
