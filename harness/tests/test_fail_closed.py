@@ -463,11 +463,71 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
             self._run(self._hook(), "claude-haiku-4-5", provider="vertex_ai"),
             {"google-cloud/vertex"})
 
-    def test_an_unmarked_request_is_still_anthropic_direct(self):
-        """The common case must not move, or every existing deployment
-        silently changes surface."""
+    def test_an_unnamed_request_resolves_to_no_surface_at_all(self):
+        """This asserted `anthropic/direct`, on the reasoning that the common
+        case must not move or every existing deployment silently changes
+        surface. That concern is real and it lost to a larger one.
+
+        The old comment justified the guess by saying a wrong one "surfaces as
+        a provider error on the next call". Half true, and the wrong half:
+        ordering a mixed request wrongly does error on Bedrock, but a minimum
+        guessed too low does not — the provider processes it uncached, writes
+        nothing, returns no error and bills normally. A silent wrong answer on
+        somebody's production traffic, produced by us patching their request.
+
+        Deployments that were relying on the guess now get observation plus an
+        RT-UNATTRIBUTED alert naming the two ways to fix it, which is a louder
+        and cheaper failure than the one it replaces.
+        """
         self.assertEqual(self._run(self._hook(), "claude-haiku-4-5"),
-                         {"anthropic/direct"})
+                         {UNATTRIBUTED})
+
+    def test_mutation_stands_down_rather_than_patching_a_guessed_surface(self):
+        """The consequence, not the label."""
+        import asyncio
+        from cacheeconomics.plugin import CachePlugin, litellm_handler
+        seen = []
+        plug = CachePlugin(key=b"k" * 32, warmup=0)
+        real = plug.on_request
+        plug.on_request = lambda body, **kw: (
+            seen.append((kw.get("target_id"), kw.get("apply"))), real(body, **kw))[1]
+        h = litellm_handler(plug, mutate=True)
+        loop = asyncio.new_event_loop()
+        try:
+            for _ in range(3):
+                loop.run_until_complete(h.async_pre_call_hook(
+                    {}, None, {"model": "claude-opus-5",
+                               "messages": [{"role": "user", "content": "x" * 400}]},
+                    "completion"))
+        finally:
+            loop.close()
+        self.assertEqual(seen[0], (UNATTRIBUTED, False))
+        codes = [a.code for a in plug.alerts]
+        self.assertIn("RT-UNATTRIBUTED", codes)
+        self.assertEqual(codes.count("RT-UNATTRIBUTED"), 1,
+                         "one alert per scope, not one per request")
+
+    def test_a_named_surface_still_mutates(self):
+        """Standing down must not become never mutating."""
+        import asyncio
+        from cacheeconomics.plugin import CachePlugin, litellm_handler
+        seen = []
+        plug = CachePlugin(key=b"k" * 32, warmup=0)
+        real = plug.on_request
+        plug.on_request = lambda body, **kw: (
+            seen.append((kw.get("target_id"), kw.get("apply"))), real(body, **kw))[1]
+        h = litellm_handler(plug, mutate=True)
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(h.async_pre_call_hook(
+                {}, None, {"model": "claude-opus-5",
+                           "custom_llm_provider": "bedrock",
+                           "messages": [{"role": "user", "content": "x" * 400}]},
+                "completion"))
+        finally:
+            loop.close()
+        self.assertEqual(seen[0], ("amazon-bedrock/converse", True))
+        self.assertNotIn("RT-UNATTRIBUTED", [a.code for a in plug.alerts])
 
     def test_an_operator_override_answers_when_nothing_names_it(self):
         self.assertEqual(

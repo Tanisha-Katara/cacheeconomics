@@ -60,8 +60,7 @@ PROVIDER_TO_TARGET = {
 }
 
 
-def target_from_row(row: dict, default: str | None = None, *,
-                    when_absent: str | None = None) -> str:
+def target_from_row(row: dict, default: str | None = None) -> str:
     """Which provider surface a LiteLLM request is bound for.
 
     One reader, because this is consumed by two paths that had already
@@ -79,18 +78,24 @@ def target_from_row(row: dict, default: str | None = None, *,
     unmapped rather than folded into the default, so the registry refuses it
     instead of quietly pricing it as Anthropic.
 
-    `when_absent` is what the caller wants when the row states no surface at
-    all, and the two callers want opposite things because their failure modes
-    are opposite. Analysing a log: guessing produces a dollar figure that looks
-    reconciled and matches no invoice, silently, so the answer is
-    `UNATTRIBUTED` and the money is withheld. Rewriting a live request: the
-    plugin has to pick minimums, TTL support and a breakpoint budget to decide
-    anything at all, and a wrong guess produces a provider error on the next
-    call. Loud and immediate beats silent and expensive, so that path may
-    assume.
+    A row that states no surface gets `UNATTRIBUTED`, for both callers. There
+    used to be a `when_absent` parameter so the live hook could substitute
+    `anthropic/direct`, justified here on the grounds that "a wrong guess
+    produces a provider error on the next call. Loud and immediate beats silent
+    and expensive."
 
-    Kept as one function with a parameter rather than two functions, because
-    two functions is exactly how these paths diverged before.
+    That justification was half right and it was the wrong half. Ordering a
+    mixed-lifetime request wrongly does error on Bedrock. A *minimum* guessed
+    too low does not: the provider processes the request uncached, writes
+    nothing, returns no error, and the bill looks ordinary. Nothing anywhere
+    reports it -- which is the same silent shape this project's own LiteLLM
+    disclosure is about, arriving on somebody's production traffic because we
+    patched their request.
+
+    So the parameter is gone rather than merely unused. Leaving it with that
+    reasoning attached is an invitation to put the guess back, and a comment
+    that makes a gap harder to notice is the failure mode this codebase has hit
+    most often. The live path stands down and says so instead.
     """
     provider = (_text(row.get("custom_llm_provider")) or "").lower()
     if not provider:
@@ -115,7 +120,7 @@ def target_from_row(row: dict, default: str | None = None, *,
         # `UNATTRIBUTED` is registered as unpriceable, so dollar figures are
         # withheld and structural findings still report. `--target-id` states
         # the surface and restores them.
-        return default or when_absent or UNATTRIBUTED
+        return default or UNATTRIBUTED
     return PROVIDER_TO_TARGET.get(provider, provider)
 
 

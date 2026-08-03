@@ -685,7 +685,11 @@ class TestTheLiveWirePathIsOptIn(unittest.IsolatedAsyncioTestCase):
             n["i"] += 1
             return real(body, **kw)
         p.on_request = timed
-        h = litellm_handler(p, mutate=mutate)
+        # The surface is stated, because this class is about the *wire* half of
+        # `mutate` and needs a resolvable one to have anything to place. It used
+        # to arrive by way of the handler substituting anthropic/direct for an
+        # unnamed provider, which is the guess that now stands down.
+        h = litellm_handler(p, mutate=mutate, target_id="anthropic/direct")
         out = None
         for i in range(20):
             data = {"model": "claude-opus-5", "litellm_call_id": f"c{i}",
@@ -955,7 +959,11 @@ class TestTheAdapterReturnsEveryFieldItPatched(unittest.IsolatedAsyncioTestCase)
             c["i"] += 1
             return real(b, **kw)
         p.on_request = timed
-        h = litellm_handler(p, mutate=mutate)
+        # The surface is stated, because this class is about the *wire* half of
+        # `mutate` and needs a resolvable one to have anything to place. It used
+        # to arrive by way of the handler substituting anthropic/direct for an
+        # unnamed provider, which is the guess that now stands down.
+        h = litellm_handler(p, mutate=mutate, target_id="anthropic/direct")
         out = None
         for i in range(20):
             data = {"model": "claude-opus-5", "litellm_call_id": f"c{i}",

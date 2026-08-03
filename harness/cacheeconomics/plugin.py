@@ -49,10 +49,10 @@ from . import registry, tiers
 # Named, so an operator can silence or route it. A hook that fails open silently is a hook nobody knows is failing.
 _log = logging.getLogger("cacheeconomics.plugin")
 from .allocate import reuse_chain
-from .monitor import MAX_SCOPES, WINDOW, Monitor
+from .monitor import MAX_FIRING, MAX_SCOPES, WINDOW, Alert, Monitor
 from .segment import (apply_markers, marker_count, segments_from_request,  # noqa: F401
                       strip_markers, walk)
-from .trace import (Request, Segment, _text, read_field,
+from .trace import (UNATTRIBUTED, Request, Segment, _text, read_field,
                     resolve_litellm_tenant, session_of, write_tokens)
 
 # Bytes per token, matching the recorder's estimator. Deliberately the same
@@ -213,6 +213,23 @@ class CachePlugin:
         # policy so the two do not disagree about which scopes still exist.
         self.alerts: deque = deque(maxlen=MAX_ALERTS)
         self._effect: OrderedDict = OrderedDict()
+        # Which (scope, code, subject) triples have already been reported, so a
+        # condition true on every request is one alert rather than one per
+        # request. Same contract the monitor holds itself to, and bounded for
+        # the same reason: this lives in a request path for weeks.
+        self._said: OrderedDict = OrderedDict()
+
+    def _record_alert(self, alert) -> bool:
+        """Keep an alert, once per subject per scope. Returns whether it was
+        new, so a caller can tell "reported" from "already reported"."""
+        key = (alert.scope, alert.code, alert.subject)
+        if key in self._said:
+            return False
+        self._said[key] = True
+        while len(self._said) > MAX_FIRING * 8:
+            self._said.popitem(last=False)
+        self.alerts.append(alert)
+        return True
 
     # --- the request path -------------------------------------------------
 
@@ -780,13 +797,23 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
             # rewrites the request rather than merely reporting on it, where
             # being wrong produces a provider error.
             from .adapters.litellm import target_from_row
-            # This path rewrites a request rather than reporting on it. It
-            # must resolve a surface to pick minimums, TTLs and a breakpoint
-            # budget, and a wrong guess surfaces as a provider error on the
-            # next call. The analysis path takes the opposite default, because
-            # there a wrong guess is a silent dollar figure.
-            target_id = target_from_row(data, self.target_id,
-                                        when_absent="anthropic/direct")
+            # No guess, on either half. This substituted `anthropic/direct` for
+            # an unresolvable surface, on the reasoning that a wrong guess
+            # "surfaces as a provider error on the next call" — which is only
+            # half true, and the wrong half. Ordering a mixed request wrongly
+            # does error on Bedrock. A *minimum* guessed too low does not: the
+            # provider processes the request uncached, writes nothing, returns
+            # no error, and the bill looks ordinary. That is the same silent
+            # shape this project's own LiteLLM disclosure is about, and here it
+            # would be arriving on somebody's production traffic because we
+            # patched their request.
+            #
+            # So an unresolvable surface means observe only. The markers this
+            # request does not get are worth less than a mutation made against
+            # minimums, TTLs and a breakpoint budget belonging to a provider it
+            # is not going to.
+            target_id = target_from_row(data, self.target_id)
+            unattributed = target_id == UNATTRIBUTED
             out, decision = self.plugin.on_request(
                 prompt, model=data.get("model", ""),
                 target_id=target_id,
@@ -806,7 +833,26 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
                 markable=markable_positions(prompt),
                 # Planning without sending has to be the plugin's decision, not
                 # a `return data` after it has already recorded the placement.
-                apply=self.mutate)
+                # And never applied against a surface nobody named.
+                apply=self.mutate and not unattributed)
+            # Said once per scope, not per request. A handler that stands down
+            # silently is indistinguishable from one that found nothing worth
+            # marking, and an operator who turned `mutate` on has every reason
+            # to expect markers.
+            if unattributed and self.mutate:
+                self.plugin._record_alert(Alert(
+                    "RT-UNATTRIBUTED", "medium",
+                    (_tenant_of(user_api_key_dict, data), UNATTRIBUTED),
+                    "mutation is standing down: this request names no provider",
+                    "Markers are placed against a surface's minimum cacheable "
+                    "prefix, its supported lifetimes and its breakpoint budget, "
+                    "and none of those are known here. A minimum guessed too low "
+                    "is not an error: the provider processes the request "
+                    "uncached, writes nothing and bills normally, so nothing "
+                    "would report it. Observation continues.",
+                    subject="unattributed",
+                    fix="Set `target_id` on the handler, or configure LiteLLM to "
+                        "pass `custom_llm_provider` on the request."))
             # The call id correlates this request with its own response, and
             # nothing else.
             key = data.get("litellm_call_id")
