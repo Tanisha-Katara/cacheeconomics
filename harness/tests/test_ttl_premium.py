@@ -364,3 +364,114 @@ class TestThresholdsAreEconomicNotFrequency(unittest.TestCase):
         got = self._codes(ts)
         self.assertNotIn("TTL-1", got)
         self.assertIn("TTL-2", got, "TTL-2 owns this trace and should still speak")
+
+
+class TestTheOtherRulesStoppedGuessing(unittest.TestCase):
+    """Four rules that each excluded, hard-coded or double-counted something."""
+
+    def _seg(self, **kw):
+        return Segment(**kw)
+
+    def _usage(self, w, r=0):
+        return {"input_tokens": 10, "cache_read_input_tokens": r,
+                "cache_creation_input_tokens": w,
+                "cache_creation": {"ephemeral_5m_input_tokens": w,
+                                   "ephemeral_1h_input_tokens": 0}}
+
+    def _codes(self, reqs, tier=Tier.INSTRUMENTED):
+        return {f.code: f for f in analyze(
+            TraceSet(requests=reqs, tier=tier, source="t"),
+            allow_unreconciled=True).findings}
+
+    def test_an_intermittent_prefix_tail_is_reported_by_the_rules_that_can_help(self):
+        """A review flagged that VOL-1 ignores absence. It does not, wherever
+        its fix applies: an optional block in front of other content renumbers
+        everything behind it, so the position holds two ids and the existing
+        buckets catch it.
+
+        What slips through is an optional block at the *end* of the prefix. That
+        forces a rewrite, but VOL-1's remedy is to move the volatile block
+        behind the stable span and there is no stable span behind it. Reporting
+        it there would attach a fix that recovers nothing. These three cover it
+        instead, and their fixes are the ones that apply.
+        """
+        def mk(i, present):
+            segs = [Segment(id="tools", role="tools", tokens=30_000, index=0)]
+            if present:
+                segs.append(Segment(id="opt", role="system", tokens=200, index=1,
+                                    cache_marked=True, ttl="5m"))
+            else:
+                segs[0] = Segment(id="tools", role="tools", tokens=30_000,
+                                  index=0, cache_marked=True, ttl="5m")
+            return Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                           model="claude-opus-5", agent="a", session="s",
+                           ttl_requested="5m", segments=segs,
+                           usage=self._usage(30_000))
+        got = self._codes([mk(i, i % 2 == 0) for i in range(30)])
+        for code in ("EFF-1", "REB-1", "CAC-1"):
+            self.assertIn(code, got)
+
+    def test_min1_sees_an_inner_marker_below_the_minimum(self):
+        """`cached_prefix_tokens` is the prefix at the *last* marker and the
+        counters are request-wide, so a 200-token marker in front of a 30k one
+        was invisible: the outer marker wrote, the inner did nothing, and
+        nothing anywhere said so."""
+        segs = [Segment(id="tiny", role="system", tokens=200, index=0,
+                        cache_marked=True, ttl="5m"),
+                Segment(id="big", role="tools", tokens=30_000, index=1,
+                        cache_marked=True, ttl="5m")]
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                        model="claude-opus-5", agent="a", session="s",
+                        ttl_requested="5m", segments=segs,
+                        usage=self._usage(30_200, r=0)) for i in range(20)]
+        self.assertIn("MIN-1", self._codes(reqs))
+
+    def test_reb0_reports_sessionless_writers_in_a_mixed_export(self):
+        """`if not sessions` meant one sessioned request anywhere silenced this
+        for every sessionless one -- and those are exactly the rows REB-1 cannot
+        reason about."""
+        u = self._usage(50_000)
+        reqs = [Request(request_id=f"s{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                        model="claude-opus-5", session="s",
+                        usage=self._usage(100)) for i in range(2)]
+        reqs += [Request(request_id=f"n{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                         model="claude-opus-5", usage=u) for i in range(50)]
+        f = self._codes(reqs, tier=Tier.USAGE_ONLY).get("REB-0")
+        self.assertIsNotNone(f, "the sessionless writers vanished")
+        self.assertIn("50 of 52", f.detail)
+        self.assertEqual(f.affected_requests, 50)
+
+    def test_fan1_uses_observed_first_token_time_over_a_flat_window(self):
+        """A sibling sent at t=8s cannot have read an entry whose first token
+        arrives at t=20s. The flat five-second window skipped it."""
+        seg = [Segment(id="p", role="system", tokens=30_000, index=0,
+                       cache_marked=True, ttl="5m")]
+        reqs = []
+        for k in range(12):
+            base = k * 600
+            for tag, off in (("a", 0), ("b", 8)):
+                reqs.append(Request(
+                    request_id=f"{tag}{k}", sent_at=T0 + timedelta(seconds=base + off),
+                    first_token_at=T0 + timedelta(seconds=base + off + 20),
+                    model="claude-opus-5", agent="a", session=f"{tag}{k}",
+                    ttl_requested="5m", segments=seg, usage=self._usage(30_000)))
+        f = self._codes(reqs).get("FAN-1")
+        self.assertIsNotNone(f, "the flat window skipped an 8-second sibling")
+        self.assertIn("observed first-token time", f.detail)
+
+    def test_fan1_says_so_when_it_had_to_fall_back(self):
+        """A stand-in for provider latency must not read as an observation."""
+        seg = [Segment(id="p", role="system", tokens=30_000, index=0,
+                       cache_marked=True, ttl="5m")]
+        reqs = []
+        for k in range(12):
+            base = k * 600
+            for tag, off in (("a", 0), ("b", 2)):
+                reqs.append(Request(
+                    request_id=f"{tag}{k}", sent_at=T0 + timedelta(seconds=base + off),
+                    model="claude-opus-5", agent="a", session=f"{tag}{k}",
+                    ttl_requested="5m", segments=seg, usage=self._usage(30_000)))
+        f = self._codes(reqs).get("FAN-1")
+        self.assertIsNotNone(f)
+        self.assertIn("five-second window", f.detail)
+        self.assertIn("stand-in", f.detail)

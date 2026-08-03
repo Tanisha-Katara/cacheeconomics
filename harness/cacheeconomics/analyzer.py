@@ -347,6 +347,21 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
     # stable headers are two prefixes, not one prefix changing.
     per_chain = defaultdict(lambda: defaultdict(set))
     labels = defaultdict(set)
+    # A review asked why absence is not treated as volatility here, and the
+    # answer is that it is, wherever this rule's remedy applies. An optional
+    # block *in front of* other content renumbers everything behind it, so the
+    # position holds two different ids and the buckets below already catch it.
+    #
+    # The case that slips through is an optional block at the *end* of the
+    # cached prefix. That does change the cached bytes and does force a rewrite
+    # -- but VOL-1's whole recommendation is to move the volatile block behind
+    # the stable span, and there is no stable span behind it. `tokens` for the
+    # suffix comes out zero and the finding correctly recovers nothing.
+    #
+    # Detecting it here and reporting it under a fix that cannot help would be
+    # worse than the gap. EFF-1, REB-1 and CAC-1 all fire on that trace, and
+    # their remedies are the ones that apply. Tried the change, measured what it
+    # produced, took it out.
     for r in reqs:
         if not r.segments:
             continue
@@ -521,7 +536,24 @@ def _f_below_minimum(reqs, ratios, window, rate_for) -> Finding | None:
             continue
         created = write_tokens(r.usage)
         read = r.usage.get("cache_read_input_tokens", 0) or 0
-        if r.cached_prefix_tokens < minimum and created == 0 and read == 0:
+        # Every marked breakpoint, not only the outermost. `cached_prefix_tokens`
+        # is the prefix at the last marker, and the counters are request-wide, so
+        # a 200-token marker followed by a 30k one looked fine: the outer marker
+        # wrote, `created` was nonzero, and the inner marker sat below the
+        # minimum doing nothing with nothing to show it. That is the silent
+        # failure this rule exists to catch, hiding inside a request where
+        # caching otherwise worked.
+        prefixes, running = [], 0
+        for sg in sorted(r.segments, key=lambda x: x.index):
+            running += sg.tokens or 0
+            if sg.cache_marked:
+                prefixes.append(running)
+        if prefixes:
+            if any(p < minimum for p in prefixes):
+                hits.append((r, minimum))
+        elif r.cached_prefix_tokens < minimum and created == 0 and read == 0:
+            # No segment structure to walk. Fall back to the request-wide test,
+            # which is all a usage-only trace can support.
             hits.append((r, minimum))
     if not hits:
         return None
@@ -992,11 +1024,32 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             buckets[((r.tenant, r.target_id, r.model), pk)].append(r)
     waste, groups, unprovable = 0.0, 0, 0
     affected = set()
+    # Which rule decided each pair was concurrent, so the detail can say so
+    # rather than implying every trace was measured the same way.
+    boundaries: set = set()
     for _key, group in buckets.items():
         group.sort(key=lambda r: r.sent_at)
         for a, b in zip(group, group[1:]):
-            if (b.sent_at - a.sent_at).total_seconds() >= 5:
-                continue
+            # Fan-out is `b` going out before `a`'s entry could be readable, and
+            # the trace often says when that was. A flat five seconds is a guess
+            # about provider latency dressed as a measurement: a request whose
+            # first token arrives at t=20s has a sibling at t=8s that could not
+            # possibly have read its cache, and the flat window skipped it
+            # because 8 >= 5.
+            #
+            # `first_token_at` is the observed boundary and is used wherever the
+            # recorder captured it. The five seconds stays only as the fallback
+            # for traces that carry no first-token timing, and the detail says
+            # which one was used.
+            if a.first_token_at:
+                if b.sent_at >= a.first_token_at:
+                    continue
+                observed_boundary = True
+            else:
+                if (b.sent_at - a.sent_at).total_seconds() >= 5:
+                    continue
+                observed_boundary = False
+            boundaries.add(observed_boundary)
             # Both must have written, and the later one's lifetime must be
             # provable, or the premium being reclaimed is a guess.
             try:
@@ -1027,10 +1080,21 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
     return Finding(
         code="FAN-1", structural=True, title="Concurrent requests each writing the same prefix",
         severity="medium", evidence_class=MEASURED,
-        detail=(f"{groups} pair(s) of requests with an identical cached prefix were sent within "
-                f"five seconds of each other and both paid to write it. A cache entry only "
-                f"becomes readable once the first response has begun streaming, so requests "
-                f"fired in parallel cannot share the write."),
+        detail=(f"{groups} pair(s) of requests with an identical cached prefix went out "
+                f"before the first of them could have been read back, and both paid to "
+                f"write it. A cache entry only becomes readable once the first response "
+                f"has begun streaming, so requests fired in parallel cannot share the "
+                f"write."
+                + (" Concurrency was measured against the observed first-token time "
+                   "on this trace."
+                   if boundaries == {True} else
+                   " This trace carries no first-token timing, so concurrency was taken "
+                   "as a five-second window -- a stand-in for provider latency rather "
+                   "than an observation. Capture first_token_at to measure it."
+                   if boundaries == {False} else
+                   " Some pairs were measured against an observed first-token time and "
+                   "the rest against a five-second window, which is a stand-in used "
+                   "where that timing is missing.")),
         # Unique requests, not pairs times two. Three requests fanning out form
         # two adjacent pairs and would have been reported as four requests.
         affected_requests=len(affected),
@@ -1123,7 +1187,16 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
     rebuild is roughly a twelve-fold swing on the tokens involved.
     """
     sessions = _sessions(reqs)
-    if not sessions and any(write_tokens(r.usage) for r in reqs):
+    # Counted, not all-or-nothing. `if not sessions` meant one sessioned request
+    # anywhere in the export silenced this rule for every sessionless one --
+    # and the rows without a session are exactly the rows REB-1 cannot reason
+    # about. Two small sessioned requests beside fifty sessionless 50k writers
+    # reported no rebuilds and no abstention, which reads as "measured, none
+    # found" when the question was never asked of the expensive half.
+    grouped = {r.request_id for g in sessions.values() for r in g}
+    unmeasurable = [r for r in reqs
+                    if write_tokens(r.usage) and r.request_id not in grouped]
+    if unmeasurable:
         # Silence here would read as "no rebuilds", which is the opposite of
         # what is true: nothing in this export says which requests followed
         # which, so the question was never asked. The runtime abstains the same
@@ -1131,12 +1204,18 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
         return Finding(
             code="REB-0", title="Prefix rebuilds could not be measured",
             severity="low", evidence_class=MEASURED,
-            detail=("No request in this export carries both a session id and a "
-                    "timestamp, so there is no way to say which request followed "
-                    "which. Rebuild counting is the most useful thing this tool "
-                    "can do with usage counters alone, and it is the one finding "
-                    "that cannot be inferred from totals."),
-            affected_requests=len(reqs), avoidable_usd_month=None,
+            detail=(f"{len(unmeasurable):,} of {len(reqs):,} cache-writing "
+                    f"request(s) carry no session id and timestamp pair, so "
+                    f"there is no way to say which request followed which for "
+                    f"them. Rebuild counting is the most useful thing this tool "
+                    f"can do with usage counters alone, and it is the one "
+                    f"finding that cannot be inferred from totals. They wrote "
+                    f"{sum(write_tokens(r.usage) for r in unmeasurable):,} "
+                    f"tokens to cache between them, and nothing here can say "
+                    f"whether that was extension or teardown."
+                    + (" The rest of the export is grouped and REB-1 covers it."
+                       if grouped else "")),
+            affected_requests=len(unmeasurable), avoidable_usd_month=None,
             confidence="high", quality_risk="low",
             fix="Export a session or conversation id alongside usage. Nothing "
                 "else about the ingest needs to change. If the agent does not "
@@ -1179,13 +1258,21 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
                 elif read:
                     extended += 1
             prev = r
-    turns = rebuilds + extended + expired
-    if not rebuilds or turns < 10:
+    # Model-switch rebuilds are excluded in the detail text and were counted in
+    # every number: `turns`, `interval`, severity and affected_requests. So a
+    # session switching model every ten turns fired REB-1 at high severity,
+    # said the rebuilds were expected, and pointed the reader at compaction --
+    # while SPL-1 correctly named the model switch on the same trace. Excluded
+    # means excluded.
+    unexplained = rebuilds - switched
+    turns = rebuilds + extended + expired - switched
+    if not unexplained or turns < 10:
+        # Every rebuild here crossed a model change. That is a separate cache
+        # pool behaving as designed, and SPL-1 owns it.
         return None
-    interval = turns / rebuilds
+    interval = turns / unexplained
     if interval >= 40:
         return None
-    unexplained = rebuilds - switched
     return Finding(
         code="REB-1", title="The cached prefix is being rebuilt, not extended",
         severity="high" if interval < 15 else "medium",
@@ -1217,7 +1304,7 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
                            f"apart"] * bool(unprovable_turns))
                     + ".")
                    if (switched or expired or unprovable_turns) else "")),
-        affected_requests=rebuilds,
+        affected_requests=unexplained,
         avoidable_usd_month=None,
         confidence="high", quality_risk="low",
         fix="Find what changes the prefix between turns before touching a TTL. "

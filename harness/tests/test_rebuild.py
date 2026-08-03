@@ -80,17 +80,26 @@ class TestRebuildIsDistinguishedFromExtension(unittest.TestCase):
     def test_it_needs_enough_turns_before_it_speaks(self):
         self.assertNotIn("REB-1", findings(session(turns=6, rebuild_every=2)))
 
-    def test_a_model_switch_is_attributed_not_blamed(self):
-        """Switching model is a separate cache pool by design. Counting it as an
-        unexplained rebuild would send somebody hunting for a bug.
+    def test_a_model_switch_is_not_reported_as_a_prefix_rebuild(self):
+        """Switching model is a separate cache pool by design.
 
-        Asserted on substance rather than on a sentence: the earlier version
-        pinned the exact clause "coincide with a model change" and failed on a
-        rewrite that changed nothing about the behaviour it guards.
+        REB-1 used to fire here and attribute the rebuilds in prose while
+        counting them in every number -- `turns`, the interval, the severity and
+        affected_requests. So a trace whose rebuilds were entirely explained
+        still arrived as a rebuild finding telling the reader to go hunting for
+        compaction. Excluded now means excluded, and when nothing is left the
+        rule says nothing and SPL-1 owns the trace.
         """
-        f = findings(session(turns=60, switch_every=10))["REB-1"]
+        got = findings(session(turns=60, switch_every=10))
+        self.assertNotIn("REB-1", got)
+        self.assertIn("SPL-1", got, "nothing names the model switch")
+
+    def test_a_mixed_trace_reports_only_the_unexplained_rebuilds(self):
+        """Some rebuilds explained by a switch, some not. The finding has to
+        cover the remainder and only the remainder."""
+        f = findings(session(turns=120, rebuild_every=10, switch_every=40))["REB-1"]
+        self.assertIn("no innocent explanation", f.detail)
         self.assertIn("model change", f.detail)
-        self.assertNotIn("no innocent explanation", f.detail)
 
     def test_rebuilds_with_no_model_change_are_called_unexplained(self):
         f = findings(session(rebuild_every=10))["REB-1"]
