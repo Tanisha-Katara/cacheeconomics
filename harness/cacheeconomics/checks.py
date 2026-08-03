@@ -144,6 +144,21 @@ def check_breakpoint_budget(breakpoints: int, target_id: str = "anthropic/direct
             "end-of-history so it hits, one at the new end so only the delta is written.",
             f"leave two free for the rolling pair, so at most {maximum - 2} static markers")
 
+    if breakpoints == 0:
+        # Not a pass. On a surface that exposes developer-placed breakpoints,
+        # markers are the only lever there is, so "0 of 4 markers used" rendered
+        # as a green tick is the check reporting success on a prompt that caches
+        # nothing at all -- the same silent-uncached shape `check_minimum` fails
+        # rather than blesses. Under budget is true and beside the point.
+        return Result(
+            name, Status.ABSTAIN,
+            f"no cache markers on {target_id}, so there is no budget to check",
+            f"{target_id} accepts developer-placed breakpoints and this request "
+            f"carries none, so nothing is cached and the {maximum}-marker budget "
+            f"is not the constraint. The provider returns no error for this.",
+            "place a marker at the deepest stable boundary, or state that this "
+            "prompt is deliberately uncached")
+
     return Result(name, Status.PASS, f"{breakpoints} of {maximum} markers used on {target_id}")
 
 

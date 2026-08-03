@@ -348,6 +348,28 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
     # so short-before-long is legal here; on a surface that constrains it,
     # `_mixed_variants` still has to respect that.
     seen_labels = set()
+    # Why it did not run, when it did not. The bound was silent: above eight
+    # segments the search returned nothing and the caller recorded nothing, so a
+    # nine-segment prompt got an answer shaped exactly like a searched one --
+    # while the function's own docstring said "the caller says so". A skipped
+    # search that looks like a completed one is the failure this whole package
+    # is about.
+    skipped = None
+    if len(segments) > MIXED_EXHAUSTIVE_MAX_SEGMENTS:
+        skipped = (f"mixed-lifetime search did not run: {len(segments)} segments "
+                   f"is above the {MIXED_EXHAUSTIVE_MAX_SEGMENTS}-segment bound "
+                   f"on exhaustive placement, so the plan below is the best of "
+                   f"the uniform arms and their relabelings, not of every "
+                   f"placement")
+    elif len(write_rates) < 2:
+        skipped = ("mixed-lifetime search did not run: this surface records one "
+                   "lifetime, so there is nothing to mix")
+    elif not gaps:
+        skipped = ("mixed-lifetime search did not run: no request gaps were "
+                   "observed, so no lifetime can be scored against survival")
+    if skipped:
+        notes.append(skipped)
+        searched.append(("mixed-exhaustive", None))
     for label, alloc in _mixed_exhaustive(segments, cum, survive, minimum,
                                           budget, write_rates, read_rate, gaps,
                                           uncached, notes, target_id):
@@ -365,8 +387,14 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
             if alloc.expected_cost < best.expected_cost:
                 best = alloc
 
+    # `best.notes` is the list `_search` built from `base_notes`, copied before
+    # the skip was known, so appending to `notes` above does not reach the
+    # caller. Attach it here or the whole point of recording the skip is lost.
+    out_notes = list(best.notes)
+    if skipped and skipped not in out_notes:
+        out_notes.append(skipped)
     return Allocation(best.tiers, best.expected_cost, uncached,
-                      searched, best.notes)
+                      searched, out_notes)
 
 
 def _search(segments, cum, survive, minimum, budget, ttl, live,

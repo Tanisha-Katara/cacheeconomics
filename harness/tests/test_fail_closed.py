@@ -1083,3 +1083,84 @@ class TestThePricingPrimitivesRefuseToInvent(unittest.TestCase):
         segs = [{"bytes": 0}, {"bytes": 0}, {"bytes": 0}]
         self.assertEqual([s["bytes"] for s in apply_counts(segs, [0, 0, 1000])],
                          [0, 0, 1000])
+
+
+class TestSilentDegradationIsSpokenAloud(unittest.TestCase):
+    """Three places the tool answered confidently without saying it had stopped
+    looking, or had done less than the answer implies.
+
+    None of these produced a wrong number. Each produced a right-shaped one: a
+    green tick, a searched plan, a note about a limit. That is worse, because
+    there is nothing for a reader to notice.
+    """
+
+    def test_zero_markers_is_not_a_passing_budget(self):
+        """`0 of 4 markers used` rendered as PASS on a surface where markers
+        are the only lever there is. Under budget, and nothing cached."""
+        from cacheeconomics import checks
+        r = checks.check_breakpoint_budget(0, "anthropic/direct")
+        self.assertEqual(r.status, checks.Status.ABSTAIN)
+        self.assertNotEqual(r.status, checks.Status.PASS)
+
+    def test_a_real_budget_still_passes(self):
+        """The other direction: abstaining on zero must not swallow the case
+        the check is for."""
+        from cacheeconomics import checks
+        self.assertEqual(checks.check_breakpoint_budget(1, "anthropic/direct").status,
+                         checks.Status.PASS)
+        self.assertEqual(checks.check_breakpoint_budget(4, "anthropic/direct").status,
+                         checks.Status.PASS)
+        self.assertEqual(checks.check_breakpoint_budget(5, "anthropic/direct").status,
+                         checks.Status.FAIL)
+
+    def _alloc(self, n):
+        from cacheeconomics import tiers
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from test_allocator_full import sg
+        segs = [sg(i, "system", 4000, f"s{i}") for i in range(n)]
+        return tiers.allocate(segs, {i: 0.0 for i in range(n)},
+                              target_id="anthropic/direct", model="claude-opus-5",
+                              gaps=[600.0] * 10)
+
+    def test_an_unsearched_plan_says_it_was_unsearched(self):
+        """Above the bound the exhaustive search returns nothing and the caller
+        recorded nothing, so a nine-segment prompt got an answer shaped exactly
+        like a searched one -- while the function's docstring said "the caller
+        says so"."""
+        from cacheeconomics import tiers
+        a = self._alloc(tiers.MIXED_EXHAUSTIVE_MAX_SEGMENTS + 1)
+        self.assertTrue([n for n in a.notes if "did not run" in n],
+                        "a skipped search is indistinguishable from a completed one")
+        self.assertIn(("mixed-exhaustive", None), a.searched)
+
+    def test_a_searched_plan_does_not_claim_it_was_skipped(self):
+        from cacheeconomics import tiers
+        a = self._alloc(tiers.MIXED_EXHAUSTIVE_MAX_SEGMENTS - 2)
+        self.assertFalse([n for n in a.notes if "did not run" in n])
+        self.assertNotIn(("mixed-exhaustive", None), a.searched)
+
+    def _litellm_plan(self, already, points):
+        from cacheeconomics import allocate
+        from cacheeconomics.trace import Request, Segment
+        segs = [Segment(id=f"s{i}", role="system", tokens=2_000, index=i,
+                        cache_marked=(i < already),
+                        ttl="5m" if i < already else None)
+                for i in range(8)]
+        r = Request(request_id="r", sent_at=datetime(2026, 7, 29, 9, tzinfo=timezone.utc),
+                    model="claude-opus-5", target_id="anthropic/direct",
+                    usage={"input_tokens": 16_000}, segments=segs, session="s")
+        return allocate.litellm_auto(r, injection_points=points)
+
+    def test_a_full_budget_does_not_get_one_more(self):
+        """The marker was written and *then* the limit checked, so a caller
+        arriving with a full budget left with one over -- and the note said it
+        "stopped at the limit" on the exact run that exceeded it."""
+        plan = self._litellm_plan(4, [{"index": 4}, {"index": 5}])
+        self.assertLessEqual(len(plan.ttls), 4)
+        self.assertTrue([n for n in plan.notes if "stopped at the" in n])
+
+    def test_and_it_still_injects_when_there_is_room(self):
+        plan = self._litellm_plan(1, [{"index": 4}, {"index": 5}])
+        self.assertEqual(len(plan.ttls), 3)
+        self.assertFalse([n for n in plan.notes if "stopped at the" in n],
+                         "claimed a limit it never reached")

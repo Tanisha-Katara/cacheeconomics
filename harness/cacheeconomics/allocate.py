@@ -175,6 +175,7 @@ def litellm_auto(req: Request, max_markers: int | None = None,
     by_index = {s.index: s for s in req.segments}
     ttls = dict(shipped)
     added = []
+    stopped = False
     for point in injection_points:
         i = point.get("index") if isinstance(point, dict) else None
         if not isinstance(i, int):
@@ -185,15 +186,23 @@ def litellm_auto(req: Request, max_markers: int | None = None,
             # Already marked by the caller: LiteLLM writes into the existing
             # message rather than adding a second marker.
             continue
+        # Checked before the write, not after. Writing first and breaking on
+        # `>=` puts one marker over the limit on the wire, and the note then
+        # says it "stopped at the limit" on the exact run that exceeded it --
+        # the plan claiming a budget it had just broken. A caller arriving with
+        # a full budget got one more.
+        if len(ttls) >= max_markers:
+            stopped = True
+            break
         control = (point.get("control") or {}) if isinstance(point, dict) else {}
         ttls[i] = control.get("ttl") or "5m"
         added.append(i)
-        if len(ttls) >= max_markers:
-            break
+    else:
+        stopped = len(ttls) >= max_markers
 
     notes = [f"{len(added)} marker(s) injected at configured points; "
              f"{len(shipped)} already carried one and were left alone"]
-    if len(ttls) >= max_markers:
+    if stopped:
         notes.append(f"stopped at the {max_markers}-marker limit for "
                      f"{req.target_id}, counting the caller's own markers")
     return Plan("litellm-auto", sorted(ttls), ttls, notes)
