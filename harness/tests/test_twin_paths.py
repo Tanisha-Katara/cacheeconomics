@@ -1666,3 +1666,72 @@ class TestStructuralMoneyNeedsCountedTokens(unittest.TestCase):
                 fh.close()
                 self.addCleanup(os.unlink, fh.name)
                 self.assertIs(load_jsonl(fh.name).tokens_are_counted, expected)
+
+
+class TestBothRenderersSayWhatToDo(unittest.TestCase):
+    """The text report printed the diagnosis and withheld the remedy.
+
+    Every finding carries a computed `fix`. The HTML renderer printed it under
+    "Action"; `Finding.describe` did not print it at all. So the report that
+    actually gets pasted into an email told the reader what was wrong and never
+    what to do, for every finding, and the two renderers disagreed about the
+    only part anybody acts on.
+
+    This file already asserted that both renderers agree about *money*. Nothing
+    compared what they tell the user to do, which is why it survived.
+    """
+
+    def _analysis(self):
+        segs = [Segment(id="vol", role="system", tokens=400, index=0),
+                Segment(id="tools", role="tools", tokens=30000, index=1,
+                        cache_marked=True, ttl="5m"),
+                Segment(id="turn", role="user", tokens=200, index=2)]
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
+                        model="claude-opus-5", agent="a", session="s",
+                        ttl_requested="5m",
+                        usage={"input_tokens": 200, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 30400},
+                        segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
+                                  for s in segs])
+                for i in range(40)]
+        return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"),
+                       allow_unreconciled=True)
+
+    def test_every_fix_reaches_both_renderers(self):
+        from cacheeconomics.report import render_html, render_text
+        a = self._analysis()
+        html, text = render_html(a), render_text(a)
+        missing = [f.code for f in a.findings
+                   if f.fix and f.fix[:40] not in text]
+        self.assertEqual(missing, [], "findings whose remedy the text report drops")
+        missing_html = [f.code for f in a.findings
+                        if f.fix and f.fix[:40] not in html]
+        self.assertEqual(missing_html, [], "findings whose remedy the HTML report drops")
+
+    def test_a_first_run_says_what_to_run_next(self):
+        """It used to end on five notes explaining what it would not answer and
+        stop there. A refusal with no next step reads as a dead end."""
+        from cacheeconomics.report import _next_steps, render_text
+        a = self._analysis()
+        steps = _next_steps(a)
+        self.assertTrue(steps, "no next steps offered")
+        self.assertIn("next:", render_text(a))
+
+    def test_the_steps_name_real_flags(self):
+        """A step telling someone to pass a flag that does not exist is worse
+        than no step."""
+        import argparse
+
+        from cacheeconomics import cli, report
+        a = self._analysis()
+        p = argparse.ArgumentParser()
+        cli._ingest_args(p)
+        cli._pricing_args(p)
+        p.add_argument("--invoice-usd", type=float)
+        p.add_argument("--allow-unreconciled", action="store_true")
+        known = {s for a_ in p._actions for s in a_.option_strings}
+        for step in report._next_steps(a):
+            for word in step.split():
+                flag = word.strip(".,'\"")
+                if flag.startswith("--"):
+                    self.assertIn(flag, known, f"step names unknown flag {flag}")

@@ -62,8 +62,15 @@ class Finding:
         # point: the safety property does not depend on remembering it.
         amount = (f"  ~{f}/mo" if f and f.released
                   else ("  [figure withheld]" if f else ""))
+        # The recommended action, which this renderer omitted entirely while the
+        # HTML one printed it under "Action". So a reader of the text report --
+        # the one that gets pasted into an email -- got the diagnosis and not
+        # the remedy, for every finding, and the two renderers disagreed about
+        # what the user was told to do. The twin-path tests never caught it
+        # because none of them compared the *actionable* half.
+        action = f"\n    do this: {self.fix}" if self.fix else ""
         return (f"[{self.severity.upper()}] {self.code} {self.title}{amount}\n"
-                f"    {self.detail}\n"
+                f"    {self.detail}{action}\n"
                 f"    evidence: {self.evidence_class} · confidence: {self.confidence} "
                 f"· quality risk: {self.quality_risk}")
 

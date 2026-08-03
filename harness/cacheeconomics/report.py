@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 from .analyzer import Analysis
 from .money import Figure
+from .trace import Tier
 
 _CSS = """
 :root{color-scheme:light;--bg:#fbfbf9;--panel:#fff;--ink:#111110;--ink2:#4d4b46;
@@ -434,4 +435,64 @@ def render_text(a: Analysis) -> str:
         out.append("")
         for n in a.notes:
             out.append(f"note: {n}")
+
+    steps = _next_steps(a)
+    if steps:
+        out.append("")
+        out.append("next:")
+        for i, step in enumerate(steps, 1):
+            out.append(f"  {i}. {step}")
     return "\n".join(out)
+
+
+def _next_steps(a: Analysis) -> list:
+    """What to run now, given what this particular report could not answer.
+
+    The report used to end on a wall of caveats. Every one of them was true and
+    none of them said what to do about it, so a first run read as a list of
+    refusals with no way forward -- the tool telling you it would not answer,
+    five times, and then stopping.
+
+    Ordered by what unblocks the most. A missing invoice blocks every dollar
+    figure, so it goes first; the tier only decides which *kinds* of finding are
+    reachable at all.
+    """
+    steps = []
+    withheld = not (a.spend.get("input_usd") and a.spend["input_usd"].released)
+
+    if withheld and not a.reconciliation:
+        steps.append("Get a dollar figure: re-run with --invoice-usd <amount> "
+                     "from the provider bill covering this window. Every number "
+                     "stays hidden until it reconciles to within 5% of money "
+                     "that actually left an account.")
+        steps.append("Or, for an internal look before the bill arrives: add "
+                     "--allow-unreconciled. It releases the figures and stamps "
+                     "the report DRAFT, which is not something to forward.")
+    elif withheld and a.reconciliation:
+        steps.append("Figures are withheld and the reason is printed above. "
+                     "Fix that rather than working around it -- each of those "
+                     "gates exists because it once let a wrong number out.")
+
+    if a.tier is Tier.USAGE_ONLY:
+        steps.append("Reach the structural findings: this input carries usage "
+                     "counters but not prompt structure, so nothing here can "
+                     "say *which part* of the prompt costs you. Export request "
+                     "bodies from your gateway and re-run with --from bodies, "
+                     "or point the agent at tier-b/capture_proxy.py if you "
+                     "cannot export.")
+    elif a.tier is Tier.INFERRED and not getattr(a, "_tokens_counted", True):
+        steps.append("Put dollar figures on the structural findings: run "
+                     "tier-b/run_diagnostic.py instead, which counts tokens "
+                     "first. Segment sizes are estimated here and the estimate "
+                     "is 19.2% off at the median.")
+
+    acted = [f for f in a.findings if f.fix and f.severity in ("high", "medium")]
+    if acted:
+        top = acted[0]
+        steps.append(f"Act on {top.code} first. It is the highest-severity "
+                     f"finding here and the 'do this' line under it is the "
+                     f"change; the detail above it is why.")
+    elif a.findings:
+        steps.append("Nothing here is high severity. The findings above are "
+                     "measurements rather than problems.")
+    return steps
