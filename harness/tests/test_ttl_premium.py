@@ -23,8 +23,9 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cacheeconomics import registry
 from cacheeconomics.analyzer import analyze                       # noqa: E402
-from cacheeconomics.trace import Request, Tier, TraceSet          # noqa: E402
+from cacheeconomics.trace import Request, Segment, Tier, TraceSet          # noqa: E402
 
 T0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
 
@@ -270,3 +271,96 @@ class TestInBandGapsThatReadNothing(unittest.TestCase):
         f = findings(self._mix(96, 4, 0, prefix=900_000),
                      allow_unreconciled=True)["TTL-2"]
         self.assertIn("earning its premium", f.title)
+
+
+class TestThresholdsAreEconomicNotFrequency(unittest.TestCase):
+    """Two rules vetoed on how often something happened before pricing it.
+
+    EFF-1 returned early unless prefix efficiency was under 50%. TTL-1 returned
+    early unless more than 40% of gaps fell in the band. Both sat in front of an
+    economic test that was already correct, and both could only ever drop real
+    findings, never add false ones.
+
+    Neither constant was derived. Caching breaks even at `(W-1)/(W-R)`, which is
+    21.7% efficiency for a 5m write and 52.6% for a 1h write, so 0.5 was above
+    one and below the other. The band it got wrong was a 1h workload between 50%
+    and 52.6%: losing money on every request and silently dropped.
+    """
+
+    def _usage(self, w, r, ttl):
+        return {"input_tokens": 10, "cache_read_input_tokens": r,
+                "cache_creation_input_tokens": w,
+                "cache_creation": {"ephemeral_5m_input_tokens": w if ttl == "5m" else 0,
+                                   "ephemeral_1h_input_tokens": w if ttl == "1h" else 0}}
+
+    def _trace(self, w, r, ttl, n=20):
+        return TraceSet(requests=[
+            Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent="a", session="s",
+                    ttl_requested=ttl, usage=self._usage(w, r, ttl))
+            for i in range(n)], tier=Tier.USAGE_ONLY, source="t")
+
+    def _codes(self, ts):
+        return {f.code: f for f in analyze(ts, allow_unreconciled=True).findings}
+
+    def test_the_break_even_is_not_one_half(self):
+        """Derived, so a multiplier change moves it and nothing has to remember."""
+        m = registry.multipliers("anthropic/direct")
+        for key, expect in (("write_5m", 0.217), ("write_1h", 0.526)):
+            W, R = m[key], m["read"]
+            self.assertAlmostEqual((W - 1) / (W - R), expect, places=2)
+
+    def test_a_1h_workload_just_above_the_old_cutoff_still_loses_money(self):
+        """Efficiency 51.2%: over the old 0.5 veto, under the 1h break-even."""
+        f = self._codes(self._trace(100_000, 105_000, "1h")).get("EFF-1")
+        self.assertIsNotNone(f, "the frequency veto is still suppressing it")
+        self.assertGreater(f.avoidable_usd_month.raw(), 0)
+
+    def test_a_5m_workload_below_the_old_cutoff_is_still_left_alone(self):
+        """Efficiency 30%: under the old veto, but over the 5m break-even of
+        21.7%, so caching is winning and EFF-1 must stay quiet. Removing a veto
+        must not turn it into a false positive."""
+        self.assertNotIn("EFF-1", self._codes(self._trace(70_000, 30_000, "5m")))
+
+    def test_ttl1_prices_a_band_share_below_the_old_forty_percent(self):
+        """A stable million-token prefix rewritten across 35 ten-minute gaps,
+        with 64 one-minute reads between them, is 34% in-band. The rewrites are
+        worth more than most findings here and were dropped unpriced."""
+        seg = [Segment(id="p", role="system", tokens=1_000_000, index=0,
+                       cache_marked=True, ttl="5m")]
+        reqs, t, i = [], 0, 0
+        for _ in range(35):
+            t += 600
+            reqs.append(Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=t),
+                                model="claude-opus-5", agent="a", session="s",
+                                ttl_requested="5m", segments=seg,
+                                usage=self._usage(1_000_000, 0, "5m")))
+            i += 1
+            for _ in range(2):
+                t += 60
+                reqs.append(Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=t),
+                                    model="claude-opus-5", agent="a", session="s",
+                                    ttl_requested="5m", segments=seg,
+                                    usage=self._usage(0, 1_000_000, "5m")))
+                i += 1
+        f = self._codes(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED,
+                                 source="t")).get("TTL-1")
+        self.assertIsNotNone(f, "34% in-band was vetoed before pricing")
+        self.assertGreater(f.avoidable_usd_month.raw(), 0)
+
+    def test_ttl1_will_not_claim_an_in_band_cadence_with_no_in_band_gaps(self):
+        """The premise, which the 40% veto had been enforcing by accident. Every
+        gap 30s and no segment identity: TTL-1 fired anyway and announced a
+        cadence inside the one-hour window at 0% in-band, contradicting TTL-2 on
+        the same trace."""
+        ts = TraceSet(requests=[
+            Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=30 * i),
+                    model="claude-opus-5", agent="a", session="s",
+                    usage={"input_tokens": 50, "cache_read_input_tokens": 1000,
+                           "cache_creation_input_tokens": 40000,
+                           "cache_creation": {"ephemeral_5m_input_tokens": 20000,
+                                              "ephemeral_1h_input_tokens": 20000}})
+            for i in range(40)], tier=Tier.USAGE_ONLY, source="t")
+        got = self._codes(ts)
+        self.assertNotIn("TTL-1", got)
+        self.assertIn("TTL-2", got, "TTL-2 owns this trace and should still speak")

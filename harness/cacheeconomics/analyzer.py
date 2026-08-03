@@ -259,8 +259,24 @@ def _monthly(amount: float, window_days: float | None) -> money.Figure | None:
 def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
     """Are the writes being read? This is where money actually leaks."""
     eff = ratios.get("prefix_efficiency")
-    if eff is None or eff >= 0.5:
+    if eff is None:
         return None
+    # No efficiency cutoff. There used to be `eff >= 0.5: return None` here, a
+    # frequency veto in front of an economic test that was already correct --
+    # `wasted <= 0` below fires only when caching genuinely costs more than not
+    # caching, and it needs no help deciding that.
+    #
+    # 0.5 was also not the break-even for either lifetime. Caching pays for
+    # itself once `W*w + R*r <= w + r`, which solves to an efficiency of
+    # `(W-1)/(W-R)`: 21.7% for a 5m write at 1.25x and 52.6% for a 1h write at
+    # 2.0x. So the constant sat above one and below the other, and the band it
+    # got wrong was the 1h workload between 50% and 52.6% -- losing money and
+    # silently dropped, because the guard ran before the arithmetic that would
+    # have caught it.
+    #
+    # Deriving the number and keeping the guard would have been the smaller
+    # change. Deleting it is the better one: the money test subsumes it, and two
+    # thresholds for one question is how they drift apart.
     # The premium depends on the lifetime that was actually written. A 5m write
     # bills 1.25x and a 1h write bills 2.0x, so the wasted part of an unread
     # write is 0.25x or 1.0x of the base rate -- a factor of four apart. This
@@ -581,7 +597,33 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
         gaps.sort()
         median = gaps[len(gaps) // 2]
         in_band = sum(1 for g in gaps if 300 < g < 3600) / len(gaps)
-        if in_band <= 0.4:
+        # No band-share veto. `if in_band <= 0.4: continue` used to sit here and
+        # returned before anything was priced, which made a frequency counter
+        # the arbiter of a money question.
+        #
+        # What it dropped: a stable million-token prefix rewritten across 35
+        # ten-minute gaps, alongside 64 one-minute reads, is 35% in-band and
+        # suppressed -- while the 35 rewrites it would convert to reads are
+        # worth more than most findings this tool publishes. Band share scales
+        # with how chatty a workload is between its slow gaps, and that has no
+        # bearing on what the slow gaps cost.
+        #
+        # The timeline walk below already prices this properly, per cache scope,
+        # charging the cold write premium and crediting only the rewrites that
+        # actually fall in the band. `recoverable <= 0` is the gate. The share
+        # stays in the detail text as context for the reader, which is the job
+        # it can actually do.
+        #
+        # What does stay is the rule's own premise. Its title says the cadence
+        # sits inside the one-hour window, so at least one gap has to. Removing
+        # the 40% veto exposed that the veto had been doing this job by
+        # accident: on a trace with no segment identity and every gap 30
+        # seconds apart, TTL-1 fired and announced an in-band cadence at 0%
+        # in-band, contradicting TTL-2 on the same trace. That is the same
+        # defect TTL-2 had -- a headline asserting a number the data denies --
+        # and a threshold is not the way to prevent it. Requiring the premise
+        # is.
+        if not in_band:
             continue
         # Only writes proven to be five-minute can be recovered by moving to
         # one hour. An earlier version multiplied every cache_creation token by
