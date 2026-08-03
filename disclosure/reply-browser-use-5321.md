@@ -11,13 +11,13 @@ issue, so that is stated rather than implied.
 
 Neither, I think. Make the lifetime configurable and leave the default at `5m`.
 
-That keeps interactive users exactly where they are, gives scheduled deployments
-a way to fix a real cost, and means `prompt_cache_creation_1h_tokens` in
-`views.py` stops being unreachable without anyone deleting it. It looks like a
-parameter on `ChatAnthropic` threaded into `_serialize_cache_control`.
+Interactive users stay where they are. Scheduled ones get a way to fix a real
+cost. And `prompt_cache_creation_1h_tokens` in `views.py` stops being unreachable
+without anyone deleting it. Looks like a parameter on `ChatAnthropic` threaded
+into `_serialize_cache_control`.
 
-Here is why not just switching to 1h, which is what my issue implied and which I
-now think would be wrong.
+My issue implied 1h was simply better. I now think that is wrong, and here is
+why.
 
 I ran 0.13.7 on one task at five schedules, capturing real requests through a
 forwarding proxy and reading the provider's own counters back. Cache writes per
