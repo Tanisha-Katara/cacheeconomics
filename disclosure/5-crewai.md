@@ -5,7 +5,7 @@
 `disclosure/verify_claims.py`
 **Reproduction:** `python3 disclosure/verify_crewai_tokens.py` — no key, no
 network, no crewAI install
-**Status:** not yet filed
+**Status:** filed 2026-08-03 as https://github.com/crewAIInc/crewAI/issues/6788
 
 ---
 

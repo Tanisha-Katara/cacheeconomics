@@ -2,7 +2,7 @@
 
 **Repo:** `Aider-AI/aider` · 47,906★ · Apache-2.0
 **Verified at:** `5dc9490bb35f9729ef2c95d00a19ccd30c26339c` (2026-05-22)
-**Status:** not yet filed
+**Status:** filed 2026-08-03 as https://github.com/Aider-AI/aider/issues/5516
 **Reproduction:** `python3 disclosure/verify_aider_cost.py` — no key, no network,
 no aider install; it reads the committed artifact rather than hard-coded
 numbers. `--live` makes three calls (uncached, write, read — one cannot show
