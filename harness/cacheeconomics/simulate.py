@@ -414,8 +414,17 @@ def simulate(reqs: list[Request], policy, volatility=None, cadence=None,
                 entry = live.get((scope, key))
                 if not (entry and entry[0] <= now < entry[1]):
                     continue
-                # Reachable from some breakpoint at or after it, within the
-                # window the provider searches back.
+                # Reachable from some breakpoint at or after it. The provider
+                # searches back FROM a breakpoint, so an entry sitting past
+                # every marker this request places cannot be found at all.
+                #
+                # This condition used to be inside `if window is not None`, so
+                # the neutral arm skipped it entirely and would read a 6k entry
+                # for a request whose only marker covers 2k -- a read no
+                # breakpoint could reach, inflating every neutral verdict.
+                # Reachability is not a pessimistic assumption; the window is.
+                if not any(m >= length for m in marks):
+                    continue
                 if window is not None and not any(
                         0 <= m - length <= window for m in marks):
                     continue

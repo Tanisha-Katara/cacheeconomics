@@ -1196,7 +1196,15 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
     grouped = {r.request_id for g in sessions.values() for r in g}
     unmeasurable = [r for r in reqs
                     if write_tokens(r.usage) and r.request_id not in grouped]
-    if unmeasurable:
+    # Reported alongside REB-1, not instead of it. Returning here meant one
+    # sessionless write anywhere suppressed the rebuild analysis of every
+    # grouped session -- and the detail then told the reader that REB-1 covered
+    # the rest, which it did not, because it never ran. A small unmeasurable
+    # slice hid the expensive pattern in the measurable one.
+    #
+    # `_rebuild_abstention` is raised first only when there is nothing left to
+    # measure. Otherwise it is stashed and the caller emits both.
+    if unmeasurable and not sessions:
         # Silence here would read as "no rebuilds", which is the opposite of
         # what is true: nothing in this export says which requests followed
         # which, so the question was never asked. The runtime abstains the same
@@ -1374,9 +1382,42 @@ def _f_cache_verdict(reqs, ratios, window, rate_for) -> Finding | None:
              "Stop writing caches that nothing reads before tuning anything else."))
 
 
+def _f_rebuild_abstention(reqs, ratios, window, rate_for) -> Finding | None:
+    """REB-0 as its own rule, so it cannot suppress REB-1.
+
+    These shared a function and REB-0 returned first. One sessionless cache
+    write anywhere therefore silenced the rebuild analysis of every grouped
+    session -- while REB-0's own detail told the reader that REB-1 covered the
+    rest. It did not; it never ran. A small unmeasurable slice hid the
+    expensive pattern in the measurable one.
+    """
+    sessions = _sessions(reqs)
+    grouped = {r.request_id for g in sessions.values() for r in g}
+    unmeasurable = [r for r in reqs
+                    if write_tokens(r.usage) and r.request_id not in grouped]
+    if not unmeasurable:
+        return None
+    return Finding(
+        code="REB-0", title="Prefix rebuilds could not be measured",
+        severity="low", evidence_class=MEASURED,
+        detail=(f"{len(unmeasurable):,} of {len(reqs):,} cache-writing "
+                f"request(s) carry no session id and timestamp pair, so there "
+                f"is no way to say which request followed which for them. They "
+                f"wrote {sum(write_tokens(r.usage) for r in unmeasurable):,} "
+                f"tokens to cache between them, and nothing here can say "
+                f"whether that was extension or teardown."
+                + (" The rest of the export is grouped, and REB-1 reports on it "
+                   "separately." if grouped else "")),
+        affected_requests=len(unmeasurable), avoidable_usd_month=None,
+        confidence="high", quality_risk="low",
+        fix="Export a session or conversation id alongside usage for these "
+            "requests. Nothing else about the ingest needs to change.")
+
+
 RULES = [_f_prefix_efficiency, _f_volatile_prefix, _f_below_minimum,
          _f_ttl_vs_cadence, _f_ttl_premium_unearned, _f_cold_fanout,
-         _f_model_split, _f_prefix_rebuild, _f_cache_verdict]
+         _f_model_split, _f_prefix_rebuild, _f_rebuild_abstention,
+         _f_cache_verdict]
 
 
 def analyze(ts: TraceSet, invoice_usd: float | None = None,

@@ -604,3 +604,97 @@ class TestTheSimulatorSearchesBackwardLikeTheProvider(unittest.TestCase):
         self.assertLess(pessimistic, neutral,
                         "the pessimistic arm read as much as the unbounded one, "
                         "so the window is not being enforced")
+
+
+class TestTodaysFixesDidNotBreakSomethingElse(unittest.TestCase):
+    """Three regressions introduced by fixes made earlier the same day.
+
+    Each fix was verified only against the case that motivated it, which is
+    exactly how a fix introduces a second defect.
+    """
+
+    def _u(self, w, r=0):
+        return {"input_tokens": 0, "cache_read_input_tokens": r,
+                "cache_creation_input_tokens": w,
+                "cache_creation": {"ephemeral_5m_input_tokens": w,
+                                   "ephemeral_1h_input_tokens": 0}}
+
+    def test_reb0_does_not_suppress_reb1(self):
+        """REB-0 and REB-1 shared a function and REB-0 returned first, so one
+        sessionless cache write anywhere silenced the rebuild analysis of every
+        grouped session -- while REB-0's detail told the reader REB-1 covered
+        the rest. It never ran."""
+        reqs = [Request(request_id="lone", sent_at=T0, model="claude-opus-5",
+                        usage=self._u(50_000))]
+        p = 100_000
+        for t in range(24):
+            cold = t % 3 == 0
+            reqs.append(Request(
+                request_id=f"s{t}", sent_at=T0 + timedelta(seconds=60 * (t + 1)),
+                model="claude-opus-5", session="s1",
+                usage=self._u(p if cold else 2_000, 0 if cold else p)))
+            p += 2_000
+        got = {f.code for f in analyze(
+            TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="t"),
+            allow_unreconciled=True).findings}
+        self.assertIn("REB-0", got)
+        self.assertIn("REB-1", got, "the unmeasurable slice hid the measurable one")
+
+    def test_the_simulator_cannot_read_past_every_current_marker(self):
+        """The backward search added today skipped the reachability test in the
+        neutral arm, because it sat inside `if window is not None`. The provider
+        searches back FROM a breakpoint, so an entry past every marker this
+        request places cannot be found. Reachability is not a pessimistic
+        assumption; only the window is."""
+        from cacheeconomics import simulate
+        from cacheeconomics.allocate import Plan
+        segs = lambda n: [Segment(id=c, role="system", tokens=2000, index=i)
+                          for i, c in enumerate("abcd"[:n])]
+        reqs = [Request(request_id="r1", sent_at=T0, model="claude-opus-5",
+                        agent="a", session="s", target_id="anthropic/direct",
+                        usage={}, segments=segs(3)),
+                Request(request_id="r2", sent_at=T0 + timedelta(seconds=30),
+                        model="claude-opus-5", agent="a", session="s",
+                        target_id="anthropic/direct", usage={}, segments=segs(4))]
+
+        def plan(r, **kw):
+            # r1 marks all three; r2 marks only the first.
+            i = 2 if r.request_id == "r1" else 0
+            return Plan(policy="p", marker_indices=[i], ttls={i: "5m"})
+
+        res = simulate.simulate(reqs, plan, assume=simulate.NEUTRAL)
+        self.assertEqual(res.usages[1].cache_read, 0,
+                         "read an entry no current breakpoint can reach")
+
+    def test_token_weighting_normalises_usage_first(self):
+        """`_weight` returned 0 for any non-dict usage, but this loader accepts
+        usage as a JSON string. One uncounted million-token row in that shape
+        weighed nothing, so 99 tiny counted rows reported fully counted -- the
+        row-counted gate reopening under schema drift."""
+        import json
+        import os
+        import tempfile
+
+        from cacheeconomics.trace import load_jsonl
+
+        def row(i, tok, counted, as_string):
+            u = {"input_tokens": tok, "cache_read_input_tokens": 0,
+                 "cache_creation_input_tokens": 0}
+            return {"request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i % 60:02d}:00Z",
+                    "model": "claude-opus-5", "target_id": "anthropic/direct",
+                    "session": "s", "ttl_requested": "5m", "tokens_counted": counted,
+                    "usage": json.dumps(u) if as_string else u,
+                    "segments": [{"id": f"a{i}", "role": "system", "tokens": tok // 2,
+                                  "index": 0, "cache_marked": True, "ttl": "5m"},
+                                 {"id": f"b{i}", "role": "user", "tokens": tok // 2,
+                                  "index": 1}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "x.jsonl")
+            with open(p, "w") as f:
+                for i in range(99):
+                    f.write(json.dumps(row(i, 100, True, False)) + "\n")
+                f.write(json.dumps(row(99, 1_000_000, False, True)) + "\n")
+            ts = load_jsonl(p, b"k" * 32)
+        self.assertLess(ts.tokens_counted, 0.01,
+                        "a JSON-string usage row weighed nothing")
+        self.assertFalse(ts.tokens_are_counted)

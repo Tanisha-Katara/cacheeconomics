@@ -1164,7 +1164,14 @@ def load_jsonl(path: str, key: bytes | None = None, *,
         # `_billed_input` calls `.get` on it. The malformed-ingest suite caught
         # this immediately, which is the whole reason it exists -- an ingest
         # that crashes on one bad row loses the entire file.
-        u = r.get("usage")
+        # Normalised the same way the Request builder normalises it. This read
+        # `r.get("usage")` and returned 0 for anything that was not already a
+        # dict -- but this loader accepts usage as a JSON string, so a row in
+        # that shape weighed nothing. Ninety-nine tiny counted dict rows beside
+        # one uncounted million-token JSON-string row then reported
+        # `tokens_counted == 1.0`, which is the row-counted gate reopening
+        # under schema drift.
+        u = _usage_dict(r.get("usage"))
         return (_billed_input(u) or 0) if isinstance(u, dict) else 0
 
     structured = [r for r in rows if _segment_list(r)]
