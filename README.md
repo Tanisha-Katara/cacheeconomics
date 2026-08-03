@@ -351,7 +351,7 @@ harness/cacheeconomics/
   cost.py       the four token classes, date-effective pricing
   money.py      a dollar figure that cannot be printed until it is released
   trace.py      ingest, tiering, reconciliation
-  analyzer.py   the finding rules (EFF-1, VOL-1, MIN-1, TTL-1, REB-1, ...)
+  analyzer.py   the finding rules (EFF-1, VOL-1, MIN-1, TTL-1, TTL-2, REB-1, ...)
   report.py     text and self-contained HTML
   simulate.py   replay a trace against a modelled cache; the policy bake-off
   allocate.py   placement policies, including a model of LiteLLM auto-injection
@@ -408,7 +408,7 @@ deciding to rewrite somebody's live traffic, and that second decision is yours.
 git clone https://github.com/Tanisha-Katara/cacheeconomics.git
 cd cacheeconomics && pip install .
 
-python3 -m pytest -q          # 1040 tests, no dependencies
+python3 -m pytest -q          # 1059 tests, no dependencies
 python3 web/build_bundle.py   # after changing anything under harness/cacheeconomics
 ```
 

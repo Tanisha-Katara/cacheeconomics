@@ -27,6 +27,12 @@ MODELED = money.MODELED
 # reorder prompt authority on the strength of nobody having checked.
 ALIGNMENT_FLOOR = 0.90
 
+# TTL-2 only speaks where the five-minute-to-one-hour band is nearly empty,
+# which is its whole premise: the long lifetime is being paid for and the
+# cadence never needed it. Deliberately well below TTL-1's 0.4 trigger so the
+# two rules cannot both recommend a change on one trace, which they did.
+BAND_IS_RARE = 0.10
+
 # Measured on 2026-07-28: a five-minute entry is gone somewhere between 300 and
 # 420 seconds, and a one-hour entry survived 56 minutes.
 _TTL_SECONDS = {"5m": 300, "1h": 3600}
@@ -693,6 +699,172 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             "is not a blanket change.")
 
 
+def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
+    """The other direction: a one-hour lifetime bought where five minutes would do.
+
+    TTL-1 answers "your cadence sits in the band and you are not using the long
+    lifetime". This is its mirror, and until now nothing here asked it: the long
+    lifetime is in use and the cadence never needed it. A reader whose agent
+    defaults to 1h got no finding at all, which reads as approval.
+
+    The naive version of this rule is wrong, and wrong in the expensive
+    direction. Counting 1h write tokens and multiplying by the 2.0-to-1.25
+    premium says "switch and save", and on the workload that prompted this rule
+    that answer is backwards. The gaps that fall in the five-minute-to-one-hour
+    band are rare -- 1.4% of them on the trace this was built against -- but each
+    one sits on a prefix that has been accumulating all session. Dropping to 5m
+    kills those entries, and the next request rewrites the whole prefix.
+
+    So both sides get counted, per isolation scope, per gap:
+
+        under 5 min   the 5m entry survives too, so the only difference is the
+                      write premium.                        saving 0.75x
+        5 min - 1 hr  the 5m entry is dead. The request writes prefix+delta at
+                      1.25x instead of reading prefix at 0.1x and writing delta
+                      at 2.0x.                       cost 1.15x on the prefix
+        over 1 hour   both are dead. No difference.
+
+    Net = 0.75 * (1h writes) - 1.15 * (prefix rewritten at band gaps), in
+    multiplier-units of the input rate. On the trace above that is +$482 against
+    -$526, so the long lifetime is right and the rule says so rather than
+    staying silent, because "I checked and 1h is correct here" is the answer
+    people actually arrive with the question about.
+
+    Multipliers come from the registry rather than being written into the
+    arithmetic, so a surface that prices its lifetimes differently is handled by
+    the same code and a surface with no 1h at all is skipped.
+    """
+    by_scope = defaultdict(list)
+    unprovable = 0
+    for r in reqs:
+        if not r.sent_at:
+            continue
+        try:
+            u = cost.Usage.from_anthropic(r.usage, ttl=_declared_ttl(r))
+        except ValueError:
+            unprovable += 1
+            continue
+        by_scope[(r.tenant, r.target_id, r.model, r.session)].append((r.sent_at, r, u))
+
+    written_1h = 0
+    band_prefix = 0            # tokens that would be rewritten if 1h became 5m
+    band_gaps = under_5m = over_1h = 0
+    saving = cost_of_switch = 0.0
+    surfaces = set()
+    for (tenant, target_id, model, session), rows in by_scope.items():
+        try:
+            m = registry.multipliers(target_id)
+        except registry.RegistryError:
+            continue
+        w5, w1h, read = m.get("write_5m"), m.get("write_1h"), m.get("read")
+        # An implicit-prefix surface has no lifetimes to choose between, so
+        # there is no premium to have overpaid. Skipping is the honest answer;
+        # pricing it against Anthropic's multipliers is how a Bedrock trace once
+        # produced a total no bill would match.
+        if not (w5 and w1h and read) or w1h <= w5:
+            continue
+        surfaces.add(target_id)
+        rows.sort(key=lambda x: x[0])
+        prev = None
+        for sent_at, r, u in rows:
+            per_token = rate_for(model, _when(r)) / 1e6
+            if u.cache_write_1h:
+                written_1h += u.cache_write_1h
+                saving += u.cache_write_1h * per_token * (w1h - w5)
+            if prev is not None:
+                gap = (sent_at - prev[0]).total_seconds()
+                if gap < 300:
+                    under_5m += 1
+                elif gap >= 3600:
+                    over_1h += 1
+                else:
+                    # The entry the 1h lifetime kept alive. Under 5m it is gone
+                    # and this request rewrites what it would have read.
+                    prefix = r.usage.get("cache_read_input_tokens") or 0
+                    if prefix:
+                        band_gaps += 1
+                        band_prefix += prefix
+                        cost_of_switch += prefix * per_token * (w5 - read)
+            prev = (sent_at, r, u)
+
+    if not written_1h:
+        return None
+    total_gaps = under_5m + band_gaps + over_1h
+    if total_gaps < 10:
+        return None
+
+    net = saving - cost_of_switch
+    share_short = under_5m / total_gaps if total_gaps else 0.0
+    share_band = band_gaps / total_gaps if total_gaps else 0.0
+    # The rule's own premise: the cadence never needed the long lifetime. Where
+    # a real share of gaps land in the band, it is load-bearing and this rule
+    # has nothing to say -- TTL-1 owns lifetime questions there.
+    #
+    # Without this, both rules fired on one trace and told the reader to move
+    # the lifetime in both directions at once. The arithmetic below is not what
+    # went wrong: on a churning workload that reads almost nothing, dropping to
+    # 5m genuinely does look cheap, because the model prices the rebuild from
+    # the reads that are actually happening. It is the recommendation that is
+    # wrong. A workload whose requests arrive ten minutes apart wants the longer
+    # lifetime and wants its prefix stabilised, and shortening the lifetime
+    # first makes the second problem harder to see.
+    if share_band > BAND_IS_RARE:
+        return None
+    monthly = _monthly(abs(net), window)
+    common = (
+        f"{written_1h:,} tokens were written at the one-hour lifetime, which "
+        f"bills at {w1h}x where the five-minute lifetime bills at {w5}x. "
+        f"{share_short:.1%} of gaps between requests in a cache scope are under "
+        f"five minutes, so a five-minute entry would have survived them too. "
+        f"{band_gaps:,} gap(s) fall in the five-minute-to-one-hour band, where "
+        f"only the one-hour entry survives; those sit on {band_prefix:,} tokens "
+        f"of prefix that a five-minute lifetime would have forced to be written "
+        f"again."
+        + (f" {unprovable} request(s) had writes of unprovable lifetime and are "
+           f"excluded." if unprovable else ""))
+
+    if net > 0:
+        return Finding(
+            code="TTL-2",
+            title="Paying the one-hour premium where five minutes would do",
+            severity="high" if band_gaps == 0 else "medium",
+            evidence_class=MODELED,
+            detail=common + (
+                f" Netting the two: the cheaper writes are worth more than the "
+                f"rewrites they would cause, so dropping to five minutes comes "
+                f"out ahead. This is a projection, not an observation -- the "
+                f"five-minute arm was never run."),
+            affected_requests=sum(len(v) for v in by_scope.values()),
+            avoidable_usd_month=monthly,
+            confidence="medium" if band_gaps else "high", quality_risk="medium",
+            fix="Drop the static prefix to the five-minute lifetime and measure "
+                "again before assuming it held. Where a scope genuinely idles "
+                "past five minutes, leave that one at an hour: this is a "
+                "per-workload call, not a global switch.")
+
+    # Nothing to recover, and worth saying. Staying silent here is what left a
+    # reader with a 1h default no answer at all, and "checked, and the long
+    # lifetime is earning its premium" is the answer to the question they came
+    # with. Priced at the cost of the change rather than a saving, so the figure
+    # is what switching would *lose*.
+    return Finding(
+        code="TTL-2", title="The one-hour lifetime is earning its premium here",
+        severity="low", evidence_class=MODELED,
+        detail=common + (
+            f" Netting the two: the rewrites a five-minute lifetime would force "
+            f"outweigh the cheaper writes it would buy, because those band gaps "
+            f"sit on prefixes averaging {band_prefix // max(1, band_gaps):,} "
+            f"tokens. Switching is modelled to cost money rather than save it. "
+            f"The band gaps are rare and expensive, which is why counting them "
+            f"by frequency gives the wrong answer."),
+        affected_requests=sum(len(v) for v in by_scope.values()),
+        avoidable_usd_month=None,
+        confidence="medium", quality_risk="medium",
+        fix="No change indicated. Leave the one-hour lifetime where it is. If "
+            "the cache bill is still too high, the lever is prefix stability "
+            "or volume, not lifetime.")
+
+
 def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
     """Concurrent identical prefixes all paying to write the same thing."""
     # Bucketed on the cached prefix inside one isolation scope. The old key was
@@ -1007,8 +1179,8 @@ def _f_cache_verdict(reqs, ratios, window, rate_for) -> Finding | None:
 
 
 RULES = [_f_prefix_efficiency, _f_volatile_prefix, _f_below_minimum,
-         _f_ttl_vs_cadence, _f_cold_fanout, _f_model_split,
-         _f_prefix_rebuild, _f_cache_verdict]
+         _f_ttl_vs_cadence, _f_ttl_premium_unearned, _f_cold_fanout,
+         _f_model_split, _f_prefix_rebuild, _f_cache_verdict]
 
 
 def analyze(ts: TraceSet, invoice_usd: float | None = None,

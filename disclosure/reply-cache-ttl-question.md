@@ -22,27 +22,36 @@ consecutive requests inside a session across my own 14,375 requests:
 Median gap 5 seconds, p90 25 seconds. So the 1h cache is buying nothing 98% of
 the time and the switch looks free.
 
-It is not. Those 195 gaps in the band sit on top of enormous prefixes: 91.4M
-tokens of established prefix across them, about 469,000 tokens each. When an
-entry dies, the next request writes all of that again at 1.25x. Costed at
-opus-5 list:
+It is not, though the margin is smaller than I first calculated. Those 195 gaps
+sit on prefixes averaging 467,000 tokens. When an entry dies, the next request
+writes what it would have read. Costed at opus-5 list, with the multipliers
+taken from the registry rather than typed in:
 
 ```
-cheaper writes on every 1h write      +$482
-prefix rebuilt when entries expire    -$571
-reads I would no longer get at 0.1x    -$46
-                                      -----
-net                                   -$135
+cheaper writes on every 1h write            +$482
+prefix rewritten at the 195 band gaps       -$524
+                                            -----
+net of switching to 5m                       -$41
 ```
 
-Switching to 5m would cost me $135 more over the window, not less. Break-even
-sits at 84% of the prefix being rebuilt, and a real expiry rebuilds all of it.
+So switching costs me about $41 over the window, against $1,285 spent writing
+1h caches. That is 3% — close enough to a wash that I would not describe it as
+a finding, and the useful part is that it is not the clear win the frequency
+argument suggests.
 
-That last part is modelled — I have not run the counterfactual — so trust the
-sign more than the size. But the sign is the opposite of what I expected, and
-the mechanism is worth carrying around: 1.4% of your turns can outweigh the
-other 98.6% once the prefix is that large. Your 5-hour control problem is real,
-and it turns out to be the cheaper problem to have.
+Two things worth saying about that arithmetic. The rebuild line is a modelled
+counterfactual; I have not run the 5m arm. And I got it wrong the first time I
+did it by hand, charging the full 1.25x rebuild *and* the read as separate
+costs, when the read is something you stop paying under 5m rather than
+something you lose. That doubled the answer. The correct netting is 0.75x on
+every 1h write against 1.15x on the prefix at each band gap, and I only caught
+it when I put the rule in the tool and made it agree with a second
+implementation.
+
+The mechanism generalises even if the number does not: 1.4% of your turns can
+carry as much cost as the other 98.6%, once the prefix is that large. Counting
+gaps by frequency gives you the wrong sign. Your 5-hour control problem is
+real, and it turns out to be the cheaper problem to have.
 
 **Your ratio.** 1 : 10 : 100–1000 is healthy, and I can be precise about why.
 Mine is 1 : 10 : 311. The number that settles it is reads / (reads + writes) —
@@ -97,9 +106,16 @@ single "input tokens" number. Those bill at 0.1x, 1.25x or 2x, and 1x. None of
 this is visible until you pull them apart, which is the actual reason the
 question is hard rather than anything about the models.
 
-One honest gap on my side. My tool has a rule for "your cadence sits in the 1h
-window and you are not using it". It has no rule for the reverse, which is your
-case and mine. You have just found something I need to add.
+One honest gap on my side, now closed. My tool had a rule for "your cadence
+sits in the 1h window and you are not using it" and nothing for the reverse,
+which is your case and mine. Your question is what surfaced it. It ships as
+TTL-2, it nets both sides rather than counting the premium, and on my history
+it returns "the one-hour lifetime is earning its premium here" — which is the
+answer, and one the tool previously gave by saying nothing at all.
+
+Writing it also caught a second thing: on a trace carrying both lifetimes, the
+new rule and the old one could recommend moving the TTL in opposite directions
+at once. There is now a test that fails if they ever do.
 
 ---
 
@@ -111,5 +127,5 @@ cacheeconomics claude-code            # ratios, findings, next steps
 cacheeconomics claude-code --detail   # the reasoning behind each one
 ```
 
-The gap distribution and the TTL costing above are not in the tool yet; they
-were computed directly off the same transcripts it reads.
+The gap distribution and the netting above are what TTL-2 computes; the model
+comparison was done directly off the same transcripts.
