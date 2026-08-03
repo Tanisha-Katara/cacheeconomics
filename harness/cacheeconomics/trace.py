@@ -1152,8 +1152,29 @@ def load_jsonl(path: str, key: bytes | None = None, *,
             return False
         return r.get("tokens_counted") is True
 
-    counted_rows = sum(1 for r in rows if _counted(r))
-    structured_rows = sum(1 for r in rows if _segment_list(r)) or 1
+    # Weighted by billed tokens, not by row count. Ninety-nine tiny counted
+    # rows beside one huge uncounted one is 99% of rows and can be 0.02% of the
+    # money -- and 99% clears the publish threshold, so every structural dollar
+    # figure would rest on a byte-share estimate covering essentially all of the
+    # spend. This package already learned that lesson once for structural
+    # coverage, which is measured in billed tokens for exactly this reason;
+    # `tokens_counted` was still counting rows.
+    def _weight(r):
+        # Type-checked: a hostile row can carry `usage` as a string, and
+        # `_billed_input` calls `.get` on it. The malformed-ingest suite caught
+        # this immediately, which is the whole reason it exists -- an ingest
+        # that crashes on one bad row loses the entire file.
+        u = r.get("usage")
+        return (_billed_input(u) or 0) if isinstance(u, dict) else 0
+
+    structured = [r for r in rows if _segment_list(r)]
+    counted_rows = sum(_weight(r) for r in structured if _counted(r))
+    structured_rows = sum(_weight(r) for r in structured)
+    if not structured_rows:
+        # No billed tokens to weight by. Fall back to rows so a trace of
+        # zero-usage requests is not silently treated as fully counted.
+        counted_rows = sum(1 for r in structured if _counted(r))
+        structured_rows = len(structured) or 1
     return TraceSet(requests=requests, tier=tier, alignment=alignment,
                     source=path, notes=notes,
                     tokens_counted=counted_rows / structured_rows,

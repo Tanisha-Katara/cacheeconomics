@@ -27,6 +27,8 @@ from __future__ import annotations
 import json
 from datetime import datetime
 
+from ..registry import UNATTRIBUTED
+from ..trace import QUALIFIES_SPEND
 from ..segment import (_billed_input, _requested_ttl, _scale_to_measured,
                        segments_from_request, usage_from_response)
 
@@ -126,7 +128,7 @@ def _first_ts(row: dict, *names):
 
 
 def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
-                target_id: str = "anthropic/direct") -> TraceSet:
+                target_id: str | None = None) -> TraceSet:
     """Load a JSONL export of logged request bodies as an INFERRED trace.
 
     Requires a key for the same reason the recorder does: a short low-entropy
@@ -136,6 +138,13 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
     means identical content yields an identical id whoever sent it. `tenant` is
     what scopes that, and it is passed into segmentation below.
     """
+    # An absent surface stays absent. A logged Anthropic-shaped body proves the
+    # API schema and nothing about who invoices it, and this defaulted to
+    # anthropic/direct -- the same fabricated-surface shape the LiteLLM adapter
+    # was fixed for. UNATTRIBUTED is registered unpriceable, so dollars are
+    # withheld while every structural finding still reports.
+    surface = target_id or UNATTRIBUTED
+
     if not key:
         raise ValueError(
             "segmenting bodies needs an HMAC key, for the same reason the recorder "
@@ -227,7 +236,7 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
                      index=sg["index"], label=sg["label"],
                      cache_marked=sg["cache_marked"], ttl=sg["ttl"])
              for sg in segs],
-            renamed=renamed, default_target=target_id, index=i,
+            renamed=renamed, default_target=surface, index=i,
             default_tenant=tenant,
             model_override=(body or {}).get("model"), usage_override=usage,
             # `cache_control: {"type": "ephemeral"}` with no ttl is the
@@ -239,6 +248,19 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
             "Model ids normalised (date snapshots stripped so they price against the "
             "registry): " + ", ".join(f"{k} -> {v}" for k, v in sorted(renamed.items())))
 
+    if any(r.target_id == UNATTRIBUTED for r in requests):
+        # An Anthropic-shaped body proves the request schema, not the billing
+        # surface. Langfuse, Helicone and a LiteLLM proxy all log the same shape
+        # in front of Bedrock or Vertex, whose rates are not ours to guess. This
+        # defaulted to anthropic/direct, which is the same fabricated-surface
+        # shape the LiteLLM adapter was fixed for: the rate scope is
+        # default-deny and can only refuse a surface it is shown.
+        notes.append(
+            f"{sum(1 for r in requests if r.target_id == UNATTRIBUTED):,} "
+            f"request(s) state no provider surface. A logged request body proves "
+            f"the API shape, not who invoices it, so they are {QUALIFIES_SPEND}. "
+            f"Pass --target-id to state the surface, or --effective-rate to "
+            f"price it from the bill.")
     surfaces = sorted({r.target_id for r in requests})
     if len(surfaces) > 1:
         notes.append(

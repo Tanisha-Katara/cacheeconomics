@@ -689,7 +689,7 @@ class TestAPricedRowIsNotASkippedRow(unittest.TestCase):
         try:
             with open(path, "w") as f:
                 f.write(json.dumps(row))
-            ts = load_bodies(path, b"k" * 32)
+            ts = load_bodies(path, b"k" * 32, target_id="anthropic/direct")
             self.assertEqual(len(ts.analysable), 1)
             self.assertEqual(ts.skipped_rows, 0, "it was priced, not skipped")
             a = analyze(ts, invoice_usd=10.0)
@@ -710,7 +710,7 @@ class TestAPricedRowIsNotASkippedRow(unittest.TestCase):
         try:
             with open(path, "w") as f:
                 f.write("\n".join(json.dumps(r) for r in rows))
-            ts = load_bodies(path, b"k" * 32)
+            ts = load_bodies(path, b"k" * 32, target_id="anthropic/direct")
             self.assertEqual(ts.skipped_rows, 1)
             a = analyze(ts, invoice_usd=10.0)
             self.assertFalse(a.reconciliation["within_ship_gate"])

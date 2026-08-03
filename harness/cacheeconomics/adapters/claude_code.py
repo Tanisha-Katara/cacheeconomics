@@ -79,7 +79,8 @@ def _usage_only(u: dict) -> dict:
 
 
 def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
-                  limit: int | None = None) -> TraceSet:
+                  limit: int | None = None,
+                  target_id: str = "anthropic/direct") -> TraceSet:
     """Every assistant turn across the transcripts under `root`.
 
     One assistant record is one billed request. User records, attachments,
@@ -189,9 +190,30 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
                 segments=[],                  # no wire structure in a transcript
                 agent=_agent_of(rec),
                 session=rec.get("sessionId"),
-                target_id="anthropic/direct",
+                target_id=target_id,
             ))
 
+    blocking: list[str] = []
+    if requests and target_id == "anthropic/direct":
+        # A transcript records the conversation, not the wire request, and
+        # carries no provider field anywhere -- checked across 190 of them.
+        # So this surface is an assumption, not something read. Left as the
+        # default because Claude Code talks to Anthropic directly unless
+        # CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set, and failing
+        # closed for everyone to catch that minority would cost more than it
+        # saves. But an assumption that decides which rate table applies has to
+        # be visible, not buried in a constructor argument.
+        #
+        # Both backstops still hold if it is wrong: with an invoice the rates
+        # disagree and reconciliation fails, and without one the report is
+        # stamped DRAFT.
+        blocking.append(
+            "Provider surface assumed to be anthropic/direct. Claude Code "
+            "transcripts record the conversation rather than the wire request "
+            "and carry no provider field, so this was not read from the data. "
+            "If this deployment routes through Bedrock or Vertex, pass "
+            "--target-id: their rates are not Anthropic's and every dollar "
+            "figure here would be against the wrong table.")
     if untimed:
         notes.append(
             f"{untimed:,} billed turns carry no usable timestamp. They are kept, "
@@ -222,7 +244,8 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
     # readable subset matching the invoice released figures while the notes
     # beside them said a whole transcript was missing.
     return TraceSet(requests=requests, tier=Tier.USAGE_ONLY,
-                    source=pattern, notes=notes,
+                    source=pattern, notes=notes + blocking,
+                    blocking_notes=blocking,
                     skipped_rows=skipped + corrupt)
 
 

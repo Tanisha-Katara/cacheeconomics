@@ -636,3 +636,159 @@ class TestAnUnstatedSurfaceIsNotAnthropic(unittest.TestCase):
             flat = " ".join(render_text(a).split())
             self.assertIn("surface is unknown", flat)
             self.assertIn("--target-id", flat)
+
+
+class TestCountedIsMeasuredInMoneyNotRows(unittest.TestCase):
+    """`tokens_counted` was a row count. Coverage learned this lesson already.
+
+    Ninety-nine tiny counted rows beside one huge uncounted one is 99% of rows,
+    clears the 0.99 publish threshold, and is 0.02% of the billed tokens. Every
+    structural dollar figure would then rest on a byte-share split covering
+    essentially all of the spend -- and that split is 19.2% off at the median,
+    which is the entire reason the threshold exists.
+
+    `structural_coverage_billed` is weighted for exactly this reason. This
+    counter was not.
+    """
+
+    def _rows(self, tmp, big_counted):
+        def row(i, tok, counted):
+            return {"request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i % 60:02d}:00Z",
+                    "model": "claude-opus-5", "target_id": "anthropic/direct",
+                    "session": "s", "ttl_requested": "5m", "tokens_counted": counted,
+                    "usage": {"input_tokens": tok, "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                    "segments": [{"id": f"s{i}a", "role": "system", "tokens": tok // 2,
+                                  "index": 0, "cache_marked": True, "ttl": "5m"},
+                                 {"id": f"s{i}b", "role": "user", "tokens": tok // 2,
+                                  "index": 1}]}
+        p = os.path.join(tmp, "x.jsonl")
+        with open(p, "w") as f:
+            for i in range(99):
+                f.write(json.dumps(row(i, 100, True)) + "\n")
+            f.write(json.dumps(row(99, 50_000_000, big_counted)) + "\n")
+        return p
+
+    def test_one_huge_uncounted_row_defeats_ninety_nine_tiny_counted_ones(self):
+        from cacheeconomics.trace import load_jsonl
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_jsonl(self._rows(tmp, big_counted=False), b"k" * 32)
+            self.assertLess(ts.tokens_counted, 0.01,
+                            "still weighted by rows, so 99/100 passed")
+            self.assertFalse(ts.tokens_are_counted)
+
+    def test_counting_the_row_that_holds_the_money_is_enough(self):
+        """The gate has to be passable, or counting stops being worth doing."""
+        from cacheeconomics.trace import load_jsonl
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_jsonl(self._rows(tmp, big_counted=True), b"k" * 32)
+            self.assertGreater(ts.tokens_counted, 0.99)
+            self.assertTrue(ts.tokens_are_counted)
+
+    def test_a_hostile_usage_field_does_not_crash_the_weighting(self):
+        """`usage` can be a string. `_billed_input` calls `.get` on it."""
+        from cacheeconomics.trace import load_jsonl
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "x.jsonl")
+            with open(p, "w") as f:
+                f.write(json.dumps({"request_id": "r", "model": "claude-opus-5",
+                                    "usage": "not-a-dict",
+                                    "segments": [{"id": "a", "role": "system",
+                                                  "tokens": 10, "index": 0}]}) + "\n")
+            load_jsonl(p, b"k" * 32)          # must not raise
+
+
+class TestABodyExportStatesNoSurface(unittest.TestCase):
+    """A logged request body proves the API shape, not who invoices it.
+
+    Langfuse, Helicone and a LiteLLM proxy all log Anthropic-shaped bodies in
+    front of Bedrock and Vertex. `load_bodies` defaulted to anthropic/direct,
+    which is the fabricated-surface shape the LiteLLM adapter was already fixed
+    for: default-deny can only refuse a surface it is shown.
+    """
+
+    def _export(self, tmp):
+        p = os.path.join(tmp, "b.jsonl")
+        body = {"model": "claude-opus-5",
+                "system": [{"type": "text", "text": "x" * 4000,
+                            "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": "hi"}]}
+        with open(p, "w") as f:
+            for i in range(30):
+                f.write(json.dumps({
+                    "sent_at": f"2026-07-29T09:{i % 60:02d}:00Z", "body": body,
+                    "usage": {"input_tokens": 200_000,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0}}) + "\n")
+        return p
+
+    def test_the_default_is_unattributed(self):
+        from cacheeconomics.adapters.bodies import load_bodies
+        from cacheeconomics.registry import UNATTRIBUTED
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_bodies(self._export(tmp), b"k" * 32)
+            self.assertEqual({r.target_id for r in ts.requests}, {UNATTRIBUTED})
+
+    def test_and_publishes_no_dollars(self):
+        from cacheeconomics.adapters.bodies import load_bodies
+        with tempfile.TemporaryDirectory() as tmp:
+            a = analyze(load_bodies(self._export(tmp), b"k" * 32),
+                        allow_unreconciled=True)
+            self.assertFalse(a.spend["input_usd"].released)
+
+    def test_stating_the_surface_restores_them(self):
+        from cacheeconomics.adapters.bodies import load_bodies
+        with tempfile.TemporaryDirectory() as tmp:
+            a = analyze(load_bodies(self._export(tmp), b"k" * 32,
+                                    target_id="anthropic/direct"),
+                        allow_unreconciled=True)
+            self.assertTrue(a.spend["input_usd"].released)
+
+    def test_the_cli_does_not_inject_a_default_behind_the_adapter(self):
+        """The CLI passed DEFAULT_TARGET for this path, which defeated the
+        adapter's refusal entirely. The litellm path already knew better."""
+        import inspect
+
+        from cacheeconomics import cli
+        src = inspect.getsource(cli._load)
+        bodies = src.split("if args.source == \"bodies\"")[1]
+        # The call, not any mention of it: the comment above the call names
+        # DEFAULT_TARGET to explain why it is not used, and matching prose
+        # rather than code is how a test ends up asserting nothing.
+        call = bodies[bodies.index("load_bodies("):]
+        call = call[:call.index(")")]
+        self.assertIn("target_id=args.target_id", call)
+        self.assertNotIn("DEFAULT_TARGET", call,
+                         "the CLI re-fabricates the surface the adapter refused")
+
+
+class TestClaudeCodeSaysTheSurfaceIsAssumed(unittest.TestCase):
+    """Transcripts carry no provider field anywhere -- checked across 190 of
+    them. The surface is an adapter assumption, kept because Claude Code talks
+    to Anthropic unless routed, but stated rather than buried."""
+
+    def test_the_assumption_is_visible_without_detail(self):
+        from cacheeconomics.adapters.claude_code import load_sessions
+        from cacheeconomics.report import render_text
+        try:
+            ts = load_sessions()
+        except Exception:
+            self.skipTest("no local transcripts")
+        if not ts.requests:
+            self.skipTest("no local transcripts")
+        self.assertTrue(any("surface assumed" in n for n in ts.blocking_notes))
+        flat = " ".join(render_text(analyze(ts, allow_unreconciled=True)).split())
+        self.assertIn("surface assumed", flat)
+        self.assertIn("--target-id", flat)
+
+    def test_an_explicit_surface_replaces_it(self):
+        from cacheeconomics.adapters.claude_code import load_sessions
+        try:
+            ts = load_sessions(target_id="amazon-bedrock/converse")
+        except Exception:
+            self.skipTest("no local transcripts")
+        if not ts.requests:
+            self.skipTest("no local transcripts")
+        self.assertEqual({r.target_id for r in ts.requests},
+                         {"amazon-bedrock/converse"})
+        self.assertFalse(any("surface assumed" in n for n in ts.blocking_notes))

@@ -112,8 +112,12 @@ def _load(args) -> TraceSet:
         from .adapters.bodies import load_bodies
         if not os.path.exists(args.path):
             raise Fail(f"no such file: {args.path}")
+        # Passed only when the operator actually said so, like the litellm
+        # path above. Injecting DEFAULT_TARGET here defeated the adapter's
+        # fail-closed: a body export states the API shape, never who invoices
+        # it, so an unstated surface has to stay unstated all the way down.
         return load_bodies(args.path, key, tenant=args.tenant,
-                           target_id=args.target_id or DEFAULT_TARGET)
+                           target_id=args.target_id)
     raise Fail(f"unknown source: {args.source}")
 
 
@@ -254,7 +258,8 @@ def cmd_claude_code(args) -> int:
     derived from real work -- worth knowing before piping it anywhere.
     """
     from .adapters.claude_code import load_sessions
-    ts = load_sessions(root=args.root, project=args.project, limit=args.limit)
+    ts = load_sessions(root=args.root, project=args.project, limit=args.limit,
+                       target_id=args.target_id or "anthropic/direct")
     a = analyze(ts, invoice_usd=args.invoice_usd,
                 effective_rate=args.effective_rate, on_date=args.on_date,
                 allow_unreconciled=args.allow_unreconciled)
@@ -425,6 +430,13 @@ def build_parser() -> argparse.ArgumentParser:
                     help="transcript root (default: ~/.claude/projects)")
     cc.add_argument("--project", help="one project directory only")
     cc.add_argument("--limit", type=int, help="most recent N sessions only")
+    # A transcript carries no provider field, so the surface here is an
+    # assumption the report states out loud. This is how to correct it.
+    cc.add_argument("--target-id", default=None,
+                    help="the provider surface these sessions ran against "
+                         "(default anthropic/direct). Set it if Claude Code was "
+                         "routed through Bedrock or Vertex, whose rates are not "
+                         "Anthropic's")
     _pricing_args(cc)
     _release_args(cc)
     _detail_arg(cc)

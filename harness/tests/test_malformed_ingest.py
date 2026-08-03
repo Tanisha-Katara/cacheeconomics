@@ -178,7 +178,7 @@ class TestNoFieldCanCrashTheIngest(unittest.TestCase):
             with open(path, "w") as f:
                 f.write(json.dumps(TestTheBodyAdapterIsJustAsTolerant.ROW)
                         + "\n42\n[]\nnull\n")
-            analyze(load_bodies(path, b"k" * 32), allow_unreconciled=True)
+            analyze(load_bodies(path, b"k" * 32, target_id="anthropic/direct"), allow_unreconciled=True)
         finally:
             os.unlink(path)
 
@@ -214,7 +214,7 @@ class TestTheBodyAdapterIsJustAsTolerant(unittest.TestCase):
                 row[field] = bad
                 path = _write([row])
                 try:
-                    analyze(load_bodies(path, b"k" * 32), allow_unreconciled=True)
+                    analyze(load_bodies(path, b"k" * 32, target_id="anthropic/direct"), allow_unreconciled=True)
                 except ValueError:
                     pass
                 except Exception as e:      # noqa: BLE001
