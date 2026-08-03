@@ -19,7 +19,8 @@ from .allocate import reuse_chain_of
 from .trace import QUALIFIES_SPEND as _QUALIFIES_SPEND
 from .trace import note_blocks_spend as _note_blocks_spend
 from .trace import (Request, Tier, TraceSet, _billed_input,  # noqa: E402
-                    marked_prefixes, marked_spans, span_is_reusable_by,
+                    UNATTRIBUTED, marked_prefixes, marked_spans,
+                    span_is_reusable_by,
                     write_tokens, write_visible_at)
 
 MEASURED = money.MEASURED
@@ -1563,7 +1564,19 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             unpriceable_surfaces[r.target_id] += 1
             continue
         except registry.RegistryError:
-            unpriceable_models[r.model] += 1
+            # A surface the registry has never heard of is a surface problem,
+            # and saying otherwise sends the reader after the wrong thing. With
+            # `--effective-rate`, `require_priceable` is skipped and the failure
+            # instead comes out of `multipliers`, which raises the generic error
+            # -- so an unattributed gateway trace was reported as "no pricing is
+            # recorded for claude-opus-5", a model that is priced. That is the
+            # exact confusion the branch above was split out to prevent, and it
+            # became the common path the moment an unnamed row stopped being
+            # answered with anthropic/direct.
+            if r.target_id not in registry.target_ids():
+                unpriceable_surfaces[r.target_id] += 1
+            else:
+                unpriceable_models[r.model] += 1
             continue
         spend_total += s.usd
         uncached_total += s.hypothetical_uncached_usd
@@ -1718,13 +1731,32 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             u for t in unpriceable_surfaces
             for u in [((registry.rate_scope().get("unpriced_surfaces") or {})
                        .get(t, {}).get("official_pricing"))] if u})
+        # Two different remedies, and offering the wrong one wastes the reader's
+        # time. A partner surface is known and merely unpriced here, so an
+        # effective rate from their bill completes it. An *unnamed* surface has
+        # no recorded cache multipliers either, so a rate alone cannot price it
+        # -- reads and writes would still be guesses. What unblocks that reader
+        # is naming the surface.
+        unnamed = sorted(t for t in unpriceable_surfaces if t == UNATTRIBUTED)
+        partner = sorted(t for t in unpriceable_surfaces if t != UNATTRIBUTED)
+        remedy = []
+        if partner:
+            remedy.append(
+                "These surfaces are operated and invoiced by the cloud provider, so "
+                "pricing them at Anthropic rates would produce a total the customer's "
+                "bill contradicts. Pass their effective rate from that bill to include "
+                "them" + (f" (published rates: {', '.join(where)})." if where else "."))
+        if unnamed:
+            remedy.append(
+                "Rows carrying no provider metadata name no surface at all, so neither "
+                "the rate nor the cache multipliers are known for them. Pass --target-id "
+                "to state which surface this traffic went to; an effective rate alone "
+                "cannot price them, because the read and write multipliers would still "
+                "be guesses.")
         notes.append(
             f"The recorded rates are Anthropic first-party list prices and do not cover "
             f"{detail}. Those requests are {QUALIFIES_SPEND} and the totals "
-            f"below cover the remainder only. These surfaces are operated and invoiced by the "
-            f"cloud provider, so pricing them at Anthropic rates would produce a total the "
-            f"customer's bill contradicts. Pass their effective rate from that bill to include "
-            f"them" + (f" (published rates: {', '.join(where)})." if where else "."))
+            f"below cover the remainder only. " + " ".join(remedy))
     if not ts.tier.supports_counterfactual:
         notes.append("Usage-only ingest: findings are limited to what usage fields reveal. "
                      "Structural causes cannot be identified without prompt structure.")

@@ -3153,6 +3153,11 @@ class TestTheBakeOffRefusesUnvalidatedSizes(unittest.TestCase):
         from cacheeconomics.trace import load_jsonl
         rows = [{"request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i:02d}:00Z",
                  "model": "claude-opus-5", "agent": "main", "session": "s1",
+                 # Stated. These tests are about size agreement and the
+                 # publication gate; the surface is a precondition they
+                 # used to get from the loader defaulting an unnamed row
+                 # to first-party.
+                 "target_id": "anthropic/direct",
                  "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
                            "cache_creation_input_tokens": 1_000,
                            "cache_creation": {"ephemeral_5m_input_tokens": 1_000,
@@ -3343,6 +3348,12 @@ class TestArmSpendIsATypedFigure(unittest.TestCase):
                          "sent_at": f"2026-07-29T09:{i:02d}:00Z",
                          "model": "claude-opus-5", "agent": "main",
                          "session": "s1",
+                         # Stated, because these tests are about the size gate
+                         # and need a priceable surface as a precondition. It
+                         # used to arrive by way of the loader defaulting an
+                         # unnamed row to first-party, which is the thing that
+                         # default now refuses to do.
+                         "target_id": "anthropic/direct",
                          "usage": {"input_tokens": 0,
                                    "cache_read_input_tokens": 0,
                                    "cache_creation_input_tokens": 1_000,
@@ -3488,6 +3499,11 @@ class TestSizesInsideTheOldFactorStillWithhold(unittest.TestCase):
             rows.append({
                 "request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i:02d}:00Z",
                 "model": "claude-opus-5", "agent": "main", "session": "s1",
+                # Stated. This class is about the *size* release gate and needs
+                # a priceable surface to have anything to release; it used to
+                # get one from the loader answering an unnamed row with
+                # first-party.
+                "target_id": "anthropic/direct",
                 "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
                           "cache_creation_input_tokens": self.BILLED,
                           "cache_creation": {

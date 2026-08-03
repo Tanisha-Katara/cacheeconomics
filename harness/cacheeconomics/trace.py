@@ -42,6 +42,19 @@ from enum import Enum
 # sentences anyway, but `blocking_notes` is what the renderers read.
 QUALIFIES_SPEND = "excluded from every dollar figure"
 
+# The surface an ingest uses when a row carries no provider metadata at all, so
+# the surface was never stated and cannot be inferred. Spelled here rather than
+# imported from `registry` because this module imports nothing from the package
+# -- that is what lets every loader and both rule paths share it -- and
+# `registry` reaches back into here lazily, so a module-level edge either way
+# would be a real cycle. `TestOneFactOneValue` pins the two spellings equal.
+#
+# `registry` registers it as unpriceable and carries the reason: it used to
+# default to anthropic/direct, so a proxy export fronting Bedrock or Vertex was
+# priced at first-party rates and published a reconciled-looking total no cloud
+# bill would match.
+UNATTRIBUTED = "unknown/unattributed"
+
 
 def note_blocks_spend(text: str) -> bool:
     """Does this note qualify a number that was published?
@@ -464,7 +477,7 @@ def resolve_tenant(row: dict, default: str | None = None) -> str | None:
 
 
 def request_from_row(row: dict, segments: list, *, renamed: dict,
-                     default_target: str = "anthropic/direct",
+                     default_target: str = UNATTRIBUTED,
                      ttl_fallback: str | None = None,
                      model_override: str | None = None,
                      usage_override: dict | None = None,
@@ -1025,7 +1038,7 @@ def _normalised(model: str, renamed: dict, target_id: str | None = None) -> str:
 
 def load_jsonl(path: str, key: bytes | None = None, *,
                default_tenant: str | None = None,
-               default_target: str = "anthropic/direct") -> TraceSet:
+               default_target: str = UNATTRIBUTED) -> TraceSet:
     """Load a normalised trace file.
 
     The tier is derived from what the file actually contains rather than

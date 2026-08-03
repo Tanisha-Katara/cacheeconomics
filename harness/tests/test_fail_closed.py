@@ -31,7 +31,7 @@ from cacheeconomics.allocate import allocator_lite, litellm_auto  # noqa: E402
 from cacheeconomics.allocator import allocator_full  # noqa: E402
 from cacheeconomics.analyzer import analyze  # noqa: E402
 from cacheeconomics.relocate import relocation_lite  # noqa: E402
-from cacheeconomics.trace import Request, Segment, Tier, TraceSet  # noqa: E402
+from cacheeconomics.trace import UNATTRIBUTED, Request, Segment, Tier, TraceSet  # noqa: E402
 
 T0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
 UNKNOWN_MODEL = "nobody-has-ever-registered-this"
@@ -322,11 +322,66 @@ class TestTheSurfaceFlagReachesEveryIngestPath(unittest.TestCase):
             self.assertEqual({r.target_id for r in ts.requests}, {self.BEDROCK},
                              f"--target-id ignored for --from {source}")
 
-    def test_the_cli_default_is_unchanged_when_nothing_is_said(self):
-        """The flag now defaults to None so silence is distinguishable. That
-        must not turn into a surface of None reaching the registry."""
+    def test_silence_names_no_surface_rather_than_inventing_one(self):
+        """Silence must not reach the registry as `None`, and it must not be
+        answered with a surface either.
+
+        This asserted `anthropic/direct`, which was the finding written down as
+        a test. The concern behind it was real -- a `None` target reaching the
+        registry -- and the answer chosen was to fabricate first-party, so a
+        gateway export whose format never carried a provider earned Anthropic
+        rates. Measured at $2,924/month on a twelve-request Bedrock-fronting
+        capture. `UNATTRIBUTED` answers the original concern without inventing:
+        it is a real string, registered as unpriceable, and the registry's own
+        rate_scope carries the reason.
+        """
         ts = self._via_cli(self._write(self._rows()), "trace")
-        self.assertEqual({r.target_id for r in ts.requests}, {"anthropic/direct"})
+        self.assertEqual({r.target_id for r in ts.requests}, {UNATTRIBUTED})
+        self.assertNotIn(None, {r.target_id for r in ts.requests})
+
+    def test_an_unnamed_surface_is_named_as_the_problem_not_the_model(self):
+        """With --effective-rate, `require_priceable` is skipped and the failure
+        comes out of `multipliers` instead, which raises the generic error.
+
+        That reported "no pricing is recorded for claude-opus-5" on a trace
+        whose model is priced -- the exact confusion the surface branch was
+        split out to prevent, arriving through the other door. It became the
+        common path the moment an unnamed row stopped being answered with
+        anthropic/direct, so the reader has to be sent at the surface.
+        """
+        from cacheeconomics.analyzer import analyze
+        ts = self._via_cli(self._write(self._rows()), "trace")
+        a = analyze(ts, invoice_usd=100.0, effective_rate=3.0)
+        blocking = " ".join(a.blocking_notes or [])
+        self.assertIn(UNATTRIBUTED, blocking)
+        self.assertNotIn("no pricing is recorded for claude", blocking.lower())
+        self.assertIn("--target-id", blocking,
+                      "named the problem without naming the remedy")
+
+    def test_a_partner_surface_is_still_told_to_use_its_own_rate(self):
+        """The other remedy must survive. Bedrock has recorded multipliers and
+        only lacks a rate, so an effective rate from the customer's bill does
+        complete it -- and telling that reader to pass --target-id instead would
+        send them nowhere."""
+        from cacheeconomics.analyzer import analyze
+        rows = [dict(r, target_id="amazon-bedrock/converse") for r in self._rows()]
+        ts = self._via_cli(self._write(rows), "trace")
+        a = analyze(ts, invoice_usd=100.0)
+        blocking = " ".join(a.blocking_notes or [])
+        self.assertIn("effective rate", blocking)
+
+    def test_an_unnamed_surface_earns_no_first_party_dollars(self):
+        """The consequence, not just the label. A trace nobody attributed must
+        not produce a priced total, because the rates on file are Anthropic
+        first-party and this surface is not known to be one."""
+        from cacheeconomics.analyzer import analyze
+        ts = self._via_cli(self._write(self._rows()), "trace")
+        a = analyze(ts, invoice_usd=100.0)
+        monthly = a.spend.get("monthly_input_usd")
+        self.assertFalse(monthly.raw() if hasattr(monthly, "raw") else monthly)
+        self.assertTrue([n for n in (a.blocking_notes or [])
+                         if UNATTRIBUTED in n],
+                        "priced nothing and did not say why")
 
     def test_a_substituted_surface_is_said_out_loud(self):
         """Attributing traffic to a surface nobody named moves money, so it is

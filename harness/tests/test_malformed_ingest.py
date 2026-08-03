@@ -248,6 +248,10 @@ class TestSegmentSizesMustAgreeWithWhatWasBilled(unittest.TestCase):
     def _rows(self, seg_tokens, n=20):
         return [{"request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i:02d}:00Z",
                  "model": "claude-opus-5", "agent": "main", "session": "s1",
+                 # Stated. These tests are about size agreement and the
+                 # publication gate; the surface is a precondition they used to
+                 # get from the loader defaulting an unnamed row to first-party.
+                 "target_id": "anthropic/direct",
                  "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
                            "cache_creation_input_tokens": 1_000,
                            "cache_creation": {"ephemeral_5m_input_tokens": 1_000,

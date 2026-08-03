@@ -86,6 +86,21 @@ class TestOneFactOneValue(unittest.TestCase):
         audit unable to reproduce the plugin's own decisions."""
         self.assertEqual(plugin.BYTES_PER_TOKEN, segment._BYTES_PER_TOKEN)
 
+    def test_the_unattributed_surface_is_one_string(self):
+        """`trace` spells it and `registry` spells it, because `trace` imports
+        nothing from the package -- that is what lets every loader and both rule
+        paths share it -- while `registry` reaches back into `trace` lazily, so
+        a module-level edge either way would be a real cycle.
+
+        Two spellings is the price of that, and drift between them would not
+        crash: it would mean a loader marking rows with a surface the registry's
+        rate scope does not recognise, which prices them at first-party rates.
+        Exactly the failure the constant exists to prevent."""
+        self.assertEqual(trace.UNATTRIBUTED, registry.UNATTRIBUTED)
+        self.assertIn(trace.UNATTRIBUTED,
+                      registry.rate_scope().get("unpriced_surfaces", {}),
+                      "the loader's default is not registered as unpriceable")
+
     def test_write_visibility_is_one_latency_under_three_names(self):
         """`FANOUT_SECONDS`, `WRITE_LATENCY_SECONDS` and the simulator's
         pessimistic `write_latency_s` are the same physical fact: how long

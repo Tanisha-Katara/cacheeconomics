@@ -26,7 +26,7 @@ import sys
 
 from . import __version__, checks, registry, report, simulate
 from .analyzer import analyze
-from .trace import TraceSet, load_jsonl
+from .trace import UNATTRIBUTED, TraceSet, load_jsonl
 
 KEY_ENV = "CACHEECONOMICS_HMAC_KEY"
 
@@ -39,7 +39,14 @@ MIN_KEY_BYTES = 16
 # Named once: `--target-id` now defaults to None so a deliberate choice can be
 # told from silence, and three loaders needed the same fallback spelled the same
 # way.
-DEFAULT_TARGET = "anthropic/direct"
+# What a trace row means when it names no surface: nothing, deliberately.
+# This was "anthropic/direct", so a gateway export whose format never carried a
+# provider earned Anthropic first-party rates -- measured at $2,924/month on a
+# twelve-request Bedrock-fronting capture. The registry's own rate_scope entry
+# already described this as fixed; the loader default was the door it could not
+# see. `--target-id` states the surface, `--effective-rate` prices it from the
+# customer's own bill.
+DEFAULT_TARGET = UNATTRIBUTED
 
 
 class Fail(Exception):
