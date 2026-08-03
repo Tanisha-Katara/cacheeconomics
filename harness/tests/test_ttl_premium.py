@@ -698,3 +698,86 @@ class TestTodaysFixesDidNotBreakSomethingElse(unittest.TestCase):
         self.assertLess(ts.tokens_counted, 0.01,
                         "a JSON-string usage row weighed nothing")
         self.assertFalse(ts.tokens_are_counted)
+
+
+class TestTheAllocatorSearchesPlansItCanCost(unittest.TestCase):
+    """The exact evaluator scored a plan the search could never reach.
+
+    `_mixed_variants` re-labels the positions the uniform DP already chose, and
+    the DP optimises each lifetime alone. When neither uniform plan beats
+    sending the prompt uncached it returns no positions, so the mixed pattern
+    has nothing to vary and a plan cheaper than both is never scored.
+
+    Two implementations of one question disagreeing is the strongest signal
+    available in this module, and it was sitting there.
+    """
+
+    def _segs(self, n=2, tokens=600):
+        return [Segment(id=chr(97 + i), role="system", tokens=tokens, index=i)
+                for i in range(n)]
+
+    def _stable(self, n=2):
+        return {i: 0.0 for i in range(n)}
+
+    def test_it_finds_the_plan_the_exact_evaluator_prices(self):
+        from cacheeconomics import tiers
+        gaps = [600.0] * 10 + [7200.0] * 10
+        a = tiers.allocate(self._segs(), self._stable(),
+                           target_id="anthropic/direct", model="claude-opus-5",
+                           gaps=gaps)
+        sb, wr, rr = tiers._surface("anthropic/direct", "claude-opus-5")
+        exact = tiers.expected_cost([(600, 1.0), (600, 1.0)], ["5m", "1h"],
+                                    rr, wr, gaps, [tiers.survival(gaps, "5m"),
+                                                   tiers.survival(gaps, "1h")])
+        self.assertAlmostEqual(a.expected_cost, exact, places=1,
+                               msg="the search still cannot reach the plan its "
+                                   "own evaluator prices cheapest")
+        self.assertEqual([(t.marker_position, t.ttl) for t in a.tiers],
+                         [(0, "5m"), (1, "1h")])
+
+    def test_and_it_beats_doing_nothing(self):
+        """1035 against 1200 uncached. The old answer was 'no markers'."""
+        from cacheeconomics import tiers
+        a = tiers.allocate(self._segs(), self._stable(),
+                           target_id="anthropic/direct", model="claude-opus-5",
+                           gaps=[600.0] * 10 + [7200.0] * 10)
+        self.assertTrue(a.tiers)
+        self.assertLess(a.expected_cost, a.uncached_cost)
+
+    def test_the_canonical_pattern_was_the_wrong_way_round_here(self):
+        """`_mixed_variants` only ever tries long-at-the-bottom, on the theory
+        that a stable prefix outlives an advancing turn. The winning plan here
+        is the opposite, which is why re-labelling could not have found it even
+        with positions."""
+        from cacheeconomics import tiers
+        a = tiers.allocate(self._segs(), self._stable(),
+                           target_id="anthropic/direct", model="claude-opus-5",
+                           gaps=[600.0] * 10 + [7200.0] * 10)
+        self.assertEqual([t.ttl for t in a.tiers], ["5m", "1h"])
+
+    def test_a_zero_budget_means_zero(self):
+        """`budget or surf_budget` made 0 indistinguishable from None, so a
+        caller with no breakpoints left got one emitted over their cap. The
+        underlying DP also raised IndexError on it rather than returning a
+        plan."""
+        from cacheeconomics import tiers
+        a = tiers.allocate(self._segs(), self._stable(),
+                           target_id="anthropic/direct", model="claude-opus-5",
+                           gaps=[60.0] * 20, budget=0)
+        self.assertEqual(a.tiers, [])
+        self.assertTrue(any("budget is zero" in n for n in a.notes))
+
+    def test_a_negative_budget_is_refused(self):
+        from cacheeconomics import tiers
+        with self.assertRaises(tiers.Unsupported):
+            tiers.allocate(self._segs(), self._stable(),
+                           target_id="anthropic/direct", model="claude-opus-5",
+                           gaps=[60.0] * 20, budget=-1)
+
+    def test_a_nonzero_budget_still_places(self):
+        """The guard must not swallow the ordinary case."""
+        from cacheeconomics import tiers
+        a = tiers.allocate(self._segs(), self._stable(),
+                           target_id="anthropic/direct", model="claude-opus-5",
+                           gaps=[60.0] * 20, budget=1)
+        self.assertTrue(a.tiers)

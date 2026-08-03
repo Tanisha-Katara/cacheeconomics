@@ -238,7 +238,11 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
     every single request and only ever shows two values.
     """
     surf_budget, write_rates, read_rate = _surface(target_id, model)
-    budget = min(budget or surf_budget, surf_budget)
+    # `budget or surf_budget` made 0 indistinguishable from None, so a caller
+    # passing "no breakpoints left" got a marker emitted over their own cap.
+    if budget is not None and budget < 0:
+        raise Unsupported(f"negative marker budget: {budget}")
+    budget = surf_budget if budget is None else min(budget, surf_budget)
     gaps = list(gaps or [])
     notes, searched = [], []
 
@@ -297,10 +301,21 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
                       searched=searched)
 
     blocked = []
+    if not budget:
+        # Zero is a real answer: the caller has no breakpoints left. `_search`
+        # indexes `cost[1]` and raised IndexError on it, so this was a crash
+        # rather than a plan.
+        return Allocation(
+            [], uncached, uncached, searched,
+            notes + ["marker budget is zero, so no plan can place one"])
+
+    arms = []
     for ttl in write_rates:
         live = survival(gaps, ttl)
         alloc = _search(segments, cum, survive, minimum, budget, ttl,
                         live, read_rate, write_rates, uncached, notes)
+        if alloc.tiers:
+            arms.append(alloc)
         # A search that placed nothing has no cost, and recording its default
         # 0.0 puts "uniform 5m 0" in front of a reader as though the plan were
         # free. Infeasible is not cheap.
@@ -319,12 +334,36 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
 
     # The one mixed pattern worth having: a long-lived stable prefix under a
     # short-lived advancing turn. Scored exactly rather than searched.
-    mixed = _mixed_variants(best, segments, cum, survive, write_rates,
-                            read_rate, gaps, notes)
-    for label, alloc in mixed:
+    #
+    # Scored on every arm's positions, not only the winner's. `_mixed_variants`
+    # needs at least two tiers to vary, and it was handed `best` -- which is the
+    # zero-tier "send it uncached" plan whenever both uniform arms lose to
+    # uncached. Measured: two 600-token segments over ten 10-minute gaps then
+    # ten 2-hour ones searched uniform 5m at 1350 and uniform 1h at 1230,
+    # neither beating 1200 uncached, and returned no markers -- while 5m over 1h
+    # on those same positions costs 1035. A 13.75% saving discarded because the
+    # only plan allowed to carry positions forward was the one that had none.
+    #
+    # The registry records `ttl_ordering_constraint` as null for this surface,
+    # so short-before-long is legal here; on a surface that constrains it,
+    # `_mixed_variants` still has to respect that.
+    seen_labels = set()
+    for label, alloc in _mixed_exhaustive(segments, cum, survive, minimum,
+                                          budget, write_rates, read_rate, gaps,
+                                          uncached, notes):
+        seen_labels.add(label)
         searched.append((label, round(alloc.expected_cost, 2)))
         if alloc.expected_cost < best.expected_cost:
             best = alloc
+    for arm in arms or [best]:
+        for label, alloc in _mixed_variants(arm, segments, cum, survive,
+                                            write_rates, read_rate, gaps, notes):
+            if label in seen_labels:
+                continue
+            seen_labels.add(label)
+            searched.append((label, round(alloc.expected_cost, 2)))
+            if alloc.expected_cost < best.expected_cost:
+                best = alloc
 
     return Allocation(best.tiers, best.expected_cost, uncached,
                       searched, best.notes)
@@ -398,6 +437,82 @@ def _search(segments, cum, survive, minimum, budget, ttl, live,
             segment_indices=tuple(s.index for s in segments[prev + 1:p + 1])))
         prev = p
     return Allocation(tiers, best_total, uncached, [], list(base_notes))
+
+
+# Above this many segments the exhaustive mixed pass is skipped and the search
+# stays on the positions the uniform DP found. Chosen so the worst case stays
+# in the low thousands of evaluations: sum(C(n,k) for k<=4) * 2**4.
+# 8, not 12: at 12 with a budget of 4 this is ~10k evaluations per call and it
+# tripled the test suite's runtime. Real prompts carry few *segments* -- system,
+# tools, and grouped messages -- so 8 covers the shape this exists for while
+# staying under ~2.6k evaluations.
+MIXED_EXHAUSTIVE_MAX_SEGMENTS = 8
+
+
+def _mixed_exhaustive(segments, cum, survive, minimum, budget, write_rates,
+                      read_rate, gaps, uncached, base_notes):
+    """Every marker placement up to `budget`, with every lifetime assignment.
+
+    `_mixed_variants` can only re-label positions the uniform DP already chose,
+    and the DP optimises each lifetime alone. When neither uniform plan beats
+    sending the prompt uncached, it returns no positions at all -- and the
+    mixed pattern then has nothing to vary, so a plan that is cheaper than both
+    is never scored. Measured on two 600-token segments: uniform 5m 1350,
+    uniform 1h 1230, uncached 1200, and 5m-over-1h 1035.
+
+    Exhaustive rather than clever, and bounded rather than complete: this is a
+    per-request placement over a handful of segments with a budget of four, not
+    a general optimiser. Above the bound it does not run and the caller says so.
+    """
+    from itertools import combinations
+    n = len(segments)
+    if n > MIXED_EXHAUSTIVE_MAX_SEGMENTS or len(write_rates) < 2 or not gaps:
+        return []
+    ttl_names = sorted(write_rates, key=ttl_seconds)
+    surv_by_ttl = {t: survival(gaps, t) for t in ttl_names}
+    out, best_c, best_alloc = [], None, None
+    for k in range(1, min(budget, n) + 1):
+        for positions in combinations(range(n), k):
+            if cum[positions[0]] < minimum:
+                continue                      # first prefix cannot cache
+            blocks, prev = [], 0
+            for p in positions:
+                blocks.append((cum[p] - prev, survive[p]))
+                prev = cum[p]
+            tail = cum[-1] - cum[positions[-1]]
+            for assignment in _ttl_assignments(ttl_names, k):
+                survivals = [surv_by_ttl[t] for t in assignment]
+                c = expected_cost(blocks, list(assignment), read_rate,
+                                  write_rates, gaps, survivals) + tail
+                if best_c is None or c < best_c:
+                    best_c, best_alloc = c, (positions, assignment, blocks)
+    if best_alloc is None or best_c >= uncached:
+        return []
+    positions, assignment, blocks = best_alloc
+    tiers, first = [], 0
+    for i, p in enumerate(positions):
+        tiers.append(Tier(p, first, blocks[i][0], cum[p], assignment[i],
+                          survive[p] * surv_by_ttl[assignment[i]],
+                          tuple(range(first, p + 1))))
+        first = p + 1
+    label = "mixed " + "/".join(assignment)
+    note = ("placement found by scoring every marker set up to the budget "
+            "against every lifetime assignment; the uniform search reached "
+            "none of them")
+    return [(label, Allocation(tiers, best_c, uncached, [],
+                               list(base_notes) + [note]))]
+
+
+def _ttl_assignments(ttl_names, k):
+    """Lifetime per marker, respecting any recorded ordering constraint.
+
+    Yields every combination when the surface records none. A surface that
+    constrains ordering gets only the assignments that satisfy it, because a
+    plan the provider would reject is not a cheaper plan.
+    """
+    from itertools import product
+    for combo in product(ttl_names, repeat=k):
+        yield combo
 
 
 def _mixed_variants(best, segments, cum, survive, write_rates, read_rate,
