@@ -208,8 +208,14 @@ class _ProxyCase(unittest.TestCase):
         threading.Thread(target=self.stub.serve_forever, daemon=True).start()
         self.addCleanup(self.stub.shutdown)
 
+        # Reserve the *name*, not the file. The proxy creates its output
+        # exclusively now, so leaving an empty file here makes it refuse to
+        # start -- which is exactly what happens to an operator who runs
+        # `touch run.jsonl` first, and is worth the harness matching rather
+        # than working around.
         self.out = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
         self.out.close()
+        os.unlink(self.out.name)
         self.addCleanup(lambda: os.path.exists(self.out.name) and os.unlink(self.out.name))
 
         # A known port. This passed `--port 0`, so the proxy chose one the test
@@ -511,8 +517,14 @@ class TestTheProxyDoesNotReframeLiveTraffic(_ProxyCase):
         self.port = self.stub.server_address[1]
         threading.Thread(target=self.stub.serve_forever, daemon=True).start()
         self.addCleanup(self.stub.shutdown)
+        # Reserve the *name*, not the file. The proxy creates its output
+        # exclusively now, so leaving an empty file here makes it refuse to
+        # start -- which is exactly what happens to an operator who runs
+        # `touch run.jsonl` first, and is worth the harness matching rather
+        # than working around.
         self.out = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
         self.out.close()
+        os.unlink(self.out.name)
         self.addCleanup(lambda: os.path.exists(self.out.name) and os.unlink(self.out.name))
         self.proxy_port = self._free_port()
         self.proxy = subprocess.Popen(
@@ -909,3 +921,60 @@ class TestAnAbortedCountLeavesNothingOnDisk(unittest.TestCase):
         root = os.path.dirname(TIER_B)
         with open(os.path.join(root, ".gitignore")) as f:
             self.assertIn("*.partial-write", f.read())
+
+
+class TestACaptureCannotQuietlyMixTwoRuns(_ProxyCase):
+    """The evidence file opened in append mode.
+
+    Pointing two runs at one path interleaved full request and response
+    bodies -- from two different clients, if an operator reused a path between
+    engagements -- while the request counter restarted at one, so nothing
+    downstream could tell the runs apart. A capture is evidence, and evidence
+    that quietly merges with other evidence is not usable.
+    """
+
+    def _run(self, out, *extra):
+        return subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "capture_proxy.py"),
+             "--out", out, "--port", str(self._free_port()), *extra],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+
+    def test_an_existing_path_is_refused_rather_than_appended(self):
+        existing = self.out.name          # created by setUp
+        r = self._run(existing)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("already exists", r.stderr)
+        self.assertIn("--append", r.stderr, "refused without naming the way out")
+
+    def test_appending_is_available_but_has_to_be_typed(self):
+        """Refusing must not become impossible-to-resume. The flag exists and
+        says what it is doing."""
+        proc = subprocess.Popen(
+            [sys.executable, "-B", os.path.join(TIER_B, "capture_proxy.py"),
+             "--out", self.out.name, "--append", "--port", str(self._free_port())],
+            stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        self.addCleanup(proc.terminate)
+        deadline = time.time() + 15
+        seen = ""
+        while time.time() < deadline and "--append" not in seen:
+            seen += proc.stderr.readline()
+        self.assertIn("adding to an existing", seen)
+
+    def test_every_captured_row_names_its_run(self):
+        """Two runs can still end up in one file by hand. A row that cannot say
+        which capture it came from cannot be separated out again."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages", json.dumps(self.BODY),
+                     {"content-type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 200)
+        for _ in range(50):
+            rows = [json.loads(l) for l in open(self.out.name) if l.strip()]
+            if rows:
+                break
+            time.sleep(0.1)
+        self.assertTrue(rows, "nothing was captured")
+        self.assertTrue(all(r.get("capture_run") for r in rows))
+        self.assertEqual(len({r["capture_run"] for r in rows}), 1,
+                         "one process, one run id")

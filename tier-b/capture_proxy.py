@@ -32,6 +32,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -269,6 +270,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             session = hashlib.sha256((tools + system).encode()).hexdigest()[:16]
             row = {"request_id": response.get("id") or f"row-{_state['n']}",
                    "sent_at": sent_at.isoformat(),
+                   # Which run produced this row. The counter restarts at one
+                   # every process, so `row-3` from Monday and `row-3` from
+                   # Tuesday are indistinguishable once two runs share a file.
+                   # Appending is opt-in now, but a file can still be
+                   # concatenated later by hand, and a row that cannot say
+                   # which capture it came from cannot be separated out again.
+                   "capture_run": _state["run_id"],
                    "session": session,
                    "agent": request.get("model", "unknown"),
                    "status": status,
@@ -285,6 +293,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--out", required=True, help="where to write the bodies export")
     p.add_argument("--port", type=int, default=8787)
+    p.add_argument("--append", action="store_true",
+                   help="add to an existing --out instead of refusing. Rows "
+                        "carry capture_run either way, so runs stay separable.")
     p.add_argument("--upstream", default=DEFAULT_UPSTREAM,
                    help=f"where to forward to (default: {DEFAULT_UPSTREAM})")
     args = p.parse_args()
@@ -294,7 +305,26 @@ def main() -> int:
         return 2
 
     _state["upstream"] = args.upstream.rstrip("/")
-    _state["out"] = open(args.out, "a")
+    _state["run_id"] = uuid.uuid4().hex[:12]
+    # Exclusive create. This opened for append, so pointing two runs at one
+    # path silently interleaved full request and response bodies -- from two
+    # different clients, if the operator reused a path between engagements --
+    # while the request counter restarted at one, leaving no way to tell the
+    # runs apart afterwards. A capture is evidence; evidence that quietly
+    # merges with other evidence is not usable.
+    try:
+        _state["out"] = open(args.out, "x" if not args.append else "a")
+    except FileExistsError:
+        print(f"  {args.out} already exists. Captures are evidence and are not "
+              f"merged by default: a second run would interleave its bodies with "
+              f"the first and nothing downstream could separate them.\n"
+              f"  Write to a new path, or pass --append to add to this one "
+              f"deliberately.", file=sys.stderr)
+        return 2
+    if args.append:
+        print(f"  --append: adding to an existing {args.out}. Rows carry "
+              f"`capture_run` so this run can be told from the others.",
+              file=sys.stderr)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print(f"  forwarding 127.0.0.1:{args.port} -> {_state['upstream']}", file=sys.stderr)
     print(f"  writing {args.out}", file=sys.stderr)
