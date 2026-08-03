@@ -1428,7 +1428,7 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         """
         return bool(on_date) or effective_rate is not None or r.sent_at is not None
 
-    def rate_for(model, when=None):
+    def rate_for(model, when=None, target_id="anthropic/direct"):
         """`when` is the day the request was sent, and every caller must pass it.
 
         Spend already prices per request date. The finding rules did not, so
@@ -1439,8 +1439,14 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         if effective_rate is not None:
             return effective_rate
         try:
-            return registry.base_rate(model, when or on_date
-                                      or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+            # The surface, not just the model. Without it this returned
+            # Anthropic list prices for a Bedrock request and every finding
+            # priced from them, while `cost.price` -- which does check --
+            # correctly refused the same row.
+            return registry.base_rate(
+                model,
+                when or on_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                target_id)
         except registry.RegistryError:
             return 0.0
 

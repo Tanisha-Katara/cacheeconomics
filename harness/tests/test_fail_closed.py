@@ -826,3 +826,88 @@ class TestClaudeCodeSaysTheSurfaceIsAssumed(unittest.TestCase):
         self.assertEqual({r.target_id for r in ts.requests},
                          {"amazon-bedrock/converse"})
         self.assertFalse(any("surface assumed" in n for n in ts.blocking_notes))
+
+
+class TestTheFigureGateHasNoSideDoors(unittest.TestCase):
+    """`Figure` was a frozen dataclass, so every generic helper walked past it.
+
+    `asdict` and `vars` both returned `{'_usd': 123.45, ...}`.
+    `json.dumps(f, default=lambda o: o.__dict__)` -- the most common serializer
+    default anyone writes -- published the number. And
+    `dataclasses.replace(f, released=True)` turned a withheld figure into "$123"
+    in one line, with no `raw()` at the call site to grep for.
+    """
+
+    def _withheld(self):
+        from cacheeconomics.money import MEASURED, Figure
+        return Figure(123.45, MEASURED, released=False,
+                      withheld_because="not reconciled")
+
+    def test_it_is_not_walkable_as_a_dataclass(self):
+        import dataclasses
+        f = self._withheld()
+        with self.assertRaises(TypeError):
+            dataclasses.asdict(f)
+        with self.assertRaises(TypeError):
+            dataclasses.replace(f, released=True)
+
+    def test_it_carries_no_instance_dict(self):
+        """`vars` and the common json default both reach through `__dict__`."""
+        import json
+        f = self._withheld()
+        with self.assertRaises(TypeError):
+            vars(f)
+        with self.assertRaises(AttributeError):
+            json.dumps(f, default=lambda o: o.__dict__)
+
+    def test_release_state_cannot_be_set_in_place(self):
+        f = self._withheld()
+        with self.assertRaises(AttributeError):
+            f.released = True
+        self.assertIn("withheld", str(f))
+
+    def test_pickling_does_not_round_trip_it_released(self):
+        import pickle
+        f = self._withheld()
+        self.assertIn("withheld", str(pickle.loads(pickle.dumps(f))))
+
+    def test_the_deliberate_paths_still_work(self):
+        """A gate with no legitimate exit is a gate nobody can use."""
+        f = self._withheld()
+        self.assertEqual(f.raw(), 123.45)
+        self.assertIn("$123", str(f.release(True)))
+        self.assertIn("withheld", str(abs(f)))
+        self.assertEqual(abs(self._withheld().release(True)).raw(), 123.45)
+
+
+class TestTheRateLookupIsScoped(unittest.TestCase):
+    """`base_rate` took only model and date, so the surface was erased before
+    default-deny could see it.
+
+    `cost.price` happened to call `require_priceable` first. Nothing made every
+    other caller do the same, and the analyzer's own `rate_for` closure did
+    not -- so a finding could price a Bedrock request at Anthropic list while
+    `cost.price` correctly refused the same row.
+    """
+
+    def test_a_partner_surface_is_refused_at_the_rate_lookup(self):
+        from cacheeconomics import registry
+        with self.assertRaises(registry.UnpriceableSurface):
+            registry.base_rate("claude-sonnet-4-6", "2026-08-01",
+                               "amazon-bedrock/converse")
+
+    def test_a_first_party_surface_still_prices(self):
+        from cacheeconomics import registry
+        self.assertGreater(
+            registry.base_rate("claude-sonnet-4-6", "2026-08-01",
+                               "anthropic/direct"), 0)
+
+    def test_an_omitted_surface_is_confirmed_not_assumed(self):
+        """Defaulting to anthropic/direct is fine only because
+        `require_priceable` then checks it rather than trusting it."""
+        import inspect
+
+        from cacheeconomics import registry
+        src = inspect.getsource(registry.base_rate)
+        self.assertIn("require_priceable", src)
+        self.assertGreater(registry.base_rate("claude-sonnet-4-6", "2026-08-01"), 0)

@@ -19,7 +19,6 @@ one place a reviewer needs to look to audit whether a guard was bypassed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 
 # Epistemic status, from the plan. Every number carries one.
 MEASURED = "measured"    # observed in historical usage fields
@@ -33,17 +32,59 @@ class WithheldFigure(Exception):
     """Raised when an unreleased figure is used as a number."""
 
 
-@dataclass(frozen=True)
 class Figure:
-    """A dollar amount plus whether anyone is allowed to see it."""
-    _usd: float
-    basis: str = MODELED
-    released: bool = False
-    withheld_because: str = "not released"
+    """A dollar amount plus whether anyone is allowed to see it.
 
-    def __post_init__(self):
-        if self.basis not in BASES:
-            raise ValueError(f"basis must be one of {BASES}, got {self.basis!r}")
+    Deliberately not a dataclass, and `__slots__` deliberately leaves no
+    `__dict__`. As a dataclass every generic helper walked straight past the
+    gate: `dataclasses.asdict(f)` and `vars(f)` both returned `{'_usd': 123.45,
+    ...}`, `json.dumps(f, default=lambda o: o.__dict__)` -- the most common
+    serializer default anyone writes -- published the number, and
+    `dataclasses.replace(f, released=True)` turned a withheld figure into "$123"
+    in one line with no `raw()` at the call site to grep for.
+
+    `__str__`, `__repr__` and `__format__` all honour the gate, so the value now
+    has no route out except `raw()`, which is the audit point this module
+    exists to provide.
+    """
+
+    __slots__ = ("_usd", "basis", "released", "withheld_because")
+
+    def __init__(self, usd: float, basis: str = MODELED, *,
+                 released: bool = False,
+                 withheld_because: str = "not released"):
+        if basis not in BASES:
+            raise ValueError(f"basis must be one of {BASES}, got {basis!r}")
+        object.__setattr__(self, "_usd", usd)
+        object.__setattr__(self, "basis", basis)
+        object.__setattr__(self, "released", bool(released))
+        object.__setattr__(self, "withheld_because", withheld_because)
+
+    def __setattr__(self, name, value):
+        raise AttributeError(
+            f"Figure is immutable; use release() rather than setting {name!r}. "
+            f"Mutating `released` in place is how a withheld number gets "
+            f"published without passing the gate.")
+
+    def __eq__(self, other):
+        if not isinstance(other, Figure):
+            return NotImplemented
+        return (self._usd == other._usd and self.basis == other.basis
+                and self.released == other.released
+                and self.withheld_because == other.withheld_because)
+
+    def __hash__(self):
+        return hash((self._usd, self.basis, self.released))
+
+    def __reduce__(self):
+        """Pickle through the constructor, not through a state dict."""
+        return (Figure, (self._usd, self.basis),
+                {"released": self.released,
+                 "withheld_because": self.withheld_because})
+
+    def __setstate__(self, state):
+        object.__setattr__(self, "released", state["released"])
+        object.__setattr__(self, "withheld_because", state["withheld_because"])
 
     def raw(self) -> float:
         """The underlying number, gate or no gate.
@@ -64,8 +105,10 @@ class Figure:
         return self._usd
 
     def release(self, ok: bool, because: str = "") -> "Figure":
-        return replace(self, released=bool(ok),
-                       withheld_because="" if ok else (because or self.withheld_because))
+        """The only way to change release state, and it makes a new Figure."""
+        return Figure(self._usd, self.basis, released=bool(ok),
+                      withheld_because=("" if ok
+                                        else (because or self.withheld_because)))
 
     def __float__(self) -> float:
         return self.amount
@@ -107,7 +150,8 @@ class Figure:
         report says "caching COST $0.83", not "caching COST $-0.83". Dropping
         abs() during a refactor produced exactly that sentence.
         """
-        return replace(self, _usd=abs(self._usd))
+        return Figure(abs(self._usd), self.basis, released=self.released,
+                      withheld_because=self.withheld_because)
 
 
 def measured(usd: float) -> Figure:

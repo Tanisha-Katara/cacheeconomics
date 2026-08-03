@@ -311,7 +311,7 @@ def _as_date(value, what="date"):
             f"picked the wrong rate tier without failing.") from None
 
 
-def base_rate(model, on_date):
+def _base_rate_unscoped(model, on_date):
     """Base input USD/Mtok effective on `on_date` (ISO yyyy-mm-dd or date)."""
     when = _as_date(on_date, "on_date")
     models = pricing()["models"]
@@ -416,3 +416,21 @@ def staleness_report(as_of=None):
             "live_canary": p.get("verified_by", {}).get("live_canary", False),
         })
     return rows
+
+
+def base_rate(model: str, on_date, target_id: str = None) -> float:
+    """The dated first-party input rate, for a surface those rates apply to.
+
+    Scoped on purpose. This took only model and date, so it handed back
+    Anthropic list prices for any model regardless of who invoices it -- the
+    surface was erased before default-deny could see it. `cost.price` happened
+    to call `require_priceable` first; nothing made every other caller do the
+    same, and the analyzer's own `rate_for` closure did not.
+
+    `target_id` is optional only so the existing tests and the date-arithmetic
+    helpers keep working on a bare model. Omitting it is treated as
+    anthropic/direct, which is the surface these rates are recorded for, and
+    which `require_priceable` then confirms rather than assumes.
+    """
+    require_priceable(target_id or "anthropic/direct")
+    return _base_rate_unscoped(model, on_date)
