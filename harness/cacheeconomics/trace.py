@@ -670,12 +670,59 @@ def marked_prefixes(segments) -> list[int]:
     Lives here because the batch rule and the runtime alert both need it, and
     when each walked its own segments they diverged on exactly this.
     """
-    out, running = [], 0
+    return [tokens for _n, tokens, _ids in marked_spans(segments)]
+
+
+def marked_spans(segments) -> list[tuple]:
+    """Each cache marker's span: `(segment count, tokens, tuple of ids)`.
+
+    The id tuple is what lets one span be recognised inside a later one. A
+    rolling conversation marks a stable prefix and an advancing end of history,
+    so the span at the outermost marker is different on every request -- and any
+    check that compares those spans for *equality* concludes nothing was ever
+    reused, on the single most common agent shape there is.
+
+    Containment is the provider's own condition, and `simulate.py` already says
+    so where it decides whether a request reads: "the key is the tuple of
+    segment ids, so `seq[:len(key)] == key` is the literal statement that the
+    cached span is a prefix of what is being sent". Same test, same tuple,
+    reachable from this one helper rather than reinvented per rule.
+
+    Ordered by index, so `out[-1]` is the outermost marker -- which is also the
+    furthest back the provider can search from on this request.
+    """
+    out, running, seen = [], 0, []
     for s in sorted(segments, key=lambda x: x.index):
         running += s.tokens or 0
+        seen.append(s.id)
         if s.cache_marked:
-            out.append(running)
+            out.append((len(seen), running, tuple(seen)))
     return out
+
+
+def span_is_reusable_by(span, later_spans) -> bool:
+    """Could a request carrying `later_spans` read an entry covering `span`?
+
+    Two conditions, both taken from the simulator's read path rather than
+    invented here:
+
+      - the cached span is a prefix of what is being sent, `seq[:len(key)] == key`
+      - it is reachable from a breakpoint at or after it, `any(m >= length)`.
+        An entry sitting past every marker this request places cannot be found.
+
+    The 20-block lookback window is deliberately not applied. `simulate.py`
+    gates that behind `enforce_lookback`, which is on only in the PESSIMISTIC
+    arm, so enforcing it here would make a rule stricter than the neutral
+    simulator on the same trace -- a new disagreement introduced while removing
+    one.
+    """
+    if not span or not later_spans:
+        return False
+    length, _tokens, ids = span
+    outermost_n, _t, outermost_ids = later_spans[-1]
+    if length > outermost_n:
+        return False                      # past every breakpoint; unreachable
+    return outermost_ids[:length] == ids
 
 
 # How long after a request is sent its cache entry is assumed readable, when

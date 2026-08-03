@@ -390,17 +390,32 @@ class Monitor:
         # usage checks run against different scope states -- recording it beside
         # `recent_writes` put the number in one state object and the check that
         # reads it in another, so RT-TTL simply stopped firing.
-        pk = self._prefix_key(r)
-        if pk:
-            before = st.last_marked_at.get(pk)
-            if before is not None:
-                rewrite_gap = (r.sent_at - before).total_seconds()
-                if rewrite_gap >= 0:
-                    st.rewrite_gaps.append(rewrite_gap)
-            st.last_marked_at[pk] = r.sent_at
-            st.last_marked_at.move_to_end(pk)
-            while len(st.last_marked_at) > MAX_FIRING:
-                st.last_marked_at.popitem(last=False)
+        #
+        # Containment, not equality, and the lookup is inverted to get it. The
+        # batch rule tests whether an earlier span is a prefix of what is being
+        # sent, which needs the id sequence -- and this window deliberately
+        # holds hashes so no prompt content sits in a long-lived process. So
+        # instead of storing sequences and testing prefixes, hash *every*
+        # boundary of this request up to its outermost marker and look each one
+        # up. Any earlier marked span that is a prefix of this request has its
+        # hash among them, by construction.
+        #
+        # Bounded exactly as before: `int -> datetime`, capped at MAX_FIRING.
+        # Cost is one hash per segment per request.
+        seen_before = None
+        for boundary in self._prefix_hashes(r):
+            when = st.last_marked_at.get(boundary)
+            if when is not None and (seen_before is None or when > seen_before):
+                seen_before = when
+        if seen_before is not None:
+            rewrite_gap = (r.sent_at - seen_before).total_seconds()
+            if rewrite_gap >= 0:
+                st.rewrite_gaps.append(rewrite_gap)
+        for span_hash in self._marked_hashes(r):
+            st.last_marked_at[span_hash] = r.sent_at
+            st.last_marked_at.move_to_end(span_hash)
+        while len(st.last_marked_at) > MAX_FIRING:
+            st.last_marked_at.popitem(last=False)
         # Only forward. A negative gap was already dropped, but `last_sent` moved
         # backwards anyway, so the *next* request measured from the regressed
         # clock and recorded a gap inflated by however far time had gone back --
@@ -455,6 +470,42 @@ class Monitor:
         top = max(marked)
         return hash(tuple(s.id for s in sorted(r.segments, key=lambda s: s.index)
                           if s.index <= top))
+
+    @staticmethod
+    def _prefix_hashes(r) -> list:
+        """One hash per prefix boundary up to the outermost marker.
+
+        The read side of the containment test. An entry past every marker this
+        request places is unreachable -- the provider searches back *from* a
+        breakpoint -- so boundaries beyond the outermost one are not generated,
+        which is `span_is_reusable_by`'s reachability condition expressed as
+        which hashes get computed at all.
+        """
+        marked = [s.index for s in r.segments if s.cache_marked]
+        if not marked:
+            return []
+        top = max(marked)
+        out, seq = [], []
+        for s in sorted(r.segments, key=lambda s: s.index):
+            if s.index > top:
+                break
+            seq.append(s.id)
+            out.append(hash(tuple(seq)))
+        return out
+
+    @staticmethod
+    def _marked_hashes(r) -> list:
+        """One hash per *marked* span. The write side: only a marked position
+        leaves an entry an later request could find."""
+        marked = {s.index for s in r.segments if s.cache_marked}
+        if not marked:
+            return []
+        out, seq = [], []
+        for s in sorted(r.segments, key=lambda s: s.index):
+            seq.append(s.id)
+            if s.index in marked:
+                out.append(hash(tuple(seq)))
+        return out
 
     @staticmethod
     def _churn(seen: deque) -> float:

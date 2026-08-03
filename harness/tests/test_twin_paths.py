@@ -442,14 +442,23 @@ class TestMixedLifetimesAreUnprovable(unittest.TestCase):
                           Segment(id=f"t{i}", role="user", tokens=200, index=1)]))
         self.assertIsNotNone(next((a for a in fired if a.code == "RT-TTL"), None))
 
-    def test_an_advancing_marker_is_refused_by_both(self):
+    def test_an_advancing_marker_is_reported_by_both(self):
         """A rolling conversation marks a stable prefix *and* the turn, so the
         span at the outermost marker is different every request.
 
-        RT-TTL used to fire here on the median request gap alone, while TTL-1
-        walked a per-prefix timeline, found no span written twice, and refused.
-        Same trace, opposite answers, and the one that spoke was the one with
-        no evidence. Neither may speak now.
+        This test used to assert both sides refused, and that was the wrong
+        answer twice over. RT-TTL fired here on the median request gap alone
+        while TTL-1 found no span written *twice* and refused; making them agree
+        settled it at silence, which pinned the gap instead of the fix. But the
+        stable prefix underneath is rewritten on every one of these requests,
+        and a one-hour lifetime turns those rewrites into reads -- which is the
+        whole of what this rule is for.
+
+        The equality test was wrong, not the finding. `('sys',)` is a prefix of
+        `('sys','turn0')`, and `simulate.py` has always credited an advancing
+        breakpoint reading the shorter entry a previous turn wrote:
+        `seq[:len(key)] == key` is "the provider's own condition for a read".
+        Both sides use containment now, and both speak.
         """
         reqs = [self._req(i, "5m", "5m", "5m") for i in range(20)]
         for r in reqs:
@@ -462,7 +471,7 @@ class TestMixedLifetimesAreUnprovable(unittest.TestCase):
         ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="twin")
         batch = [f for f in analyze(ts).findings if f.code == "TTL-1"]
         self.assertEqual(bool(runtime), bool(batch))
-        self.assertFalse(runtime)
+        self.assertTrue(runtime, "the canonical agent shape, and neither speaks")
 
     def test_and_the_analyzer_still_prices_it(self):
         self.assertEqual(analyzer._declared_ttl(self._req(0, "5m", "5m", "5m")), "5m")
@@ -2301,6 +2310,132 @@ class TestTheRuntimeAndTheReportAgreePerFindingCode(unittest.TestCase):
         batch, runtime = self._both(self._reqs(segs), "TTL-1", "RT-TTL")
         self.assertFalse(batch)
         self.assertEqual(batch, runtime)
+
+    # -- the rolling conversation, and everything it must not swallow --------
+
+    def _rolling(self, n=12, gap=600, root=lambda i: "sys", ttl="5m"):
+        """A stable prefix marked at index 0 and an advancing marker at the end
+        of history. The most common agent shape there is, and the one both
+        rules refused because the span at the outermost marker is different on
+        every request."""
+        out = []
+        for i in range(n):
+            segs = [Segment(id=root(i), role="system", tokens=30_000, index=0,
+                            cache_marked=True, ttl=ttl)]
+            for t in range(i + 1):
+                segs.append(Segment(id=f"turn{t}", role="user", tokens=500,
+                                    index=t + 1, cache_marked=(t == i),
+                                    ttl=ttl if t == i else None))
+            out.append(Request(
+                request_id=f"r{i}", sent_at=T0 + timedelta(seconds=gap * i),
+                model="claude-opus-5", target_id="anthropic/direct",
+                ttl_requested=ttl, session="s",
+                usage={"input_tokens": 30_000 + 500 * (i + 1),
+                       "cache_creation_input_tokens": 30_000 + 500 * (i + 1)},
+                segments=segs))
+        return out
+
+    def test_a_rolling_conversation_in_band_is_seen_by_both(self):
+        batch, runtime = self._both(self._rolling(), "TTL-1", "RT-TTL")
+        self.assertTrue(batch, "the canonical shape this rule exists for")
+        self.assertEqual(batch, runtime)
+
+    def test_rolling_under_five_minutes_is_refused_by_both(self):
+        """The 5m entry was still alive, so whatever caused the miss, a longer
+        lifetime is not the fix. EFF-1 and VOL-1 name those causes."""
+        batch, runtime = self._both(self._rolling(gap=60), "TTL-1", "RT-TTL")
+        self.assertFalse(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_rolling_beyond_an_hour_is_refused_by_both(self):
+        batch, runtime = self._both(self._rolling(gap=7200), "TTL-1", "RT-TTL")
+        self.assertFalse(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_a_workload_already_on_one_hour_is_not_told_to_switch_to_one_hour(self):
+        batch, runtime = self._both(self._rolling(ttl="1h"), "TTL-1", "RT-TTL")
+        self.assertFalse(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_a_drifting_root_is_refused_by_both(self):
+        """Containment must not degrade into "anything matches". These ids
+        differ at position 0, so no span is a prefix of any later one and there
+        is nothing a lifetime could recover."""
+        batch, runtime = self._both(
+            self._rolling(root=lambda i: f"sys{i}"), "TTL-1", "RT-TTL")
+        self.assertFalse(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_the_two_ttl_rules_never_both_speak(self):
+        """TTL-1 and TTL-2 are mirrors -- "move to 1h" and "5m would do". This
+        is the first change that could make them collide on one trace, and a
+        report carrying both tells the reader to do two opposite things."""
+        for label, reqs in (("rolling 5m", self._rolling()),
+                            ("rolling 1h", self._rolling(ttl="1h")),
+                            ("rolling fast", self._rolling(gap=60))):
+            with self.subTest(trace=label):
+                ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="twin")
+                codes = [f.code for f in analyze(ts).findings]
+                self.assertFalse("TTL-1" in codes and "TTL-2" in codes,
+                                 f"both fired on {label}: {codes}")
+
+    def test_the_credited_figure_cannot_exceed_what_was_written(self):
+        """Under containment the request writes the prefix *plus* a new turn,
+        and only the prefix becomes a read. Crediting the whole write bills the
+        turn as recovered too, which overstates a client's saving."""
+        reqs = self._rolling()
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="twin")
+        a = analyze(ts, invoice_usd=500.0)
+        found = [f for f in a.findings if f.code == "TTL-1"]
+        self.assertTrue(found)
+        written = sum(r.usage["cache_creation_input_tokens"] for r in reqs)
+        # Every written token recovered at the full write-to-read delta is the
+        # ceiling no honest figure can pass. Scaled to a month the same way the
+        # finding is, or the comparison is between two different units.
+        rate = registry.base_rate("claude-opus-5", "2026-07-29", "anthropic/direct")
+        mult = registry.multipliers("anthropic/direct")
+        ceiling = (written * (rate / 1e6) * (mult["write_5m"] - mult["read"])
+                   * (30.0 / a.window_days))
+        self.assertLess(found[0].avoidable_usd_month.raw(), ceiling)
+
+    def test_the_turn_delta_is_not_billed_as_recovered(self):
+        """Sharper than the ceiling above. Grow the per-turn delta and the
+        matched prefix does not change, so a figure that scales with the delta
+        is crediting content that is new under either lifetime."""
+        def rolling_with_turn(turn_tokens):
+            out = []
+            for i in range(12):
+                segs = [Segment(id="sys", role="system", tokens=30_000, index=0,
+                                cache_marked=True, ttl="5m")]
+                for t in range(i + 1):
+                    segs.append(Segment(id=f"turn{t}", role="user",
+                                        tokens=turn_tokens, index=t + 1,
+                                        cache_marked=(t == i),
+                                        ttl="5m" if t == i else None))
+                wrote = 30_000 + turn_tokens * (i + 1)
+                out.append(Request(
+                    request_id=f"r{i}", sent_at=T0 + timedelta(seconds=600 * i),
+                    model="claude-opus-5", target_id="anthropic/direct",
+                    ttl_requested="5m", session="s",
+                    usage={"input_tokens": wrote,
+                           "cache_creation_input_tokens": wrote},
+                    segments=segs))
+            return out
+
+        def figure(turn_tokens):
+            ts = TraceSet(requests=rolling_with_turn(turn_tokens),
+                          tier=Tier.INSTRUMENTED, source="twin")
+            f = [x for x in analyze(ts, invoice_usd=500.0).findings
+                 if x.code == "TTL-1"]
+            self.assertTrue(f, f"no finding at turn={turn_tokens}")
+            return f[0].avoidable_usd_month.raw()
+
+        small, large = figure(500), figure(5_000)
+        # Ten times the delta. The recovered prefix is bounded by the previous
+        # write, which grows only by the deltas already counted, so the figure
+        # must not grow anywhere near tenfold.
+        self.assertLess(large, small * 4,
+                        f"figure tracks the delta: {small:.2f} -> {large:.2f}")
 
     def test_every_pair_has_a_case_where_it_fires(self):
         """Guards the guard. Each pair above needs at least one fixture on which

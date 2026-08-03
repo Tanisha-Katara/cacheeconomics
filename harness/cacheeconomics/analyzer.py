@@ -19,7 +19,8 @@ from .allocate import reuse_chain_of
 from .trace import QUALIFIES_SPEND as _QUALIFIES_SPEND
 from .trace import note_blocks_spend as _note_blocks_spend
 from .trace import (Request, Tier, TraceSet, _billed_input,  # noqa: E402
-                    marked_prefixes, write_tokens, write_visible_at)
+                    marked_prefixes, marked_spans, span_is_reusable_by,
+                    write_tokens, write_visible_at)
 
 MEASURED = money.MEASURED
 MODELED = money.MODELED
@@ -680,17 +681,31 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             already_1h += u.cache_write_1h
             if not (u.cache_write_5m and r.sent_at):
                 continue
-            # Keyed on the cached span itself, not just the scope. Two writes
-            # fifteen minutes apart in the same session are only evidence that a
-            # one-hour lifetime would have helped if they wrote *the same
-            # prefix*. Without segment identity they could be different or
-            # drifted prefixes, and a longer lifetime does nothing for those.
-            pk = _prefix_key(r)
-            if pk is None:
+            # Two writes fifteen minutes apart are only evidence that a longer
+            # lifetime would have helped if the second could have *read* what
+            # the first wrote. Without segment identity they could be different
+            # or drifted prefixes, and a longer lifetime does nothing for those.
+            #
+            # The span is carried rather than folded into the bucket key,
+            # because equality is the wrong test. A rolling conversation marks a
+            # stable prefix and an advancing end of history, so the outermost
+            # span differs on every request: keyed on it, every bucket held one
+            # write, every write looked cold, and each one *subtracted* the 1h
+            # premium before the agent was dropped for having no in-band
+            # rewrite. On the most common agent shape there is, this rule scored
+            # against its own recommendation and then stayed silent -- while the
+            # report raised EFF-1 and sent the reader hunting for a rotating id.
+            #
+            # `span_is_reusable_by` is the simulator's own read condition, which
+            # has always credited an advancing breakpoint reading the shorter
+            # entry a previous turn wrote.
+            spans = marked_spans(r.segments)
+            if not spans:
                 unkeyed += 1
                 continue
-            by_scope[(r.tenant, r.target_id, r.model, r.session, pk)].append(
-                (r.sent_at, u.cache_write_5m, rate_for(r.model, _when(r), r.target_id)))
+            by_scope[(r.tenant, r.target_id, r.model, r.session)].append(
+                (r.sent_at, u.cache_write_5m, rate_for(r.model, _when(r), r.target_id),
+                 spans))
 
         # Only a rewrite in the 5m-to-1h band is evidence that the five-minute
         # lifetime is what caused the miss. A rewrite 60 seconds after the last
@@ -710,17 +725,41 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             # value harder to see.
             _m = registry.multipliers(scope[1])
             _w5, _w1h, _read = _m["write_5m"], _m["write_1h"], _m["read"]
-            last = None
-            for sent_at, tokens, rate in writes:
+            # The most recent earlier write whose span this request could read,
+            # not simply the previous write in the scope. Walking backwards
+            # stops at the first match, which is the longest still-relevant one
+            # because writes are in time order.
+            earlier: list = []
+            for sent_at, tokens, rate, spans in writes:
                 per_token = rate / 1e6
-                gap = None if last is None else (sent_at - last).total_seconds()
-                last = sent_at
+                match = None
+                for prev_at, prev_span, prev_tokens in reversed(earlier):
+                    if span_is_reusable_by(prev_span, spans):
+                        match = (prev_at, prev_tokens)
+                        break
+                for span in spans:
+                    earlier.append((sent_at, span, tokens))
+                gap = None if match is None else (sent_at - match[0]).total_seconds()
                 if gap is not None and gap <= 300:
                     non_ttl_misses += 1        # a 5m entry was still alive; not a TTL problem
                     continue
                 if gap is not None and gap < 3600:
                     in_band_rewrites += 1
-                    recoverable += tokens * per_token * (_w5 - _read)   # rewrite -> read
+                    # What becomes a read is the entry the *earlier* request
+                    # wrote, not this one's whole write. On equal spans the two
+                    # are the same number and nothing moves; under containment
+                    # this write is prefix plus a new turn, and the turn is new
+                    # content under either lifetime, so crediting all of it
+                    # overstates the saving.
+                    #
+                    # Both sides are the provider's own `cache_creation` figure
+                    # rather than our segment token estimates. Bounding by the
+                    # estimate instead cut a fixture writing 200,000 tokens down
+                    # to its 7,000-token segment sum and silenced the rule --
+                    # the estimate is a split of the billed total, not a second
+                    # opinion on it.
+                    recovered = min(match[1], tokens)
+                    recoverable += recovered * per_token * (_w5 - _read)
                 else:
                     recoverable -= tokens * per_token * (_w1h - _w5)    # cold write costs more
 
