@@ -212,7 +212,19 @@ class _ProxyCase(unittest.TestCase):
             except OSError:
                 time.sleep(0.05)
         else:
-            self.skipTest("proxy did not come up")
+            # Not a skip. A proxy that crashes on import, exits before binding,
+            # or binds the wrong interface used to skip six tests and leave CI
+            # green -- the entire live capture path unguarded by the suite that
+            # exists to guard it.
+            rc = self.proxy.poll()
+            err = ""
+            if rc is not None:
+                try:
+                    err = (self.proxy.stderr.read() or b"").decode()[-600:]
+                except Exception:                              # noqa: BLE001
+                    err = "(stderr unavailable)"
+            self.fail(f"capture_proxy did not accept a connection on "
+                      f"127.0.0.1:{self.proxy_port}. exit={rc}\n{err}")
 
     def _post(self, accept_gzip=True):
         req = urllib.request.Request(
@@ -423,7 +435,19 @@ class TestTheProxyDoesNotReframeLiveTraffic(_ProxyCase):
             except OSError:
                 time.sleep(0.05)
         else:
-            self.skipTest("proxy did not come up")
+            # Not a skip. A proxy that crashes on import, exits before binding,
+            # or binds the wrong interface used to skip six tests and leave CI
+            # green -- the entire live capture path unguarded by the suite that
+            # exists to guard it.
+            rc = self.proxy.poll()
+            err = ""
+            if rc is not None:
+                try:
+                    err = (self.proxy.stderr.read() or b"").decode()[-600:]
+                except Exception:                              # noqa: BLE001
+                    err = "(stderr unavailable)"
+            self.fail(f"capture_proxy did not accept a connection on "
+                      f"127.0.0.1:{self.proxy_port}. exit={rc}\n{err}")
 
     def test_a_chunked_upload_arrives_intact(self):
         payload = json.dumps(self.BODY).encode()
@@ -476,35 +500,72 @@ class TestTheProxyDoesNotReframeLiveTraffic(_ProxyCase):
         self.assertTrue(rows, "a streamed request was not captured at all")
 
 
+
+
 class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
     """`sweep_report.py` runs the CLI with --allow-unreconciled.
 
     That releases figures the analyzer stamps DRAFT and labels not for external
-    use. The script parsed the released strings into a committed artifact that
-    said nothing about it, so a file in tier-b/evidence carried dollar
-    projections the normal gate would have withheld -- with the caveat left
-    behind in a report nobody keeps.
+    use, and the script parses those released strings into a committed
+    artifact -- so a file in tier-b/evidence can carry dollar projections the
+    normal gate would have withheld.
+
+    The first version of this test parsed `analyse()` for dict keys with `ast`.
+    Returning `unreconciled=False` with an empty gate string passed it, which
+    is the same source-inspection failure this file had just been cleaned of,
+    reintroduced one turn later by the person doing the cleaning. It calls the
+    real function against a real fixture now.
     """
 
-    def test_the_artifact_declares_it_is_unreconciled(self):
-        import ast
-        src = open(os.path.join(TIER_B, "sweep_report.py")).read()
-        tree = ast.parse(src)
-        fn = next(n for n in ast.walk(tree)
-                  if isinstance(n, ast.FunctionDef) and n.name == "analyse")
-        returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
-        dicts = [r.value for r in returns if isinstance(r.value, ast.Dict)]
-        self.assertTrue(dicts, "analyse() no longer returns a dict literal")
-        keyed = {k.value for d in dicts for k in d.keys
-                 if isinstance(k, ast.Constant)}
-        self.assertIn("monthly_input_usd", keyed, "fixture is stale")
-        self.assertIn("unreconciled", keyed,
-                      "dollar fields ship without their gate state")
-        self.assertIn("gate", keyed)
+    def _bodies(self, tmp):
+        p = os.path.join(tmp, "run.jsonl")
+        body = {"model": "claude-opus-5",
+                "system": [{"type": "text", "text": "s" * 30_000,
+                            "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": "hi"}]}
+        with open(p, "w") as f:
+            for i in range(20):
+                f.write(json.dumps({
+                    "sent_at": f"2026-07-29T09:{i:02d}:00Z", "body": body,
+                    "usage": {"input_tokens": 200,
+                              "cache_read_input_tokens": 30_000 if i else 0,
+                              "cache_creation_input_tokens": 0 if i else 30_000,
+                              "cache_creation": {
+                                  "ephemeral_5m_input_tokens": 0 if i else 30_000,
+                                  "ephemeral_1h_input_tokens": 0}}}) + "\n")
+        return p
 
-    def test_it_still_uses_the_draft_flag_knowingly(self):
-        """If the flag ever goes away the declaration must go with it, rather
-        than sitting there claiming a caveat that no longer applies."""
-        src = open(os.path.join(TIER_B, "sweep_report.py")).read()
-        self.assertIn("--allow-unreconciled", src)
-        self.assertIn("DRAFT", src)
+    def _analyse(self, tmp):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "sweep_report_under_test", os.path.join(TIER_B, "sweep_report.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.analyse(self._bodies(tmp))
+
+    def test_the_result_declares_it_is_unreconciled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            got = self._analyse(tmp)
+        if "error" in got:
+            self.fail(f"sweep analyse failed: {got['error']}")
+        self.assertIs(got.get("unreconciled"), True)
+        self.assertTrue((got.get("gate") or "").strip(),
+                        "a dollar field shipped with an empty gate reason")
+
+    def test_the_gate_reason_names_what_released_the_figures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            got = self._analyse(tmp)
+        if "error" in got:
+            self.fail(got["error"])
+        self.assertIn("unreconciled", (got.get("gate") or "").lower())
+
+    def test_a_dollar_field_never_travels_without_the_declaration(self):
+        """The property rather than the field list: if a money key is present,
+        the gate state must be present and true."""
+        with tempfile.TemporaryDirectory() as tmp:
+            got = self._analyse(tmp)
+        if "error" in got:
+            self.fail(got["error"])
+        money = [k for k in got if "usd" in k]
+        self.assertTrue(money, "fixture produced no dollar fields; vacuous")
+        self.assertIs(got.get("unreconciled"), True)

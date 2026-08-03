@@ -350,7 +350,7 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
     seen_labels = set()
     for label, alloc in _mixed_exhaustive(segments, cum, survive, minimum,
                                           budget, write_rates, read_rate, gaps,
-                                          uncached, notes):
+                                          uncached, notes, target_id):
         seen_labels.add(label)
         searched.append((label, round(alloc.expected_cost, 2)))
         if alloc.expected_cost < best.expected_cost:
@@ -450,7 +450,7 @@ MIXED_EXHAUSTIVE_MAX_SEGMENTS = 8
 
 
 def _mixed_exhaustive(segments, cum, survive, minimum, budget, write_rates,
-                      read_rate, gaps, uncached, base_notes):
+                      read_rate, gaps, uncached, base_notes, target_id):
     """Every marker placement up to `budget`, with every lifetime assignment.
 
     `_mixed_variants` can only re-label positions the uniform DP already chose,
@@ -480,7 +480,7 @@ def _mixed_exhaustive(segments, cum, survive, minimum, budget, write_rates,
                 blocks.append((cum[p] - prev, survive[p]))
                 prev = cum[p]
             tail = cum[-1] - cum[positions[-1]]
-            for assignment in _ttl_assignments(ttl_names, k):
+            for assignment in _ttl_assignments(ttl_names, k, target_id):
                 survivals = [surv_by_ttl[t] for t in assignment]
                 c = expected_cost(blocks, list(assignment), read_rate,
                                   write_rates, gaps, survivals) + tail
@@ -503,15 +503,33 @@ def _mixed_exhaustive(segments, cum, survive, minimum, budget, write_rates,
                                list(base_notes) + [note]))]
 
 
-def _ttl_assignments(ttl_names, k):
+def _ttl_assignments(ttl_names, k, target_id):
     """Lifetime per marker, respecting any recorded ordering constraint.
 
-    Yields every combination when the surface records none. A surface that
-    constrains ordering gets only the assignments that satisfy it, because a
-    plan the provider would reject is not a cheaper plan.
+    This yielded every permutation while its own docstring said constrained
+    surfaces were filtered. They were not, and the comment made that harder to
+    notice rather than easier. Measured: two 5,000-token segments on
+    amazon-bedrock/converse produced `[(0, "5m"), (1, "1h")]`, which
+    `checks.check_ttl_ordering` fails on the same surface -- the allocator
+    recommending a placement the project's own linter rejects, on the output
+    that gets applied to a production prompt rather than published.
+
+    A constraint the registry does not record is not a constraint. A constraint
+    it does record is enforced here, once, rather than at each call site.
     """
     from itertools import product
+    try:
+        constraint = registry.capability(target_id, "ttl_ordering_constraint")
+    except registry.RegistryError:
+        # Unrecorded is not permission on a surface nobody has described. The
+        # uniform assignments are always valid under any ordering rule, so they
+        # are what survives.
+        constraint = "longest_first"
     for combo in product(ttl_names, repeat=k):
+        if constraint == "longest_first":
+            secs = [ttl_seconds(t) for t in combo]
+            if any(b > a for a, b in zip(secs, secs[1:])):
+                continue
         yield combo
 
 

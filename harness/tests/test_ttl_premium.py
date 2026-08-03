@@ -923,3 +923,72 @@ class TestTheLiteLLMBaselineIsWhatLiteLLMDoes(unittest.TestCase):
                          injection_points=[{"index": 0,
                                             "control": {"type": "ephemeral"}}])
         self.assertEqual(p.ttls, {0: "1h"}, "overwrote the caller's lifetime")
+
+
+class TestTheAllocatorObeysTheOrderingRule(unittest.TestCase):
+    """`_ttl_assignments` yielded every permutation while its docstring said
+    constrained surfaces were filtered. They were not, and the comment made
+    that harder to notice rather than easier.
+
+    On amazon-bedrock/converse the allocator produced [(0,"5m"), (1,"1h")],
+    which this project's own `checks.check_ttl_ordering` fails on that surface.
+    The allocator recommending a plan the linter rejects, on the output that
+    gets applied to a production prompt rather than published.
+    """
+
+    SEGS = [Segment(id="a", role="system", tokens=5000, index=0),
+            Segment(id="b", role="user", tokens=5000, index=1)]
+    RATES = {0: 0.0, 1: 0.0}
+    GAPS = [600.0] * 20 + [7200.0]
+
+    def _plan(self, target):
+        from cacheeconomics import tiers
+        a = tiers.allocate(self.SEGS, self.RATES, target_id=target,
+                           model="claude-haiku-4-5", gaps=self.GAPS, budget=2)
+        return [(t.marker_position, t.ttl) for t in a.tiers]
+
+    def test_a_constrained_surface_gets_a_plan_its_own_linter_passes(self):
+        from cacheeconomics import checks
+        plan = self._plan("amazon-bedrock/converse")
+        self.assertTrue(plan, "no plan at all; the fixture no longer bites")
+        r = checks.check_ttl_ordering([t for _, t in plan],
+                                      "amazon-bedrock/converse",
+                                      "claude-haiku-4-5")
+        self.assertEqual(str(getattr(r.status, "value", r.status)), "PASS", r.detail)
+
+    def test_an_unconstrained_surface_can_still_mix_either_way(self):
+        """The filter must not cost the plan it was added to find."""
+        from cacheeconomics import checks
+        plan = self._plan("anthropic/direct")
+        self.assertEqual(plan, [(0, "5m"), (1, "1h")])
+        st = checks.check_ttl_ordering(
+            ["5m", "1h"], "anthropic/direct", "claude-haiku-4-5").status
+        self.assertEqual(str(getattr(st, "value", st)), "PASS")
+
+    def test_an_unrecorded_surface_gets_the_conservative_rule(self):
+        """Unrecorded is not permission. Uniform assignments are valid under
+        any ordering rule, so those are what survive."""
+        from cacheeconomics.tiers import _ttl_assignments
+        got = list(_ttl_assignments(["5m", "1h"], 2, "no/such-surface"))
+        self.assertNotIn(("5m", "1h"), got)
+        self.assertIn(("5m", "5m"), got)
+        self.assertIn(("1h", "1h"), got)
+
+
+class TestREB0IsEmittedOnce(unittest.TestCase):
+    """Splitting REB-0 into its own rule left the old early return in place, so
+    an all-sessionless export emitted it twice -- the same population counted
+    by each path. The double-count the split was meant to prevent, in the other
+    direction."""
+
+    def test_an_all_sessionless_export_reports_it_once(self):
+        u = {"input_tokens": 0, "cache_read_input_tokens": 0,
+             "cache_creation_input_tokens": 50_000,
+             "cache_creation": {"ephemeral_5m_input_tokens": 50_000,
+                                "ephemeral_1h_input_tokens": 0}}
+        reqs = [Request(request_id=f"r{i}", sent_at=T0, model="claude-opus-5",
+                        usage=u) for i in range(2)]
+        codes = [f.code for f in analyze(
+            TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="t"),
+            allow_unreconciled=True).findings]
+        self.assertEqual(codes.count("REB-0"), 1, codes)

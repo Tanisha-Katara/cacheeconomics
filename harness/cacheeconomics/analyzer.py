@@ -1204,34 +1204,10 @@ def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
     #
     # `_rebuild_abstention` is raised first only when there is nothing left to
     # measure. Otherwise it is stashed and the caller emits both.
-    if unmeasurable and not sessions:
-        # Silence here would read as "no rebuilds", which is the opposite of
-        # what is true: nothing in this export says which requests followed
-        # which, so the question was never asked. The runtime abstains the same
-        # way, and for the same reason.
-        return Finding(
-            code="REB-0", title="Prefix rebuilds could not be measured",
-            severity="low", evidence_class=MEASURED,
-            detail=(f"{len(unmeasurable):,} of {len(reqs):,} cache-writing "
-                    f"request(s) carry no session id and timestamp pair, so "
-                    f"there is no way to say which request followed which for "
-                    f"them. Rebuild counting is the most useful thing this tool "
-                    f"can do with usage counters alone, and it is the one "
-                    f"finding that cannot be inferred from totals. They wrote "
-                    f"{sum(write_tokens(r.usage) for r in unmeasurable):,} "
-                    f"tokens to cache between them, and nothing here can say "
-                    f"whether that was extension or teardown."
-                    + (" The rest of the export is grouped and REB-1 covers it."
-                       if grouped else "")),
-            affected_requests=len(unmeasurable), avoidable_usd_month=None,
-            confidence="high", quality_risk="low",
-            fix="Export a session or conversation id alongside usage. Nothing "
-                "else about the ingest needs to change. If the agent does not "
-                "emit one, `tier-b/capture_proxy.py` derives a cache-pool key "
-                "from the stable prefix, which is the grouping every finding "
-                "here actually reasons about -- without it a workload that "
-                "interleaves call types reads as one conversation whose tools "
-                "keep changing, and VOL-1 fires on a prefix that never drifted.")
+    # REB-0 belongs to `_f_rebuild_abstention` alone. Splitting it into its own
+    # rule left this early return in place, so an all-sessionless export emitted
+    # REB-0 twice -- the same population counted once by each path, which is the
+    # double-count the split was meant to prevent in the other direction.
     rebuilds, extended, switched, tokens, expired = 0, 0, 0, 0, 0
     unprovable_turns = 0
     for group in sessions.values():

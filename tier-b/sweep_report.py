@@ -77,21 +77,40 @@ def analyse(path: str) -> dict:
         os.path.dirname(HERE), "harness"),
         CACHEECONOMICS_HMAC_KEY=os.environ.get(
             "CACHEECONOMICS_HMAC_KEY", "0" * 64))
+    # `--target-id` is required now. A bodies export states the API shape and
+    # never the billing surface, so the loader resolves it to UNATTRIBUTED and
+    # withholds every figure -- correct, and it broke this script silently until
+    # a behavioural test called `analyse()` instead of parsing it. These
+    # captures come from capture_proxy pointed at Anthropic, which is a fact
+    # this script knows and the export does not carry.
     r = subprocess.run([sys.executable, "-m", "cacheeconomics.cli", "analyze",
                         path, "--from", "bodies", "--allow-unreconciled",
+                        "--target-id", "anthropic/direct",
                         "--format", "json"],
                        capture_output=True, text=True, env=env)
     if r.returncode != 0:
         return {"error": r.stderr.strip()[:200]}
     d = json.loads(r.stdout)
-    monthly = float(d["spend"]["monthly_input_usd"].replace("$", "").replace(",", ""))
+
+    def _usd(text):
+        """A figure, or None when the gate withheld it.
+
+        `float("[withheld: ...]")` raised ValueError and took the whole sweep
+        down. A withheld figure is an answer, not a crash, and the artifact has
+        to be able to say so.
+        """
+        if not isinstance(text, str) or text.startswith("["):
+            return None
+        try:
+            return float(text.replace("$", "").replace(",", ""))
+        except ValueError:
+            return None
+
+    monthly = _usd(d["spend"].get("monthly_input_usd"))
     ttl = next((f for f in d["findings"] if f["code"] == "TTL-1"), None)
     rec = 0.0
     if ttl and ttl.get("avoidable_usd_month"):
-        try:
-            rec = float(ttl["avoidable_usd_month"].replace("$", "").replace(",", ""))
-        except ValueError:
-            rec = 0.0
+        rec = _usd(ttl["avoidable_usd_month"]) or 0.0
     # The gate state travels with the numbers. `--allow-unreconciled` releases
     # figures the analyzer stamps DRAFT and marks not for external use, and this
     # parsed the released strings into a committed artifact that said nothing
