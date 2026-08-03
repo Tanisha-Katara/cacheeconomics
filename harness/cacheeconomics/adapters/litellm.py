@@ -44,7 +44,7 @@ from ..segment import usage_from_details as _from_details
 from ..registry import UNATTRIBUTED
 from ..trace import (QUALIFIES_SPEND, note_blocks_spend as _note_blocks_spend,
                      Request, Tier, TraceSet, _is_token_count, _text,
-                     session_of, write_tokens)
+                     resolve_litellm_tenant, session_of, write_tokens)
 
 # `custom_llm_provider` -> a surface the registry carries. Only mappings the
 # registry can actually price are listed; anything else keeps the provider name
@@ -257,23 +257,11 @@ def _agent_of(row: dict) -> str:
 
 
 def _tenant_of(row: dict) -> str | None:
-    """Cache isolation is per key, not per human.
-
-    Ordered narrowest first. Two teams under one org do not share a cache entry,
-    so an org id would merge traffic that can never pool -- which reads as a
-    prefix being rebuilt when it is simply a different tenant's.
-    """
-    # `.get` on a string is an AttributeError, and this is the one ingest path
-    # whose input is another system's schema. Measured: `metadata` written as a
-    # string took the entire export down instead of costing one row.
-    meta = row.get("metadata")
-    meta = meta if isinstance(meta, dict) else {}
-    for k in ("user_api_key_hash", "user_api_key_alias", "user_api_key_team_id",
-              "team_id", "user_api_key_user_id"):
-        v = _text(meta.get(k))
-        if v:
-            return v
-    return _text(row.get("end_user"))
+    """Whose traffic this is. Delegates to the one resolver the live hook also
+    uses. This read `end_user` and never metadata `user_id`; the hook read
+    `user_id` and never `end_user`; and being `.get`-only it dropped
+    object-shaped metadata entirely. One row, two tenants, two pools."""
+    return resolve_litellm_tenant(row)
 
 
 def request_from_payload(row: dict, *, default_tenant: str | None = None,

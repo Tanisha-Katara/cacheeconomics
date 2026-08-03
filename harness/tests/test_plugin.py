@@ -1761,19 +1761,56 @@ class TestTenantMatchesTheBatchAdapter(unittest.TestCase):
     six, so a team-scoped key resolved to None and two teams shared one
     `(None, target, model)` scope -- for caches the provider keeps apart."""
 
-    def test_every_field_the_adapter_reads_is_read_here_too(self):
+    # Every place either side has ever read a tenant from, and the shapes they
+    # actually arrive in. Each row is fed to both paths and the two answers must
+    # match -- including when the answer is None.
+    ROWS = (
+        ("key hash", {"metadata": {"user_api_key_hash": "h1"}}),
+        ("key alias", {"metadata": {"user_api_key_alias": "alias-1"}}),
+        ("key team", {"metadata": {"user_api_key_team_id": "team-9"}}),
+        ("team", {"metadata": {"team_id": "t2"}}),
+        ("key user", {"metadata": {"user_api_key_user_id": "ku-3"}}),
+        ("metadata user_id", {"metadata": {"user_id": "u-42"}}),
+        ("end_user", {"end_user": "acme"}),
+        ("top-level user", {"user": "u-77"}),
+        ("user_id beside end_user",
+         {"metadata": {"user_id": "u-42"}, "end_user": "acme"}),
+        ("nothing", {"model": "claude-opus-5"}),
+        ("metadata as a string", {"metadata": "not-a-dict", "end_user": "acme"}),
+        ("unhashable value", {"metadata": {"team_id": {"nested": 1}},
+                              "end_user": "acme"}),
+    )
+
+    def test_the_two_paths_answer_identically_on_every_shape(self):
+        """Structural before: it grepped the adapter's source for field names
+        and asserted the live tuple contained them. That is one direction only,
+        and it could not see the divergence that mattered -- both lists held
+        `team_id`, and the two still returned different tenants for
+        `{"metadata": {"user_id": ...}, "end_user": ...}`, because they differ
+        in what they read *after* the shared five. A row is the only thing that
+        exercises that."""
         from cacheeconomics.adapters import litellm as batch
-        import inspect
-        src = inspect.getsource(batch)
-        block = src[src.index("user_api_key_hash"):]
-        fields = {f for f in ("user_api_key_hash", "user_api_key_alias",
-                              "user_api_key_team_id", "team_id",
-                              "user_api_key_user_id")
-                  if f in block[:400]}
-        self.assertTrue(fields, "adapter field list moved; update this test")
-        missing = fields - set(plugin_mod._TENANT_FIELDS)
-        self.assertEqual(missing, set(),
-                         "the live path ignores tenant fields the batch path uses")
+        for name, row in self.ROWS:
+            with self.subTest(row=name):
+                self.assertEqual(plugin_mod._tenant_of(None, row),
+                                 batch._tenant_of(row))
+
+    def test_the_object_shaped_key_reaches_both(self):
+        """The live hook is handed an object; the loader was `.get`-only and
+        read no tenant at all from one."""
+        from cacheeconomics.adapters import litellm as batch
+
+        class ObjMeta:
+            user_api_key_team_id = "team-a"
+        row = {"metadata": ObjMeta()}
+        self.assertEqual(plugin_mod._tenant_of(None, row), "team-a")
+        self.assertEqual(batch._tenant_of(row), "team-a")
+
+    def test_neither_path_invents_a_tenant(self):
+        for name, row in self.ROWS:
+            if name != "nothing":
+                continue
+            self.assertIsNone(plugin_mod._tenant_of(None, row))
 
     def test_it_reads_an_object_key_and_a_dict_key_and_metadata(self):
         class ObjKey:

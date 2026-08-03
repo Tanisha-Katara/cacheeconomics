@@ -108,6 +108,23 @@ def walk(request: dict):
     for mi, m in enumerate(request.get("messages") or []):
         role = m.get("role", "user") if isinstance(m, dict) else "user"
         content = m.get("content") if isinstance(m, dict) else m
+        # OpenAI-shaped tool history, which this package had no word for: both
+        # names appeared zero times across the whole repo. Neither is `content`,
+        # so an assistant message that only calls a tool produced no segment at
+        # all, and the call id -- which LiteLLM regenerates per call -- sat in
+        # the middle of the prefix invalidating everything behind it while the
+        # segmenter reported the prompt as perfectly stable. It is on the wire,
+        # so it is part of the prefix, so it gets an identity.
+        #
+        # The path's last element is a name rather than an index, which is what
+        # makes these positions unmarkable: `_mark` indexes into `content` and
+        # neither field lives there. Seeing drift is the whole job here;
+        # rewriting somebody else's tool protocol is not.
+        if isinstance(m, dict):
+            for name in ("tool_calls", "tool_call_id"):
+                value = m.get(name)
+                if value is not None:
+                    yield role, f"{role}:{name}", value, ("messages", mi, name)
         if isinstance(content, str):
             yield role, role, content, ("messages", mi, None)
             continue
@@ -342,6 +359,14 @@ def _mark(body: dict, path: tuple, ttl: str) -> None:
             body["system"][path[1]] = blockify(body["system"][path[1]])
     else:
         _, mi, bi = path
+        # A named position is tool history, not content. Nothing may write a
+        # `cache_control` there: it does not live under `content`, so the write
+        # would either miss or invent a shape the provider never documented.
+        if isinstance(bi, str):
+            raise ValueError(
+                f"refusing to place a cache marker on {bi!r} at messages[{mi}]: "
+                f"tool history is visible to the segmenter so drift is caught, "
+                f"and is deliberately not a marker location")
         msg = body["messages"][mi]
         if bi is None:
             msg["content"] = [blockify(msg["content"])]

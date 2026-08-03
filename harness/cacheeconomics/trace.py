@@ -585,6 +585,78 @@ def _billed_input(usage: dict) -> int:
                if _is_token_count(v) and v > 0)
 
 
+# Where LiteLLM records whose traffic a request is, narrowest first. Cache
+# isolation is per key, not per human: two teams under one org never share an
+# entry, so an org id would merge traffic that can never pool.
+LITELLM_TENANT_FIELDS = ("user_api_key_hash", "user_api_key_alias",
+                         "user_api_key_team_id", "team_id",
+                         "user_api_key_user_id", "user_id")
+
+
+def read_field(obj, *names):
+    """Read an identity field from a mapping or an object, as a scalar or None.
+
+    LiteLLM hands the live hook a `user_api_key_dict` whose name is the only
+    thing guaranteeing its shape, and reaching for an attribute alone collapsed
+    every tenant to None whenever it arrived as the dict its name advertises.
+    Tenant is part of the cache isolation scope, so that silently pooled traffic
+    that can never share an entry.
+
+    Values are normalised through `_text`, so everything leaving here is
+    hashable. These feed tenant, session and agent, and all three end up in
+    dictionary keys -- a dict in `metadata.trace_id` raised `unhashable type`
+    from inside `async_pre_call_hook`, which is optional metadata failing
+    somebody's live LLM call. Numbers stringify, because a numeric tenant id
+    means something; structured values are discarded, because there is no honest
+    reading of a dictionary as a tenant.
+
+    A discarded structured value means "this name did not answer" and the search
+    continues, or a dict in `session_id` would stop `conversation_id` from ever
+    being read.
+    """
+    for name in names:
+        raw = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+        if raw is None:
+            continue
+        scalar = _text(raw)
+        if scalar is not None:
+            return scalar
+    return None
+
+
+def resolve_litellm_tenant(data, key=None) -> str | None:
+    """Whose traffic this is. One answer for the live hook and the loader.
+
+    They had two, and on `{"metadata": {"user_id": "u-42"}, "end_user": "acme"}`
+    they gave two different tenants for one row: the live path read `user_id`
+    and the loader read `end_user`. Tenant is part of the cache isolation scope,
+    so the same traffic landed in different pools depending on which path saw
+    it, and a monitor that disagrees with the report about who a request belongs
+    to cannot be reconciled against it.
+
+    Each path also knew something the other did not. The loader read `end_user`
+    and the hook did not; the hook read metadata `user_id` and a top-level
+    `user`, and the loader read neither. The loader was `.get`-only, so
+    object-shaped metadata -- the shape the live hook is handed -- read as no
+    tenant at all.
+
+    The stated reason for keeping them apart was that the adapter sits behind an
+    optional dependency. It does not: `adapters/litellm.py` imports no
+    third-party package, and this function lives in the module both already
+    import.
+    """
+    for source in (key, (data or {}).get("metadata") if isinstance(data, dict)
+                   else getattr(data, "metadata", None)):
+        if source is None:
+            continue
+        got = read_field(source, *LITELLM_TENANT_FIELDS)
+        if got:
+            return got
+    # Then the request's own end user, then the bare `user` field. Both are
+    # broader than a key, so they come last and in that order.
+    return read_field(data or {}, "end_user", "user")
+
+
 def marked_prefixes(segments) -> list[int]:
     """Token count of the prefix ending at each cache marker, in index order.
 

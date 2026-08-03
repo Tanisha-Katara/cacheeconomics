@@ -52,7 +52,8 @@ from .allocate import reuse_chain
 from .monitor import MAX_SCOPES, WINDOW, Monitor
 from .segment import (apply_markers, marker_count, segments_from_request,  # noqa: F401
                       strip_markers, walk)
-from .trace import Request, Segment, _text, session_of, write_tokens
+from .trace import (Request, Segment, _text, read_field,
+                    resolve_litellm_tenant, session_of, write_tokens)
 
 # Bytes per token, matching the recorder's estimator. Deliberately the same
 # constant: a plugin that estimated prompt size differently from the tool that
@@ -91,9 +92,29 @@ def markable_positions(body: dict, containers=MESSAGE_CONTAINERS) -> frozenset:
     The caller knows its own transport; the plugin does not. So markability is
     stated as positions, computed from the same `walk` that produces the
     segments, rather than inferred from a role.
+
+    Two positions are excluded whatever the caller says. Tool history --
+    `tool_calls` and `tool_call_id` -- is visible to the segmenter so a rotating
+    call id shows up as the drift it is, and is not a marker location: it is not
+    content, and the message carrying it belongs to a protocol this package does
+    not model. Modelling LiteLLM's translation of it is the trap `litellm_auto`
+    already fell into, and the cost of guessing wrong here is a mutated request
+    on somebody's live traffic.
+
+    So does the *content* of a message that carries either field. Marking a
+    bare-string `tool` message rewrote `"18C"` into Anthropic block form on an
+    OpenAI-shaped request -- a body neither provider documents, produced by a
+    tool whose entire claim is that it does not guess.
     """
-    return frozenset(i for i, (_, _, _, path) in enumerate(walk(body))
-                     if path[0] in containers)
+    stood_down = set()
+    for i, (_, _, _, path) in enumerate(walk(body)):
+        if len(path) > 2 and isinstance(path[2], str):
+            stood_down.add(path[1])
+    return frozenset(
+        i for i, (_, _, _, path) in enumerate(walk(body))
+        if path[0] in containers
+        and not (len(path) > 2 and isinstance(path[2], str))
+        and not (path[0] == "messages" and path[1] in stood_down))
 
 # Alerts a plugin keeps for a human to read. The monitor caps its own state and
 # this did not: a long-running proxy accumulated one list entry per alert for
@@ -572,39 +593,10 @@ class CachePlugin:
 
 
 def _field(obj, *names):
-    """Read an identity field from a mapping or an object, as a scalar or None.
-
-    LiteLLM hands the hook a `user_api_key_dict`, and the name is the only thing
-    guaranteeing its shape. Reaching for an attribute alone collapsed every
-    tenant to None whenever it arrived as the dict its name advertises, and
-    tenant is part of the cache isolation scope -- so that silently pooled
-    traffic that can never share an entry.
-
-    Normalised through the loader's own `_text`, so every value leaving here is
-    hashable. All three call sites feed tenant, session or agent, and all three
-    end up in dictionary keys: the reuse chain and the monitor's scope. A dict or
-    list in `metadata.trace_id` raised `TypeError: unhashable type` from inside
-    `async_pre_call_hook` -- optional metadata failing somebody's LLM call, on
-    the one path that sits in front of live traffic.
-
-    `_text` was written for this exact class on the ingest side, where its
-    docstring calls it "the same class as the `usage`-as-a-string crash, one
-    field over". It was one field over again: the loader was hardened and the
-    live hook was not. Numbers stringify because a numeric tenant id means
-    something; structured values are discarded, because there is no honest
-    reading of a dictionary as a tenant.
-    """
-    for name in names:
-        raw = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
-        if raw is None:
-            continue
-        # Keep looking rather than giving up. Discarding a structured value has to
-        # mean "this name did not answer", or a dict in `session_id` would stop
-        # `conversation_id` from ever being read.
-        scalar = _text(raw)
-        if scalar is not None:
-            return scalar
-    return None
+    """Mapping-or-object identity read. Lives in trace.py now, because the
+    loader needed the same accessor and reaching for `.get` alone dropped every
+    object-shaped tenant on that side."""
+    return read_field(obj, *names)
 
 
 def default_session_from(data: dict):
@@ -649,26 +641,11 @@ def default_agent_from(data: dict) -> str:
 # adapter lives behind an optional dependency and this path must not acquire
 # one. The field list is the thing that has to agree, and a test asserts it
 # does.
-_TENANT_FIELDS = ("user_api_key_hash", "user_api_key_alias",
-                  "user_api_key_team_id", "team_id", "user_api_key_user_id",
-                  "user_id")
-
-
 def _tenant_of(user_api_key_dict, data) -> str | None:
-    """Whose traffic this is, from either place LiteLLM records it.
-
-    Reads through `_field`, which handles a mapping or an object. Reaching for
-    `.get` alone collapses every tenant to None when the key arrives as an
-    object -- the mirror of the bug `_field` was written for, reintroduced by
-    widening the field list without reusing the accessor.
-    """
-    for source in (user_api_key_dict, (data or {}).get("metadata")):
-        if source is None:
-            continue
-        got = _field(source, *_TENANT_FIELDS)
-        if got:
-            return got
-    return _field(data or {}, "user")
+    """Whose traffic this is. Delegates, so the live hook and the loader cannot
+    answer differently for one row -- they did, and tenant is part of the cache
+    isolation scope."""
+    return resolve_litellm_tenant(data, key=user_api_key_dict)
 
 
 def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,

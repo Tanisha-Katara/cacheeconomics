@@ -1040,3 +1040,92 @@ class TestExactTokenCountsWhenSupplied(unittest.TestCase):
         # counting each segment alone, which is the property that makes the
         # result exact.
         self.assertEqual(calls, [1, 2, 3, 4])
+
+
+class TestToolHistoryIsVisibleButNotMarkable(unittest.TestCase):
+    """`tool_calls` and `tool_call_id` appeared zero times in this repo.
+
+    Both are on the wire in front of everything after them, and LiteLLM
+    regenerates the call id per call -- so an agent using tools rebuilt its
+    prefix on every request while the segmenter reported a perfectly stable
+    prompt. An assistant message that only calls a tool has `content: None`,
+    which produced no segment at all.
+
+    The response is to see them and stand down: identity so drift surfaces,
+    and no marker placement, because the message belongs to a protocol this
+    package does not model and the mutating path sits in front of live traffic.
+    """
+
+    @staticmethod
+    def _body(call_id):
+        return {"model": "gpt-4o", "messages": [
+            {"role": "system", "content": "you are helpful"},
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": call_id, "type": "function",
+                             "function": {"name": "get_weather",
+                                          "arguments": '{"city":"SF"}'}}]},
+            {"role": "tool", "tool_call_id": call_id, "content": "18C"},
+            {"role": "user", "content": "and tomorrow"}]}
+
+    def test_a_rotating_call_id_changes_the_prefix(self):
+        from cacheeconomics.segment import segments_from_request
+        a = segments_from_request(self._body("call_aaa"), KEY)
+        b = segments_from_request(self._body("call_bbb"), KEY)
+        self.assertEqual(len(a), len(b))
+        self.assertNotEqual([s["id"] for s in a], [s["id"] for s in b])
+
+    def test_an_assistant_that_only_calls_a_tool_is_still_a_segment(self):
+        from cacheeconomics.segment import walk
+        labels = [label for _, label, _, _ in walk(self._body("c1"))]
+        self.assertIn("assistant:tool_calls", labels)
+        self.assertIn("tool:tool_call_id", labels)
+
+    def test_a_stable_call_id_leaves_the_prefix_alone(self):
+        """The other direction: seeing the field must not make every request
+        look like drift."""
+        from cacheeconomics.segment import segments_from_request
+        a = segments_from_request(self._body("call_same"), KEY)
+        b = segments_from_request(self._body("call_same"), KEY)
+        self.assertEqual([s["id"] for s in a], [s["id"] for s in b])
+
+    def test_the_plugin_will_not_mark_tool_history(self):
+        from cacheeconomics.plugin import markable_positions
+        from cacheeconomics.segment import walk
+        body = self._body("c1")
+        paths = [p for _, _, _, p in walk(body)]
+        markable = markable_positions(body)
+        for i, path in enumerate(paths):
+            if len(path) > 2 and isinstance(path[2], str):
+                self.assertNotIn(i, markable, f"{path} is offered for marking")
+
+    def test_it_will_not_mark_the_content_of_a_tool_message_either(self):
+        """Marking a bare-string `tool` message rewrote "18C" into Anthropic
+        block form on an OpenAI-shaped request -- a body neither provider
+        documents."""
+        from cacheeconomics.plugin import markable_positions
+        from cacheeconomics.segment import walk
+        body = self._body("c1")
+        markable = markable_positions(body)
+        for i, (role, _, _, path) in enumerate(walk(body)):
+            if path[0] == "messages" and body["messages"][path[1]].get("tool_call_id"):
+                self.assertNotIn(i, markable)
+        self.assertEqual(sorted(markable), [0, 1, 5])
+
+    def test_marking_it_anyway_raises_rather_than_rewriting(self):
+        from cacheeconomics.segment import apply_markers
+        with self.assertRaises(ValueError):
+            apply_markers(self._body("c1"), {2: "5m"})
+
+    def test_an_anthropic_body_is_untouched_by_any_of_this(self):
+        """Blast radius: an Anthropic request carries neither field, so its
+        segmentation must be exactly what it was."""
+        from cacheeconomics.segment import segments_from_request, walk
+        body = {"model": "claude-opus-5",
+                "system": [{"type": "text", "text": "policy"}],
+                "messages": [{"role": "user", "content": "hello"},
+                             {"role": "assistant", "content": "hi"}]}
+        self.assertEqual([p for _, _, _, p in walk(body)],
+                         [("system", 0), ("messages", 0, None),
+                          ("messages", 1, None)])
+        self.assertEqual(len(segments_from_request(body, KEY)), 3)
