@@ -796,3 +796,116 @@ class TestCountingLargeExportsStaysLinear(unittest.TestCase):
         self.assertLess(large, small * 100 + 0.5,
                         f"200 segments cost {large:.3f}s against {small:.3f}s "
                         f"for 20 -- worse than the shape of the search itself")
+
+
+class TestAMalformedUploadDoesNotTakeTheNextRequestWithIt(_ProxyCase):
+    """`_BadChunkedBody` is raised partway through a body, so an unknown number
+    of bytes are still unread on the socket.
+
+    `protocol_version = "HTTP/1.1"` means keep-alive, so the next read starts
+    inside the abandoned body and parses it as a request line -- the same
+    corruption draining the trailers was written to prevent, reintroduced on
+    the error path. One malformed upload took the following good request with
+    it and dropped it from the capture silently.
+
+    Driven over a raw socket, because `http.client` will not send framing this
+    broken and the point is what a broken client does.
+    """
+
+    def _sock(self):
+        s = socket.create_connection(("127.0.0.1", self.proxy_port), timeout=10)
+        self.addCleanup(s.close)
+        return s
+
+    def test_the_proxy_refuses_it_and_closes_rather_than_desyncing(self):
+        s = self._sock()
+        s.sendall(b"POST /v1/messages HTTP/1.1\r\n"
+                  b"Host: 127.0.0.1\r\n"
+                  b"Transfer-Encoding: chunked\r\n\r\n"
+                  b"5\r\nhello\r\nZZZZ\r\n")
+        # Read to EOF, which the server closing is what makes possible -- and is
+        # itself half of what this test is checking.
+        reply = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        self.assertIn(b"400", reply.split(b"\r\n")[0])
+        self.assertIn(b"cacheeconomics_proxy_bad_request", reply)
+        # Closed, so a client reusing the socket gets a clean failure rather
+        # than having its next request eaten by the abandoned body.
+        head = reply.split(b"\r\n\r\n")[0].lower()
+        self.assertIn(b"connection: close", head)
+
+    def test_a_good_request_on_a_fresh_connection_still_works(self):
+        """The other direction: refusing must not take the proxy down."""
+        self._sock().sendall(b"POST /v1/messages HTTP/1.1\r\n"
+                             b"Host: 127.0.0.1\r\n"
+                             b"Transfer-Encoding: chunked\r\n\r\n"
+                             b"5\r\nhello\r\nZZZZ\r\n")
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=10)
+        conn.request("POST", "/v1/messages", json.dumps(self.BODY),
+                     {"content-type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 200)
+
+
+class TestAnAbortedCountLeavesNothingOnDisk(unittest.TestCase):
+    """The streamed writer opened `<out>.partial-write` and closed it only on
+    the normal path.
+
+    Any exception between the open and the rename left an enriched export on
+    disk holding client prompt bodies, under a name `.gitignore` did not cover.
+    Same defect as the plaintext count cache the same change removed, one file
+    over.
+    """
+
+    def setUp(self):
+        self.ct = load("count_tokens")
+        self.dir = tempfile.mkdtemp()
+        self.src = os.path.join(self.dir, "in.jsonl")
+        self.out = os.path.join(self.dir, "out.jsonl")
+        with open(self.src, "w") as f:
+            for i in range(4):
+                f.write(json.dumps({"request": {
+                    "model": "claude-opus-5",
+                    "system": [{"type": "text", "text": f"SECRET-POLICY-{i}"}],
+                    "messages": [{"role": "user",
+                                  "content": f"CONFIDENTIAL-{i}"}]}}) + "\n")
+
+    def _run(self, after):
+        """Run the counter, raising `after` once one row has been emitted."""
+        real = self.ct.count_segments
+        seen = {"n": 0}
+
+        def wrapped(body, count, cache):
+            seen["n"] += 1
+            if seen["n"] > 1:
+                raise after
+            return real(body, count, cache)
+
+        self.ct.count_segments = wrapped
+        self.addCleanup(setattr, self.ct, "count_segments", real)
+        argv = sys.argv[:]
+        sys.argv = ["count_tokens", self.src, "--out", self.out,
+                    "--endpoint", "http://127.0.0.1:1/unused"]
+        try:
+            self.ct.main()
+        except BaseException:                                  # noqa: BLE001
+            pass
+        finally:
+            sys.argv = argv
+
+    def test_an_interrupt_leaves_no_prompt_bearing_file(self):
+        self._run(KeyboardInterrupt("ctrl-c"))
+        left = [f for f in os.listdir(self.dir) if f != "in.jsonl"]
+        for name in left:
+            blob = open(os.path.join(self.dir, name)).read()
+            self.assertNotIn("SECRET-POLICY", blob, f"{name} holds prompt text")
+            self.assertNotIn("CONFIDENTIAL", blob, f"{name} holds prompt text")
+        self.assertNotIn("out.jsonl.partial-write", left)
+
+    def test_the_temp_name_is_gitignored_as_a_second_line_of_defence(self):
+        root = os.path.dirname(TIER_B)
+        with open(os.path.join(root, ".gitignore")) as f:
+            self.assertIn("*.partial-write", f.read())

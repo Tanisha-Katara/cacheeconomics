@@ -137,12 +137,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except _BadChunkedBody as e:
             # Nothing goes upstream and nothing is recorded. A truncated body
             # forwarded as if whole is a capture of a request nobody made.
+            #
+            # And the connection dies with it. This raises partway through a
+            # body, so an unknown number of bytes are still unread on the
+            # socket -- and `protocol_version = "HTTP/1.1"` means keep-alive, so
+            # the next read starts inside the abandoned body and parses it as a
+            # request line. That is the same corruption draining the trailers
+            # was written to prevent, reintroduced on the error path: one
+            # malformed upload taking the following good request with it, and
+            # silently dropping it from the capture. The remainder cannot be
+            # drained because its framing is what failed, so the only correct
+            # answer is to close.
+            self.close_connection = True
             body = json.dumps({"error": {
                 "type": "cacheeconomics_proxy_bad_request",
                 "message": f"could not read the request body: {e}"}}).encode()
             self.send_response(400)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
+            self.send_header("connection", "close")
             self.end_headers()
             self.wfile.write(body)
             return

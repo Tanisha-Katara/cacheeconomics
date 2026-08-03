@@ -154,93 +154,107 @@ def main() -> int:
     counted, skipped, failed = 0, 0, 0
     tmp_path = args.out + ".partial-write"
     sink = None if args.dry_run else open(tmp_path, "w")
+    # Closed and cleaned up on every exit, not just the normal one. Without
+    # this, any exception between the open and the rename -- a write failure, a
+    # cache checkpoint failure, an operator hitting ctrl-c -- left an enriched
+    # export on disk containing client prompt bodies, under a name `.gitignore`
+    # did not cover. That is the same defect as the plaintext count cache this
+    # same change was written to remove, one file over.
+    renamed = False
+    try:
 
-    def emit(text):
-        if sink is not None:
-            sink.write(text + "\n")
+        def emit(text):
+            if sink is not None:
+                sink.write(text + "\n")
 
-    with open(args.path) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                emit(line)                 # passed through untouched
-                skipped += 1
-                continue
-            body = _find_body(row) if isinstance(row, dict) else None
-            if not body:
+        with open(args.path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    emit(line)                 # passed through untouched
+                    skipped += 1
+                    continue
+                body = _find_body(row) if isinstance(row, dict) else None
+                if not body:
+                    emit(json.dumps(row))
+                    skipped += 1
+                    continue
+                try:
+                    row["segment_tokens"] = count_segments(body, count, cache)
+                    counted += 1
+                except Exception as e:                                # noqa: BLE001
+                    # The row survives without counts and the analyzer falls back to
+                    # estimating it, which is worse but is not nothing. Losing the
+                    # row entirely would be.
+                    print(f"  row {counted + failed + skipped}: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+                    failed += 1
                 emit(json.dumps(row))
-                skipped += 1
-                continue
-            try:
-                row["segment_tokens"] = count_segments(body, count, cache)
-                counted += 1
-            except Exception as e:                                # noqa: BLE001
-                # The row survives without counts and the analyzer falls back to
-                # estimating it, which is worse but is not nothing. Losing the
-                # row entirely would be.
-                print(f"  row {counted + failed + skipped}: {type(e).__name__}: {e}",
-                      file=sys.stderr)
-                failed += 1
-            emit(json.dumps(row))
-            if counted % 25 == 0 and counted and not args.dry_run:
-                # Not during a dry run. The dry-run counter returns 0 for every
-                # prefix, and this checkpoint fires before the guard below, so
-                # a dry run over 25+ rows wrote a cache mapping real prefix keys
-                # to zero counts. A later real run with the same --out resumes
-                # from those zeros and emits `segment_tokens` that look counted
-                # and never touched a tokenizer -- while the dry run printed
-                # "Nothing was sent and nothing was written."
-                with open(cache_path, "w") as cf:
-                    json.dump(cache, cf)
-                print(f"  {counted:,} rows, {stats['calls']:,} calls, "
-                      f"{len(cache):,} cached", file=sys.stderr)
+                if counted % 25 == 0 and counted and not args.dry_run:
+                    # Not during a dry run. The dry-run counter returns 0 for every
+                    # prefix, and this checkpoint fires before the guard below, so
+                    # a dry run over 25+ rows wrote a cache mapping real prefix keys
+                    # to zero counts. A later real run with the same --out resumes
+                    # from those zeros and emits `segment_tokens` that look counted
+                    # and never touched a tokenizer -- while the dry run printed
+                    # "Nothing was sent and nothing was written."
+                    with open(cache_path, "w") as cf:
+                        json.dump(cache, cf)
+                    print(f"  {counted:,} rows, {stats['calls']:,} calls, "
+                          f"{len(cache):,} cached", file=sys.stderr)
 
-    if sink is not None:
-        sink.close()
+        if sink is not None:
+            sink.close()
 
-    if args.dry_run:
-        # Deliberately writes nothing. A dry run produced an output file whose
-        # `segment_tokens` were all zero, and the loader read that as *counted*
-        # -- `tokens_are_counted: True` on a file that had never spoken to a
-        # tokenizer, with every segment's size collapsed onto one. A file that
-        # looks authoritative and is not is the exact failure this toolchain
-        # exists to refuse, so the dry run reports and stops.
-        print(f"\n  DRY RUN: {stats['calls']:,} calls would go to {args.endpoint}")
-        print(f"  {counted:,} rows would be counted, {skipped:,} skipped.")
-        print("  Nothing was sent and nothing was written.")
+        if args.dry_run:
+            # Deliberately writes nothing. A dry run produced an output file whose
+            # `segment_tokens` were all zero, and the loader read that as *counted*
+            # -- `tokens_are_counted: True` on a file that had never spoken to a
+            # tokenizer, with every segment's size collapsed onto one. A file that
+            # looks authoritative and is not is the exact failure this toolchain
+            # exists to refuse, so the dry run reports and stops.
+            print(f"\n  DRY RUN: {stats['calls']:,} calls would go to {args.endpoint}")
+            print(f"  {counted:,} rows would be counted, {skipped:,} skipped.")
+            print("  Nothing was sent and nothing was written.")
+            return 0
+
+        # A partial count is not a count. Rows whose tokenizer call failed are
+        # written without `segment_tokens` and the analyzer estimates them, which is
+        # the right fallback -- but this returned 0 either way, and
+        # `run_diagnostic.py` reads only the exit code. So a run where the endpoint
+        # failed on the largest row proceeded as though counting had succeeded, and
+        # nothing downstream could tell.
+        partial = failed > 0
+        out_path = args.out if not partial or args.allow_partial else args.out + ".partial"
+        os.replace(tmp_path, out_path)
+        renamed = True
+        with open(cache_path, "w") as cf:
+            json.dump(cache, cf)
+
+        print(f"\n  counted   {counted:,} rows")
+        print(f"  skipped   {skipped:,} (no recognisable body)")
+        if failed:
+            print(f"  failed    {failed:,} (left for the analyzer to estimate)")
+        print(f"  API calls {stats['calls']:,} for {len(cache):,} distinct prefixes"
+              + (f", {stats['calls'] / counted:.1f} per row" if counted else ""))
+        print(f"  wrote     {out_path}")
+        print(f"  cache     {cache_path} (re-runs are free)")
+        if partial and not args.allow_partial:
+            print(f"\n  PARTIAL: {failed:,} row(s) could not be counted, so this is "
+                  f"not a counted export.\n  Written to {out_path} rather than "
+                  f"{args.out}. Re-run to pick up the cached prefixes, or pass "
+                  f"--allow-partial to accept a mixed file.", file=sys.stderr)
+            return 1
         return 0
-
-    # A partial count is not a count. Rows whose tokenizer call failed are
-    # written without `segment_tokens` and the analyzer estimates them, which is
-    # the right fallback -- but this returned 0 either way, and
-    # `run_diagnostic.py` reads only the exit code. So a run where the endpoint
-    # failed on the largest row proceeded as though counting had succeeded, and
-    # nothing downstream could tell.
-    partial = failed > 0
-    out_path = args.out if not partial or args.allow_partial else args.out + ".partial"
-    os.replace(tmp_path, out_path)
-    with open(cache_path, "w") as cf:
-        json.dump(cache, cf)
-
-    print(f"\n  counted   {counted:,} rows")
-    print(f"  skipped   {skipped:,} (no recognisable body)")
-    if failed:
-        print(f"  failed    {failed:,} (left for the analyzer to estimate)")
-    print(f"  API calls {stats['calls']:,} for {len(cache):,} distinct prefixes"
-          + (f", {stats['calls'] / counted:.1f} per row" if counted else ""))
-    print(f"  wrote     {out_path}")
-    print(f"  cache     {cache_path} (re-runs are free)")
-    if partial and not args.allow_partial:
-        print(f"\n  PARTIAL: {failed:,} row(s) could not be counted, so this is "
-              f"not a counted export.\n  Written to {out_path} rather than "
-              f"{args.out}. Re-run to pick up the cached prefixes, or pass "
-              f"--allow-partial to accept a mixed file.", file=sys.stderr)
-        return 1
-    return 0
+    finally:
+        if sink is not None and not sink.closed:
+            sink.close()
+        if not renamed and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 if __name__ == "__main__":
