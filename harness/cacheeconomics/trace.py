@@ -700,21 +700,40 @@ def marked_spans(segments) -> list[tuple]:
     return out
 
 
-def span_is_reusable_by(span, later_spans) -> bool:
+def span_is_reusable_by(span, later_spans, lookback=None) -> bool:
     """Could a request carrying `later_spans` read an entry covering `span`?
 
-    Two conditions, both taken from the simulator's read path rather than
-    invented here:
+    All three conditions from the simulator's read path, rather than invented
+    here:
 
       - the cached span is a prefix of what is being sent, `seq[:len(key)] == key`
       - it is reachable from a breakpoint at or after it, `any(m >= length)`.
         An entry sitting past every marker this request places cannot be found.
+      - it is within `lookback` blocks of one of those breakpoints, the
+        simulator's `any(0 <= m - length <= window)`.
 
-    The 20-block lookback window is deliberately not applied. `simulate.py`
-    gates that behind `enforce_lookback`, which is on only in the PESSIMISTIC
-    arm, so enforcing it here would make a rule stricter than the neutral
-    simulator on the same trace -- a new disagreement introduced while removing
-    one.
+    The window used to be left out here, on the reasoning that `simulate.py`
+    gates it behind `enforce_lookback` and so the neutral arm does without it.
+    That was wrong, and expensively: measured on a tool-heavy agent appending 25
+    messages per call -- an ordinary tool call/result loop -- every marker lands
+    25 blocks past the previous one, past the recorded 20, so *every* read TTL-1
+    credited was one the provider would not give. It published $836/month on
+    that workload, and $1,058 at a stride of 40, growing as it got more wrong.
+
+    The neutral simulator arm can omit the window because it *compares*
+    placements against each other, and an optimistic assumption shared by both
+    arms cancels. A rule publishing an absolute figure to a client has nothing
+    for it to cancel against. So callers that publish money pass the window and
+    side with PESSIMISTIC; that is a difference in what the two are for, not a
+    disagreement about the provider.
+
+    `lookback=None` means unbounded and is the honest reading of a surface whose
+    `lookback_blocks` the registry does not record -- there, reachability is all
+    that can be checked.
+
+    The window is a parameter because this module imports nothing from the
+    package, which is what lets both the batch rules and the runtime alerts
+    share it. Callers read `capability(target_id, "lookback_blocks")`.
     """
     if not span or not later_spans:
         return False
@@ -722,6 +741,9 @@ def span_is_reusable_by(span, later_spans) -> bool:
     outermost_n, _t, outermost_ids = later_spans[-1]
     if length > outermost_n:
         return False                      # past every breakpoint; unreachable
+    if lookback is not None and not any(
+            0 <= n - length <= lookback for n, _tk, _id in later_spans):
+        return False                      # too far back from every breakpoint
     return outermost_ids[:length] == ids
 
 

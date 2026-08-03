@@ -725,6 +725,19 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             # value harder to see.
             _m = registry.multipliers(scope[1])
             _w5, _w1h, _read = _m["write_5m"], _m["write_1h"], _m["read"]
+            # The provider searches back a bounded number of blocks from a
+            # breakpoint, and this rule publishes a dollar figure, so the bound
+            # is enforced. Without it a tool loop appending 25 messages per call
+            # was credited for reads at 25 blocks against a recorded window of
+            # 20 -- every one of them a read the provider would not give.
+            #
+            # None where the surface records no window: unbounded is the honest
+            # reading of a number nobody has written down, and the containment
+            # and reachability tests still apply.
+            try:
+                _lookback = registry.capability(scope[1], "lookback_blocks")
+            except registry.RegistryError:
+                _lookback = None
             # The most recent earlier write whose span this request could read,
             # not simply the previous write in the scope. Walking backwards
             # stops at the first match, which is the longest still-relevant one
@@ -734,7 +747,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 per_token = rate / 1e6
                 match = None
                 for prev_at, prev_span, prev_tokens in reversed(earlier):
-                    if span_is_reusable_by(prev_span, spans):
+                    if span_is_reusable_by(prev_span, spans, _lookback):
                         match = (prev_at, prev_tokens)
                         break
                 for span in spans:

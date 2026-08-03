@@ -2398,6 +2398,60 @@ class TestTheRuntimeAndTheReportAgreePerFindingCode(unittest.TestCase):
                    * (30.0 / a.window_days))
         self.assertLess(found[0].avoidable_usd_month.raw(), ceiling)
 
+    def _tool_loop(self, stride, n=12, gap=600):
+        """A tool-heavy agent: `stride` messages appended per LLM call, which
+        is what a tool call/result loop looks like on the wire. Content is
+        perfectly stable, so containment always holds -- the only question is
+        whether the provider could still reach the entry."""
+        out = []
+        for i in range(n):
+            segs = [Segment(id="sys", role="system", tokens=20_000, index=0)]
+            total = stride * (i + 1)
+            for t in range(total):
+                segs.append(Segment(id=f"m{t}", role="user", tokens=100,
+                                    index=t + 1, cache_marked=(t == total - 1),
+                                    ttl="5m" if t == total - 1 else None))
+            wrote = 20_000 + 100 * total
+            out.append(Request(
+                request_id=f"r{i}", sent_at=T0 + timedelta(seconds=gap * i),
+                model="claude-opus-5", target_id="anthropic/direct",
+                ttl_requested="5m", session="s",
+                usage={"input_tokens": wrote, "cache_creation_input_tokens": wrote},
+                segments=segs))
+        return out
+
+    def test_a_read_past_the_lookback_window_is_credited_by_neither(self):
+        """The provider searches back a bounded number of blocks from a
+        breakpoint. `lookback_blocks` is 20 on this surface and is recorded.
+
+        A tool loop appending 25 messages a call puts every marker 25 blocks
+        past the previous one, so no earlier entry is reachable -- and both
+        rules credited them anyway, publishing $836/month, rising to $1,058 at
+        a stride of 40. The figure grew as it got more wrong.
+        """
+        window = registry.capability("anthropic/direct", "lookback_blocks")
+        self.assertEqual(window, 20, "fixture is calibrated to this number")
+        batch, runtime = self._both(self._tool_loop(window + 5), "TTL-1", "RT-TTL")
+        self.assertFalse(batch, "credited a read the provider would not give")
+        self.assertEqual(batch, runtime)
+
+    def test_a_read_inside_the_window_is_still_credited_by_both(self):
+        """The other direction, and the one that makes the test above mean
+        something: bounding must not silence the rule wholesale."""
+        window = registry.capability("anthropic/direct", "lookback_blocks")
+        batch, runtime = self._both(self._tool_loop(window - 5), "TTL-1", "RT-TTL")
+        self.assertTrue(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_an_unrecorded_window_falls_back_to_reachability_alone(self):
+        """`lookback=None` means the surface records no window. Unbounded is the
+        honest reading of a number nobody wrote down; inventing 20 there would
+        be the same fabrication this package refuses everywhere else."""
+        near = (5, 400, ("a", "b", "c", "d", "e"))
+        far = [(500, 40_000, tuple("abcde") + tuple(f"x{i}" for i in range(495)))]
+        self.assertTrue(trace.span_is_reusable_by(near, far, None))
+        self.assertFalse(trace.span_is_reusable_by(near, far, 20))
+
     def test_the_turn_delta_is_not_billed_as_recovered(self):
         """Sharper than the ceiling above. Grow the per-turn delta and the
         matched prefix does not change, so a figure that scales with the delta

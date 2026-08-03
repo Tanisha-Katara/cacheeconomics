@@ -473,23 +473,41 @@ class Monitor:
 
     @staticmethod
     def _prefix_hashes(r) -> list:
-        """One hash per prefix boundary up to the outermost marker.
+        """One hash per prefix boundary this request could actually read from.
 
         The read side of the containment test. An entry past every marker this
         request places is unreachable -- the provider searches back *from* a
         breakpoint -- so boundaries beyond the outermost one are not generated,
         which is `span_is_reusable_by`'s reachability condition expressed as
         which hashes get computed at all.
+
+        The provider also searches back only a bounded number of blocks, so
+        boundaries further than that behind every marker are not generated
+        either. Leaving that out gave RT-TTL the same over-credit as TTL-1 on a
+        tool loop appending 25 messages a call, and the parity class exists to
+        make a one-sided fix fail rather than pass.
         """
         marked = [s.index for s in r.segments if s.cache_marked]
         if not marked:
             return []
+        try:
+            window = registry.capability(r.target_id, "lookback_blocks")
+        except registry.RegistryError:
+            window = None
         top = max(marked)
+        ordered = sorted(r.segments, key=lambda s: s.index)
+        # Marker positions as lengths in this sequence, which is the unit
+        # `lookback_blocks` and `span_is_reusable_by` both count in.
+        marks = [i + 1 for i, s in enumerate(ordered) if s.cache_marked]
         out, seq = [], []
-        for s in sorted(r.segments, key=lambda s: s.index):
+        for s in ordered:
             if s.index > top:
                 break
             seq.append(s.id)
+            length = len(seq)
+            if window is not None and not any(
+                    0 <= m - length <= window for m in marks):
+                continue
             out.append(hash(tuple(seq)))
         return out
 
