@@ -19,6 +19,8 @@ import http.server
 import importlib.util
 import json
 import os
+import socket
+import time
 import subprocess
 import sys
 import tempfile
@@ -134,6 +136,9 @@ class TestTheCounterIsExactAndCached(unittest.TestCase):
 
 
 class _Stub(http.server.BaseHTTPRequestHandler):
+    # Counted so a test can prove the request actually arrived here.
+    hits = 0
+
     """An upstream that answers like the provider, and gzips if asked."""
 
     def log_message(self, *a):
@@ -147,6 +152,7 @@ class _Stub(http.server.BaseHTTPRequestHandler):
                               "usage": {"input_tokens": 7,
                                         "cache_read_input_tokens": 0,
                                         "cache_creation_input_tokens": 0}}).encode()
+        type(self).hits += 1
         wants_gzip = "gzip" in (self.headers.get("accept-encoding") or "")
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -158,13 +164,25 @@ class _Stub(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-class TestTheProxyForwardsSomethingReadable(unittest.TestCase):
-    """It stripped `content-encoding` and forwarded the still-compressed body,
-    so the client decoded gzip as text. Measured as "'utf-8' codec can't decode
-    byte 0x8b" -- the gzip magic number -- six steps into a real agent run.
-    """
+class _ProxyCase(unittest.TestCase):
+    """A live proxy in front of a loopback stub, for cases that need to send a
+    real request through it. Shared because both cases below do."""
+
+    BODY = {"model": "claude-opus-5", "max_tokens": 8,
+            "system": [{"type": "text", "text": "you are precise",
+                        "cache_control": {"type": "ephemeral"}}],
+            "tools": [{"name": "t", "description": "d",
+                       "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "hi"}]}
+
+    @staticmethod
+    def _free_port():
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
 
     def setUp(self):
+        _Stub.hits = 0
         self.stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Stub)
         self.port = self.stub.server_address[1]
         threading.Thread(target=self.stub.serve_forever, daemon=True).start()
@@ -174,39 +192,89 @@ class TestTheProxyForwardsSomethingReadable(unittest.TestCase):
         self.out.close()
         self.addCleanup(lambda: os.path.exists(self.out.name) and os.unlink(self.out.name))
 
+        # A known port. This passed `--port 0`, so the proxy chose one the test
+        # could never discover -- which is exactly why nothing was ever sent
+        # through it and every assertion in this class read the source instead.
+        self.proxy_port = self._free_port()
         self.proxy = subprocess.Popen(
             [sys.executable, os.path.join(TIER_B, "capture_proxy.py"),
-             "--out", self.out.name, "--port", "0",
+             "--out", self.out.name, "--port", str(self.proxy_port),
              "--upstream", f"http://127.0.0.1:{self.port}"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             env=dict(os.environ, ANTHROPIC_API_KEY="test"))
         self.addCleanup(self.proxy.terminate)
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", self.proxy_port), 0.1):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            self.skipTest("proxy did not come up")
 
-    def test_the_upstream_is_overridable(self):
+    def _post(self, accept_gzip=True):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy_port}/v1/messages",
+            data=json.dumps(self.BODY).encode(),
+            headers={"content-type": "application/json",
+                     "accept-encoding": "gzip" if accept_gzip else "identity"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.read()
+
+
+class TestTheProxyForwardsSomethingReadable(_ProxyCase):
+    """It stripped `content-encoding` and forwarded the still-compressed body,
+    so the client decoded gzip as text. Measured as "'utf-8' codec can't decode
+    byte 0x8b" -- the gzip magic number -- six steps into a real agent run.
+    """
+
+    def test_a_request_reaches_the_configured_upstream(self):
         """It hard-coded api.anthropic.com, which locks out every client behind
-        a gateway -- the ones most likely to care about egress at all."""
-        src = open(os.path.join(TIER_B, "capture_proxy.py")).read()
-        self.assertIn("--upstream", src)
-        self.assertIn("DEFAULT_UPSTREAM", src)
+        a gateway -- the ones most likely to care about egress at all.
 
-    def test_it_asks_upstream_for_identity_encoding(self):
-        src = open(os.path.join(TIER_B, "capture_proxy.py")).read()
-        self.assertIn('"accept-encoding"] = "identity"', src.replace("'", '"'),
-                      "the proxy may request a compressed body it cannot forward")
+        Driven end to end. Asserting `--upstream` appears in the source passes
+        on dead code that still forwards to the default host.
+        """
+        self._post()
+        self.assertEqual(_Stub.hits, 1,
+                         "the request never reached the configured upstream")
+
+    def test_the_client_gets_a_body_it_can_decode(self):
+        """The proxy stripped `content-encoding` and forwarded the still-gzipped
+        bytes, so the client decoded gzip as text. Measured as "\'utf-8\' codec
+        can\'t decode byte 0x8b" -- the gzip magic number -- six steps into a
+        real agent run."""
+        raw = self._post(accept_gzip=True)
+        self.assertNotEqual(raw[:2], b"\x1f\x8b", "forwarded a compressed body")
+        json.loads(raw.decode())          # must not raise
 
 
-class TestEveryCapturedRowCarriesASession(unittest.TestCase):
+class TestEveryCapturedRowCarriesASession(_ProxyCase):
     """Without one, every request lands in one reuse chain. On a real capture
     that made three different *kinds* of request -- an agent loop beside a
     judgement call -- read as one conversation whose tools kept changing, and
     VOL-1 fired confidently on a prefix that had never drifted."""
 
     def test_the_key_is_derived_from_the_stable_prefix(self):
-        src = open(os.path.join(TIER_B, "capture_proxy.py")).read()
-        self.assertIn('"session"', src)
-        self.assertIn("tools", src.split('"session"')[0][-600:],
-                      "the session key should be derived from tools and system, "
-                      "which is what decides the cache pool")
+        """Read off a captured row, not off the source. Grepping for the string
+        "session" passes on a constant, and a constant session is precisely the
+        bug: every request lands in one reuse chain."""
+        self._post()
+        other = dict(self.BODY, tools=[{"name": "z", "description": "d",
+                                        "input_schema": {"type": "object"}}])
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy_port}/v1/messages",
+            data=json.dumps(other).encode(),
+            headers={"content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
+        rows = [json.loads(l) for l in open(self.out.name) if l.strip()]
+        self.assertEqual(len(rows), 2, "the proxy did not capture both requests")
+        keys = [r.get("session") for r in rows]
+        self.assertTrue(all(keys), "a captured row carries no session")
+        self.assertNotEqual(keys[0], keys[1],
+                            "two different tool sets share a session key, so "
+                            "every request lands in one reuse chain")
+
 
 
 class TestTheDefaultPathCounts(unittest.TestCase):

@@ -558,11 +558,49 @@ class TestTheSimulatorSearchesBackwardLikeTheProvider(unittest.TestCase):
 
     def test_the_pessimistic_arm_still_bounds_the_search(self):
         """The window is a real provider constraint and the pessimistic arm is
-        where this project chooses to enforce it. Removing the exact-match
-        requirement must not quietly remove that too."""
+        where this project enforces it. Removing the exact-match requirement
+        must not quietly remove that too.
+
+        The fixture has to put a cached prefix OUTSIDE the window or the test
+        proves nothing. An earlier version reused `_reqs()`, whose three turns
+        are all within any plausible lookback, and asserted `cost_p >= cost_n`
+        -- which holds trivially when the two arms are identical. Deleting the
+        window enforcement passed it.
+        """
         from cacheeconomics import simulate
+        from cacheeconomics.allocate import Plan
+        from cacheeconomics.simulate import registry_lookback
+        window = registry_lookback("anthropic/direct")
+        self.assertTrue(window, "no lookback recorded, so this cannot be tested")
         self.assertTrue(simulate.PESSIMISTIC.enforce_lookback)
-        cost_p, _ = self._cost(self._moving, assume=simulate.PESSIMISTIC)
-        cost_n, _ = self._cost(self._moving, assume=simulate.NEUTRAL)
-        self.assertGreaterEqual(cost_p, cost_n,
-                                "the pessimistic arm came out cheaper than neutral")
+
+        # A conversation far longer than the window, so the entry the first
+        # turn wrote sits well behind the advancing breakpoint.
+        n = window + 6
+        layers = [("system", 4000, "sys")] + [
+            ("user", 4000, f"m{i}") for i in range(n)]
+
+        def reqs():
+            out = []
+            for k in range(2, len(layers) + 1):
+                out.append(Request(
+                    request_id=f"r{k}", sent_at=T0 + timedelta(seconds=30 * k),
+                    model="claude-opus-5", agent="a", session="s",
+                    target_id="anthropic/direct", usage={},
+                    segments=[Segment(id=sid, role=role, tokens=tok, index=i)
+                              for i, (role, tok, sid) in enumerate(layers[:k])]))
+            return out
+
+        def moving(r, **kw):
+            i = len(r.segments) - 1
+            return Plan(policy="moving", marker_indices=[i], ttls={i: "5m"})
+
+        def reads(assume):
+            res = simulate.simulate(reqs(), moving, assume=assume)
+            return sum(u.cache_read for u in res.usages)
+
+        neutral, pessimistic = reads(simulate.NEUTRAL), reads(simulate.PESSIMISTIC)
+        self.assertGreater(neutral, 0, "nothing read even unbounded; fixture is wrong")
+        self.assertLess(pessimistic, neutral,
+                        "the pessimistic arm read as much as the unbounded one, "
+                        "so the window is not being enforced")

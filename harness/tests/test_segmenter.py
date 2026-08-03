@@ -1030,5 +1030,13 @@ class TestExactTokenCountsWhenSupplied(unittest.TestCase):
             return sizes[min(n - 1, 3)]          # minus the sentinel
 
         got = count_segments(self.BODY, fake, {})
-        self.assertEqual(len(got), 3)
-        self.assertTrue(all(n >= 0 for n in got))
+        # The actual differences, not the shape of the list. This asserted only
+        # `len(got) == 3` and non-negativity, so `count_segments` returning
+        # [0, 0, 0] passed the test whose own docstring says the counts must
+        # come back exactly -- and counted tokens are what release structural
+        # dollar figures.
+        self.assertEqual(got, [11, 22, 7])
+        # And that it took differences of *growing prefixes* rather than
+        # counting each segment alone, which is the property that makes the
+        # result exact.
+        self.assertEqual(calls, [1, 2, 3, 4])

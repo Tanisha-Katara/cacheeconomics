@@ -745,21 +745,35 @@ class TestABodyExportStatesNoSurface(unittest.TestCase):
             self.assertTrue(a.spend["input_usd"].released)
 
     def test_the_cli_does_not_inject_a_default_behind_the_adapter(self):
-        """The CLI passed DEFAULT_TARGET for this path, which defeated the
-        adapter's refusal entirely. The litellm path already knew better."""
-        import inspect
+        """The CLI passed DEFAULT_TARGET on this path, defeating the adapter's
+        refusal entirely.
 
+        Behavioural, not a source slice. The earlier version read
+        `inspect.getsource(cli._load)` and checked the text of the call, which
+        `args.target_id = args.target_id or DEFAULT_TARGET` one line above it
+        passes cleanly while reintroducing the whole bug. Verified: that
+        mutation passed the old assertions.
+        """
         from cacheeconomics import cli
-        src = inspect.getsource(cli._load)
-        bodies = src.split("if args.source == \"bodies\"")[1]
-        # The call, not any mention of it: the comment above the call names
-        # DEFAULT_TARGET to explain why it is not used, and matching prose
-        # rather than code is how a test ends up asserting nothing.
-        call = bodies[bodies.index("load_bodies("):]
-        call = call[:call.index(")")]
-        self.assertIn("target_id=args.target_id", call)
-        self.assertNotIn("DEFAULT_TARGET", call,
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._export(tmp)
+            argv = ["analyze", path, "--from", "bodies",
+                    "--allow-unreconciled", "--format", "json"]
+            key = os.environ.get("CACHEECONOMICS_HMAC_KEY")
+            os.environ["CACHEECONOMICS_HMAC_KEY"] = "k" * 32
+            try:
+                args = cli.build_parser().parse_args(argv)
+                ts = cli._load(args)
+            finally:
+                if key is None:
+                    os.environ.pop("CACHEECONOMICS_HMAC_KEY", None)
+                else:
+                    os.environ["CACHEECONOMICS_HMAC_KEY"] = key
+        from cacheeconomics.registry import UNATTRIBUTED
+        self.assertEqual({r.target_id for r in ts.requests}, {UNATTRIBUTED},
                          "the CLI re-fabricates the surface the adapter refused")
+        self.assertFalse(analyze(ts, allow_unreconciled=True)
+                         .spend["input_usd"].released)
 
 
 class TestClaudeCodeSaysTheSurfaceIsAssumed(unittest.TestCase):
@@ -767,15 +781,37 @@ class TestClaudeCodeSaysTheSurfaceIsAssumed(unittest.TestCase):
     them. The surface is an adapter assumption, kept because Claude Code talks
     to Anthropic unless routed, but stated rather than buried."""
 
+    def _fixture(self, tmp):
+        """A transcript on disk, so these run in CI.
+
+        They used to call `load_sessions()` against the developer's own
+        `~/.claude/projects` and skip on any exception or empty result. On a
+        clean checkout that is an unconditional skip, so a mutation removing
+        the surface blocker would never have been tested at all -- on the one
+        path that decides which rate table applies.
+        """
+        import json
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        path = os.path.join(proj, "session.jsonl")
+        with open(path, "w") as f:
+            for i in range(12):
+                f.write(json.dumps({
+                    "type": "assistant", "sessionId": "s1",
+                    "uuid": f"u{i}", "requestId": f"r{i}",
+                    "timestamp": f"2026-07-29T09:{i:02d}:00.000Z",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 100, "output_tokens": 10,
+                        "cache_read_input_tokens": 20_000,
+                        "cache_creation_input_tokens": 1_000}}}) + "\n")
+        return tmp
+
     def test_the_assumption_is_visible_without_detail(self):
         from cacheeconomics.adapters.claude_code import load_sessions
         from cacheeconomics.report import render_text
-        try:
-            ts = load_sessions()
-        except Exception:
-            self.skipTest("no local transcripts")
-        if not ts.requests:
-            self.skipTest("no local transcripts")
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_sessions(root=self._fixture(tmp))
+        self.assertTrue(ts.requests, "fixture produced no requests")
         self.assertTrue(any("surface assumed" in n for n in ts.blocking_notes))
         flat = " ".join(render_text(analyze(ts, allow_unreconciled=True)).split())
         self.assertIn("surface assumed", flat)
@@ -783,12 +819,10 @@ class TestClaudeCodeSaysTheSurfaceIsAssumed(unittest.TestCase):
 
     def test_an_explicit_surface_replaces_it(self):
         from cacheeconomics.adapters.claude_code import load_sessions
-        try:
-            ts = load_sessions(target_id="amazon-bedrock/converse")
-        except Exception:
-            self.skipTest("no local transcripts")
-        if not ts.requests:
-            self.skipTest("no local transcripts")
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_sessions(root=self._fixture(tmp),
+                               target_id="amazon-bedrock/converse")
+        self.assertTrue(ts.requests, "fixture produced no requests")
         self.assertEqual({r.target_id for r in ts.requests},
                          {"amazon-bedrock/converse"})
         self.assertFalse(any("surface assumed" in n for n in ts.blocking_notes))
