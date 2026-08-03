@@ -99,6 +99,11 @@ def main() -> int:
                    help="model whose tokenizer to ask (default: claude-haiku-4-5). "
                         "Claude models share a tokenizer, so this rarely matters")
     p.add_argument("--cache", help="cache file to read and write (default: <out>.cache.json)")
+    p.add_argument("--allow-partial", action="store_true",
+                   help="write the output and exit 0 even when some rows could "
+                        "not be counted. Those rows carry no segment_tokens and "
+                        "the analyzer estimates them, so the file is a mix of "
+                        "counted and estimated sizes")
     p.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
                    help="where to send the counting calls. Point it at your own "
                         "gateway to keep the egress inside your perimeter "
@@ -165,7 +170,14 @@ def main() -> int:
                       file=sys.stderr)
                 failed += 1
             rows.append(json.dumps(row))
-            if counted % 25 == 0 and counted:
+            if counted % 25 == 0 and counted and not args.dry_run:
+                # Not during a dry run. The dry-run counter returns 0 for every
+                # prefix, and this checkpoint fires before the guard below, so
+                # a dry run over 25+ rows wrote a cache mapping real prefix keys
+                # to zero counts. A later real run with the same --out resumes
+                # from those zeros and emits `segment_tokens` that look counted
+                # and never touched a tokenizer -- while the dry run printed
+                # "Nothing was sent and nothing was written."
                 with open(cache_path, "w") as cf:
                     json.dump(cache, cf)
                 print(f"  {counted:,} rows, {stats['calls']:,} calls, "
@@ -183,7 +195,15 @@ def main() -> int:
         print("  Nothing was sent and nothing was written.")
         return 0
 
-    with open(args.out, "w") as f:
+    # A partial count is not a count. Rows whose tokenizer call failed are
+    # written without `segment_tokens` and the analyzer estimates them, which is
+    # the right fallback -- but this returned 0 either way, and
+    # `run_diagnostic.py` reads only the exit code. So a run where the endpoint
+    # failed on the largest row proceeded as though counting had succeeded, and
+    # nothing downstream could tell.
+    partial = failed > 0
+    out_path = args.out if not partial or args.allow_partial else args.out + ".partial"
+    with open(out_path, "w") as f:
         f.write("\n".join(rows) + "\n")
     with open(cache_path, "w") as cf:
         json.dump(cache, cf)
@@ -194,8 +214,14 @@ def main() -> int:
         print(f"  failed    {failed:,} (left for the analyzer to estimate)")
     print(f"  API calls {stats['calls']:,} for {len(cache):,} distinct prefixes"
           + (f", {stats['calls'] / counted:.1f} per row" if counted else ""))
-    print(f"  wrote     {args.out}")
+    print(f"  wrote     {out_path}")
     print(f"  cache     {cache_path} (re-runs are free)")
+    if partial and not args.allow_partial:
+        print(f"\n  PARTIAL: {failed:,} row(s) could not be counted, so this is "
+              f"not a counted export.\n  Written to {out_path} rather than "
+              f"{args.out}. Re-run to pick up the cached prefixes, or pass "
+              f"--allow-partial to accept a mixed file.", file=sys.stderr)
+        return 1
     return 0
 
 

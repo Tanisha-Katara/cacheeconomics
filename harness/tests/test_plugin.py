@@ -8,11 +8,13 @@ every request, forever, without anybody looking.
 
 import os
 import sys
+import asyncio
 import unittest
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from cacheeconomics import plugin as plugin_mod
 from cacheeconomics.plugin import (CachePlugin, litellm_handler,        # noqa: E402
                                    markable_positions)
 from cacheeconomics.segment import (apply_markers, marker_count,       # noqa: E402
@@ -1685,3 +1687,90 @@ class TestTheWireTtlReachesTheMonitor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheLiveHookFailsOpen(unittest.IsolatedAsyncioTestCase):
+    """This sits in front of a live request.
+
+    Anything it raises is an error the caller's own API call never made. There
+    is no input from a proxy's traffic worth breaking a completion over, least
+    of all in the observe-only default where the plugin is not supposed to
+    change anything at all.
+
+    Measured before the guard: a model field arriving as a dict raised
+    TypeError out of model normalisation, and a message whose content is an
+    integer raised out of segmentation. Both with mutate=False.
+    """
+
+    def _handler(self, **kw):
+        return litellm_handler(CachePlugin(key=KEY), mutate=False, **kw)
+
+    async def _call(self, data):
+        h = self._handler()
+        out = await h.async_pre_call_hook({"user_id": "u"}, None, data, "completion")
+        return h, out
+
+    async def test_a_malformed_model_does_not_break_the_request(self):
+        data = {"model": {"bad": "claude-opus-5"},
+                "messages": [{"role": "user", "content": "hi"}]}
+        h, out = await self._call(data)
+        self.assertIs(out, data, "the caller's request was not returned")
+        self.assertEqual(h._failures, 1)
+
+    async def test_non_string_message_content_does_not_break_the_request(self):
+        data = {"model": "claude-opus-5",
+                "messages": [{"role": "user", "content": 7}]}
+        h, out = await self._call(data)
+        self.assertIs(out, data)
+        self.assertEqual(h._failures, 1)
+
+    async def test_a_well_formed_request_still_goes_through_the_hook(self):
+        """The guard must not swallow the plugin's actual work."""
+        data = {"model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hello " * 50}]}
+        h, out = await self._call(data)
+        self.assertEqual(h._failures, 0)
+        self.assertIsNotNone(out)
+
+    async def test_cancellation_still_propagates(self):
+        """`except BaseException` would swallow a cancellation and leave the
+        proxy waiting on a task that will never finish."""
+        h = self._handler()
+
+        async def boom(*a, **kw):
+            raise asyncio.CancelledError()
+
+        h._pre_call = boom
+        with self.assertRaises(asyncio.CancelledError):
+            await h.async_pre_call_hook({"user_id": "u"}, None,
+                                        {"model": "claude-opus-5",
+                                         "messages": [{"role": "user",
+                                                       "content": "x"}]},
+                                        "completion")
+
+
+class TestTenantMatchesTheBatchAdapter(unittest.TestCase):
+    """The live hook read three identity fields where the batch adapter reads
+    six, so a team-scoped key resolved to None and two teams shared one
+    `(None, target, model)` scope -- for caches the provider keeps apart."""
+
+    def test_every_field_the_adapter_reads_is_read_here_too(self):
+        from cacheeconomics.adapters import litellm as batch
+        import inspect
+        src = inspect.getsource(batch)
+        block = src[src.index("user_api_key_hash"):]
+        fields = {f for f in ("user_api_key_hash", "user_api_key_alias",
+                              "user_api_key_team_id", "team_id",
+                              "user_api_key_user_id")
+                  if f in block[:400]}
+        self.assertTrue(fields, "adapter field list moved; update this test")
+        missing = fields - set(plugin_mod._TENANT_FIELDS)
+        self.assertEqual(missing, set(),
+                         "the live path ignores tenant fields the batch path uses")
+
+    def test_it_reads_an_object_key_and_a_dict_key_and_metadata(self):
+        class ObjKey:
+            user_api_key_team_id = "team-a"
+        self.assertEqual(plugin_mod._tenant_of(ObjKey(), {}), "team-a")
+        self.assertEqual(plugin_mod._tenant_of({"user_api_key_hash": "h1"}, {}), "h1")
+        self.assertEqual(plugin_mod._tenant_of({}, {"metadata": {"team_id": "t2"}}), "t2")

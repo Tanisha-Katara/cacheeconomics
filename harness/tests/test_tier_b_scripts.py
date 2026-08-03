@@ -293,3 +293,54 @@ class TestTheDefaultPathCounts(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCountingCannotFakeAnExactResult(unittest.TestCase):
+    """The counted path is what releases structural dollar figures.
+
+    A file that looks counted and is not is the exact failure this toolchain
+    exists to refuse, and there were two ways to produce one.
+    """
+
+    def _script(self):
+        return os.path.join(TIER_B, "count_tokens.py")
+
+    def _bodies(self, tmp, n):
+        p = os.path.join(tmp, "b.jsonl")
+        body = {"model": "claude-opus-5",
+                "system": [{"type": "text", "text": "x" * 200}],
+                "messages": [{"role": "user", "content": "hi"}]}
+        with open(p, "w") as f:
+            for i in range(n):
+                b = json.loads(json.dumps(body))
+                b["system"][0]["text"] = f"x{i}" * 200
+                f.write(json.dumps({"sent_at": "2026-07-29T09:00:00Z",
+                                    "body": b, "usage": {"input_tokens": 500}}) + "\n")
+        return p
+
+    def test_a_dry_run_writes_no_cache(self):
+        """The checkpoint fired before the dry-run guard, so a dry run over 25+
+        rows wrote real prefix keys mapped to zero counts. A later real run
+        resumes from those and emits segment_tokens that never saw a tokenizer
+        -- while the dry run printed "Nothing was sent and nothing was written."
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            src = self._bodies(tmp, 60)
+            out = os.path.join(tmp, "counted.jsonl")
+            r = subprocess.run(
+                [sys.executable, self._script(), src, "-o", out, "--dry-run"],
+                capture_output=True, text=True,
+                env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+            self.assertEqual(r.returncode, 0, r.stderr[-400:])
+            self.assertFalse(os.path.exists(out), "a dry run wrote its output")
+            self.assertFalse(os.path.exists(out + ".cache.json"),
+                             "a dry run wrote a cache of zero counts")
+
+    def test_the_flag_exists_and_is_documented(self):
+        """`--allow-partial` is the opt-out for a mixed counted/estimated file.
+        Without it a failed row now exits non-zero, because run_diagnostic.py
+        reads only the exit code."""
+        r = subprocess.run([sys.executable, self._script(), "--help"],
+                           capture_output=True, text=True)
+        self.assertIn("--allow-partial", r.stdout)
+        self.assertIn("estimates them", r.stdout)

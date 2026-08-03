@@ -42,7 +42,12 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
+import logging
+
 from . import registry, tiers
+
+# Named, so an operator can silence or route it. A hook that fails open silently is a hook nobody knows is failing.
+_log = logging.getLogger("cacheeconomics.plugin")
 from .allocate import reuse_chain
 from .monitor import MAX_SCOPES, WINDOW, Monitor
 from .segment import (apply_markers, marker_count, segments_from_request,  # noqa: F401
@@ -640,6 +645,32 @@ def default_agent_from(data: dict) -> str:
             or _field(data, "litellm_agent") or "unknown")
 
 
+# Kept next to the handler rather than imported from the adapter, because the
+# adapter lives behind an optional dependency and this path must not acquire
+# one. The field list is the thing that has to agree, and a test asserts it
+# does.
+_TENANT_FIELDS = ("user_api_key_hash", "user_api_key_alias",
+                  "user_api_key_team_id", "team_id", "user_api_key_user_id",
+                  "user_id")
+
+
+def _tenant_of(user_api_key_dict, data) -> str | None:
+    """Whose traffic this is, from either place LiteLLM records it.
+
+    Reads through `_field`, which handles a mapping or an object. Reaching for
+    `.get` alone collapses every tenant to None when the key arrives as an
+    object -- the mirror of the bug `_field` was written for, reintroduced by
+    widening the field list without reusing the accessor.
+    """
+    for source in (user_api_key_dict, (data or {}).get("metadata")):
+        if source is None:
+            continue
+        got = _field(source, *_TENANT_FIELDS)
+        if got:
+            return got
+    return _field(data or {}, "user")
+
+
 def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
                     agent_from=None, mutate: bool = False,
                     target_id: str | None = None):
@@ -708,12 +739,41 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
             # An operator override for proxies that do not name the provider in
             # either place the resolver looks. None means "resolve per request".
             self.target_id = target_id
+            self._failures = 0
             self.session_from = session_from or default_session_from
             self.agent_from = agent_from or default_agent_from
             self._pending = {}
 
         async def async_pre_call_hook(self, user_api_key_dict, cache, data,
                                       call_type):
+            """Fail open, always.
+
+            This sits in front of a live request. Anything it raises is an
+            error the caller's own API call never made, and there is no input
+            from a proxy's traffic worth breaking a request over -- least of
+            all in the observe-only default, where the plugin is not even
+            supposed to change anything.
+
+            Measured before this guard existed: `{"model": {"bad": "..."}}`
+            raised TypeError out of model normalisation, and a message whose
+            content is an integer raised out of segmentation. Both with
+            mutate=False. A schema this code has never seen is LiteLLM's
+            business, not a reason to take down somebody's completion.
+
+            The narrow exceptions are deliberate: no `except BaseException`, so
+            a cancellation or a KeyboardInterrupt still propagates.
+            """
+            try:
+                return await self._pre_call(user_api_key_dict, cache, data,
+                                            call_type)
+            except (LookupError, TypeError, ValueError, AttributeError,
+                    ArithmeticError, registry.RegistryError) as e:
+                self._failures += 1
+                _log.warning("cacheeconomics: pre-call hook failed open (%s: %s)",
+                             type(e).__name__, e)
+                return data
+
+        async def _pre_call(self, user_api_key_dict, cache, data, call_type):
             if call_type not in ("completion", "text_completion"):
                 return data
             messages = data.get("messages")
@@ -753,8 +813,12 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
             out, decision = self.plugin.on_request(
                 prompt, model=data.get("model", ""),
                 target_id=target_id,
-                tenant=_field(user_api_key_dict, "user_id", "team_id",
-                              "user_api_key_user_id"),
+                # The same precedence the batch adapter uses, read from both
+                # places LiteLLM puts it. This read three fields where the
+                # adapter reads six, so `{"user_api_key_team_id": "team-a"}`
+                # resolved to None and two teams shared one `(None, target,
+                # model)` scope -- for caches the provider keeps apart.
+                tenant=_tenant_of(user_api_key_dict, data),
                 # The conversation, not the call. These are different ids and
                 # only one of them is stable across turns.
                 session=self.session_from(data),
