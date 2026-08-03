@@ -43,9 +43,21 @@ class Figure:
     `dataclasses.replace(f, released=True)` turned a withheld figure into "$123"
     in one line with no `raw()` at the call site to grep for.
 
-    `__str__`, `__repr__` and `__format__` all honour the gate, so the value now
-    has no route out except `raw()`, which is the audit point this module
-    exists to provide.
+    `__str__`, `__repr__` and `__format__` all honour the gate.
+
+    What this does NOT claim, because the first version of this docstring did
+    and it was wrong: that `raw()` is the only way to reach the number. It is
+    not. `f._usd` reads it, `type(f)._usd.__get__(f, type(f))` reads it through
+    the slot descriptor, and `f.__reduce_ex__(4)` carries it in the pickle
+    payload. A single-underscore attribute is a convention, not a wall, and
+    claiming otherwise is worse than the gap because it stops anyone looking.
+
+    The property that actually holds, and the one worth having: no *generic*
+    or *accidental* route publishes the value. Anything that reaches it names
+    it, which is what makes `_usd` and `raw()` both greppable at review time.
+    The routes closed here were the ones nobody writes deliberately -- a
+    serializer default, a dataclass helper, `vars`, an in-place assignment --
+    and those are how a withheld number actually escaped in practice.
     """
 
     __slots__ = ("_usd", "basis", "released", "withheld_because")

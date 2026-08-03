@@ -72,21 +72,23 @@ def cadence(path: str) -> dict:
             "requests": len(rows)}
 
 
-def analyse(path: str) -> dict:
+def analyse(path: str, target_id: str | None = None) -> dict:
     env = dict(os.environ, PYTHONPATH=os.path.join(
         os.path.dirname(HERE), "harness"),
         CACHEECONOMICS_HMAC_KEY=os.environ.get(
             "CACHEECONOMICS_HMAC_KEY", "0" * 64))
-    # `--target-id` is required now. A bodies export states the API shape and
-    # never the billing surface, so the loader resolves it to UNATTRIBUTED and
-    # withholds every figure -- correct, and it broke this script silently until
-    # a behavioural test called `analyse()` instead of parsing it. These
-    # captures come from capture_proxy pointed at Anthropic, which is a fact
-    # this script knows and the export does not carry.
-    r = subprocess.run([sys.executable, "-m", "cacheeconomics.cli", "analyze",
-                        path, "--from", "bodies", "--allow-unreconciled",
-                        "--target-id", "anthropic/direct",
-                        "--format", "json"],
+    # Stated by the operator, not assumed by the script. This hard-coded
+    # anthropic/direct, which converted a bodies capture from a proxy fronting
+    # Bedrock or Vertex back into first-party traffic and -- with
+    # --allow-unreconciled also set -- emitted draft dollars for it. The same
+    # absence-to-Anthropic failure the adapters were fixed for, at the script
+    # layer, falsifying the surface before the analyzer's own guard could see
+    # it. Without one the figures stay withheld, which is the correct answer.
+    cmd = [sys.executable, "-m", "cacheeconomics.cli", "analyze",
+           path, "--from", "bodies", "--allow-unreconciled", "--format", "json"]
+    if target_id:
+        cmd += ["--target-id", target_id]
+    r = subprocess.run(cmd,
                        capture_output=True, text=True, env=env)
     if r.returncode != 0:
         return {"error": r.stderr.strip()[:200]}
@@ -108,9 +110,9 @@ def analyse(path: str) -> dict:
 
     monthly = _usd(d["spend"].get("monthly_input_usd"))
     ttl = next((f for f in d["findings"] if f["code"] == "TTL-1"), None)
-    rec = 0.0
+    rec = None
     if ttl and ttl.get("avoidable_usd_month"):
-        rec = _usd(ttl["avoidable_usd_month"]) or 0.0
+        rec = _usd(ttl["avoidable_usd_month"])
     # The gate state travels with the numbers. `--allow-unreconciled` releases
     # figures the analyzer stamps DRAFT and marks not for external use, and this
     # parsed the released strings into a committed artifact that said nothing
@@ -124,7 +126,11 @@ def analyse(path: str) -> dict:
                      "account"),
             "draft_notes": draft,
             "monthly_input_usd": monthly, "ttl1_usd_month": rec,
-            "recoverable_share": (rec / monthly) if monthly else 0.0,
+            # None, not zero. A withheld figure is unknown, and `rec or 0.0`
+            # rendered it as "0%" -- understating a real TTL opportunity in
+            # exactly the case where the gate refused to publish the number.
+            "recoverable_share": ((rec / monthly)
+                                  if (rec is not None and monthly) else None),
             "ttl1_raised": ttl is not None,
             "window_days": d["window_days"],
             "measured_usd": d["spend"]["input_usd"]}
@@ -163,7 +169,9 @@ def main() -> int:
     print("  " + "-" * 56)
     for r in rows:
         band = f"{r['in_band']}/{r['n']}"
-        rec = f"{r['recoverable_share']*100:.0f}%" if r.get("ttl1_raised") else "none"
+        share = r.get("recoverable_share")
+        rec = ("withheld" if (r.get("ttl1_raised") and share is None)
+               else f"{share*100:.0f}%" if r.get("ttl1_raised") else "none")
         between = (f"{r['median_inter']:.0f}s" if r["median_inter"] else "under 5m")
         print(f"  {r['label']:<12} {between:>13} {band:>9} {r['requests']:>5} "
               f"{rec:>12}")

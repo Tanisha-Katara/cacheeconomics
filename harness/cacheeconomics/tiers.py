@@ -520,13 +520,22 @@ def _ttl_assignments(ttl_names, k, target_id):
     from itertools import product
     try:
         constraint = registry.capability(target_id, "ttl_ordering_constraint")
+        known = True
     except registry.RegistryError:
-        # Unrecorded is not permission on a surface nobody has described. The
-        # uniform assignments are always valid under any ordering rule, so they
-        # are what survives.
-        constraint = "longest_first"
+        constraint, known = None, False
+
     for combo in product(ttl_names, repeat=k):
-        if constraint == "longest_first":
+        if not known:
+            # Abstain rather than guess. Assuming `longest_first` looked
+            # conservative and was not: it suppressed a possibly valid cheaper
+            # plan while still emitting the other mixed order, which is only
+            # legal if the unrecorded rule happens to be the one assumed.
+            # `checks.check_ttl_ordering` abstains when the field is missing;
+            # this now matches it, and only uniform assignments -- valid under
+            # every ordering rule there is -- survive.
+            if len(set(combo)) > 1:
+                continue
+        elif constraint == "longest_first":
             secs = [ttl_seconds(t) for t in combo]
             if any(b > a for a, b in zip(secs, secs[1:])):
                 continue

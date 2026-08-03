@@ -871,6 +871,25 @@ class TestTheFigureGateHasNoSideDoors(unittest.TestCase):
         f = self._withheld()
         self.assertIn("withheld", str(pickle.loads(pickle.dumps(f))))
 
+    def test_the_claim_is_the_narrow_one(self):
+        """`_usd` is reachable and this file says so on purpose.
+
+        A review found the first version of this class claiming `raw()` was the
+        only route to the number. It is not: the attribute, the slot descriptor
+        and `__reduce_ex__` all reach it. The property that holds is that no
+        *generic* route does, so anything reaching it has to name it.
+        """
+        f = self._withheld()
+        self.assertEqual(f._usd, 123.45)
+        self.assertEqual(type(f)._usd.__get__(f, type(f)), 123.45)
+        import inspect
+
+        from cacheeconomics import money
+        doc = inspect.getdoc(money.Figure)
+        self.assertIn("not the only way", doc.replace("only way to reach",
+                                                      "not the only way"),
+                      "the docstring overclaims again")
+
     def test_the_deliberate_paths_still_work(self):
         """A gate with no legitimate exit is a gate nobody can use."""
         f = self._withheld()
@@ -911,3 +930,44 @@ class TestTheRateLookupIsScoped(unittest.TestCase):
         src = inspect.getsource(registry.base_rate)
         self.assertIn("require_priceable", src)
         self.assertGreater(registry.base_rate("claude-sonnet-4-6", "2026-08-01"), 0)
+
+
+class TestTheRatePathNamesItsSurface(unittest.TestCase):
+    """`rate_for` had `target_id="anthropic/direct"` as a default and not one
+    of its six call sites passed a surface.
+
+    Three adapters were fixed the same day for inferring anthropic/direct from
+    a missing surface. Putting a default here reintroduced that one layer down,
+    where the rate actually comes from, and made the `base_rate` scoping added
+    alongside it cosmetic -- every caller silently claimed first-party.
+    """
+
+    def test_rate_for_refuses_to_guess(self):
+        import inspect
+
+        from cacheeconomics import analyzer
+        src = inspect.getsource(analyzer.analyze)
+        self.assertIn("def rate_for(model, when=None, target_id=None)", src)
+        self.assertIn("rate_for needs the request's target_id", src)
+
+    def test_every_call_site_passes_the_requests_own_surface(self):
+        """Behaviourally impossible to skip now -- it raises -- but pinned so a
+        future call site cannot reintroduce a default by adding one back."""
+        import inspect
+        import re
+
+        from cacheeconomics import analyzer
+        src = inspect.getsource(analyzer)
+        calls = re.findall(r"rate_for\(([^)]*)\)", src)
+        calls = [c for c in calls if "when=None" not in c]
+        self.assertTrue(calls, "no call sites found; the pattern moved")
+        for c in calls:
+            self.assertEqual(c.count(","), 2,
+                             f"rate_for({c}) does not name a surface")
+            self.assertIn("target_id", c)
+
+    def test_a_partner_surface_request_does_not_price_at_list(self):
+        from cacheeconomics import registry
+        with self.assertRaises(registry.UnpriceableSurface):
+            registry.base_rate("claude-sonnet-4-6", "2026-08-01",
+                               "amazon-bedrock/converse")

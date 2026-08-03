@@ -418,7 +418,7 @@ def staleness_report(as_of=None):
     return rows
 
 
-def base_rate(model: str, on_date, target_id: str = None) -> float:
+def base_rate(model: str, on_date, target_id: str = "anthropic/direct") -> float:
     """The dated first-party input rate, for a surface those rates apply to.
 
     Scoped on purpose. This took only model and date, so it handed back
@@ -427,10 +427,12 @@ def base_rate(model: str, on_date, target_id: str = None) -> float:
     to call `require_priceable` first; nothing made every other caller do the
     same, and the analyzer's own `rate_for` closure did not.
 
-    `target_id` is optional only so the existing tests and the date-arithmetic
-    helpers keep working on a bare model. Omitting it is treated as
-    anthropic/direct, which is the surface these rates are recorded for, and
-    which `require_priceable` then confirms rather than assumes.
+    The default is anthropic/direct because that is the surface these rates are
+    recorded for, and `require_priceable` then confirms it rather than assuming
+    it -- but a caller that knows its surface must say so. `analyzer.rate_for`
+    refuses to be called without one for exactly that reason: three adapters
+    were fixed today for inferring anthropic/direct from a missing surface, and
+    a silent default here would put the same bug one layer down.
     """
-    require_priceable(target_id or "anthropic/direct")
+    require_priceable(target_id)
     return _base_rate_unscoped(model, on_date)

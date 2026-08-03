@@ -313,7 +313,7 @@ def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
             # published EFF-1 at list price: spend reconciled at $0.25 while the
             # finding claimed $180, five times what the invoice supports.
             spend = cost.price(u, r.model, target_id=r.target_id, on_date=_when(r),
-                               effective_rate=rate_for(r.model, _when(r)))
+                               effective_rate=rate_for(r.model, _when(r), r.target_id))
         except registry.RegistryError:
             unprovable += 1
             continue
@@ -470,7 +470,7 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
             except registry.RegistryError:
                 m = {"write_5m": 1.25, "write_1h": 2.0, "read": 0.10}
             delta = m[f"write_{ttl}"] - m.get("read", 0.10)
-            wasted += tokens * (rate_for(r.model, _when(r)) / 1e6) * delta
+            wasted += tokens * (rate_for(r.model, _when(r), r.target_id) / 1e6) * delta
     # A later blocker can leave nothing recoverable by moving this one alone.
     # Reporting nothing at all would be worse than the overstatement it
     # replaces: the volatility is real, it is costing money, and the client
@@ -693,7 +693,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 unkeyed += 1
                 continue
             by_scope[(r.tenant, r.target_id, r.model, r.session, pk)].append(
-                (r.sent_at, u.cache_write_5m, rate_for(r.model, _when(r))))
+                (r.sent_at, u.cache_write_5m, rate_for(r.model, _when(r), r.target_id)))
 
         # Only a rewrite in the 5m-to-1h band is evidence that the five-minute
         # lifetime is what caused the miss. A rewrite 60 seconds after the last
@@ -878,7 +878,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
         rows.sort(key=lambda x: x[0])
         prev = None
         for sent_at, r, u in rows:
-            per_token = rate_for(model, _when(r)) / 1e6
+            per_token = rate_for(model, _when(r), r.target_id) / 1e6
             if u.cache_write_1h:
                 written_1h += u.cache_write_1h
                 saving += u.cache_write_1h * per_token * (w1h - w5)
@@ -1066,7 +1066,7 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
                 m = registry.multipliers(b.target_id)
             except registry.RegistryError:
                 m = {"write_5m": 1.25, "write_1h": 2.0}
-            per_token = rate_for(b.model, _when(b)) / 1e6
+            per_token = rate_for(b.model, _when(b), b.target_id) / 1e6
             groups += 1
             affected.update((a.request_id, b.request_id))
             waste += ub.cache_write_5m * per_token * (m["write_5m"] - 0.10)
@@ -1313,7 +1313,7 @@ def _f_cache_verdict(reqs, ratios, window, rate_for) -> Finding | None:
         try:
             u = cost.Usage.from_anthropic(r.usage, ttl=_declared_ttl(r))
             s = cost.price(u, r.model, target_id=r.target_id, on_date=_when(r),
-                           effective_rate=rate_for(r.model, _when(r)))
+                           effective_rate=rate_for(r.model, _when(r), r.target_id))
         except (ValueError, registry.RegistryError):
             continue
         priced += 1
@@ -1428,7 +1428,7 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         """
         return bool(on_date) or effective_rate is not None or r.sent_at is not None
 
-    def rate_for(model, when=None, target_id="anthropic/direct"):
+    def rate_for(model, when=None, target_id=None):
         """`when` is the day the request was sent, and every caller must pass it.
 
         Spend already prices per request date. The finding rules did not, so
@@ -1443,6 +1443,14 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             # Anthropic list prices for a Bedrock request and every finding
             # priced from them, while `cost.price` -- which does check --
             # correctly refused the same row.
+            if target_id is None:
+                # No default. Three adapters were fixed today for inferring
+                # anthropic/direct from a missing surface, and a default here
+                # would put that back one layer down, where the rate actually
+                # comes from. Every call site names the request's own surface.
+                raise TypeError(
+                    "rate_for needs the request's target_id; defaulting a "
+                    "surface is how partner traffic gets first-party rates")
             return registry.base_rate(
                 model,
                 when or on_date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
