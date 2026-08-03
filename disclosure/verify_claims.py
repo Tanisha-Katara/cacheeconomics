@@ -48,6 +48,22 @@ CLAIMS = [
          "prompt_tokens_details"],
     ),
     (
+        "4-aider",
+        "Aider-AI/aider",
+        "aider/coders/base_coder.py",
+        [(2092, "prompt_tokens - input_cost_per_token_cache_hit"),
+         (2095, "cache_write_tokens * input_cost_per_token * 1.25"),
+         (2097, "cost += prompt_tokens * input_cost_per_token")],
+        [],
+    ),
+    (
+        "5-crewai",
+        "crewAIInc/crewAI",
+        "lib/crewai/src/crewai/llms/providers/anthropic/completion.py",
+        [(1977, "input_tokens + output_tokens")],
+        [],
+    ),
+    (
         "3-browser-use",
         "browser-use/browser-use",
         "browser_use/llm/anthropic/chat.py",
