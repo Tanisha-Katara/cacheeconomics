@@ -140,3 +140,20 @@ model's minimum is ignored silently, with no error and
   computed by this same path.
 - `Aider-AI/aider` has an Individual CLA, so this is filed as an issue with the
   patch inline rather than as a PR. Happy to sign and open one if preferred.
+
+
+---
+
+## Correction posted 2026-08-03
+
+The headline claim in this draft is **wrong** and was corrected publicly at
+https://github.com/Aider-AI/aider/issues/5516#issuecomment-5168933428.
+
+`compute_costs_from_tokens` is a fallback. `base_coder.py:2036-2043` calls
+`litellm.completion_cost` first, and measurement shows it returns a correct
+non-zero cost for cached Anthropic completions on both the streaming and
+non-streaming paths, so the buggy function does not run. The double-count and
+the deepseek unit error are real but latent.
+
+I read the fallback and never read its caller. The reproduction checked the
+arithmetic and never checked the premise.

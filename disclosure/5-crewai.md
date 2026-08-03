@@ -147,3 +147,16 @@ reason for the version above, but it is your call.
   probably unaffected. I have not verified that against a live Bedrock call and
   am not claiming it.
 - I have not checked the Gemini or OpenAI native providers for the same shape.
+
+
+---
+
+## Correction posted 2026-08-03
+
+The evidence citation in this draft was wrong and was corrected publicly at
+https://github.com/crewAIInc/crewAI/issues/6788#issuecomment-5168933668.
+
+`prompt-tokens-semantics.json` has `cache_creation_input_tokens: 0` on all
+three LiteLLM calls, so it demonstrates reads rather than both cache classes.
+The write case is in `litellm-marker-survival.json`, which the issue did not
+link. The claim holds; the citation did not support it.
