@@ -18,7 +18,10 @@ input total between segments in proportion to their *bytes*. Measured against
 the provider's tokenizer, that split has a median absolute error of 19.2% per
 segment and a worst case of 181%, because dense JSON tool schemas run about 2.74
 bytes per token where English prose runs 5.22. Every structural finding is
-costed from that split. With counts the same comparison lands at 0.2% median.
+costed from that split. Counting removes essentially all of that error, since
+the sizes then come from the same tokenizer that bills them -- but there is no
+committed artifact measuring the residual the way inferred-token-split.json
+measures the 19.2%, so this does not quote a number for it.
 
 What it costs. One call per distinct prefix cut, cached, and the endpoint is
 free. Prompt caching only pays when the prefix is stable, so the prefix is

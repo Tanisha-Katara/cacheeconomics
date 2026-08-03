@@ -99,6 +99,15 @@ Anthropic. The 15% is a property of this workload and yours will differ, which i
 the point of measuring rather than quoting it.
 
 Runs, raw counts and the analysis are in
-[`tier-b/evidence/`](https://github.com/Tanisha-Katara/cacheeconomics/tree/main/tier-b/evidence):
-`browser-use-interactive.json`, `browser-use-scheduled.json`,
-`interval-sweep.json`.
+[`tier-b/evidence/`](https://github.com/Tanisha-Katara/cacheeconomics/tree/main/tier-b/evidence).
+
+Being precise about which number traces to which file, because a review found I
+had not been. The 7-second and 10-minute rows are derivable from
+`browser-use-interactive.json` and `browser-use-scheduled.json`, which carry
+`cache_creation_input_tokens` and a request count. The 2-minute, 7-minute and
+15-minute rows are not: `interval-sweep.json` records each schedule's
+recoverable share and its measured dollars, and no per-schedule creation total,
+so those three cells cannot be recomputed from what is committed. They came from
+the same sweep and I have no reason to doubt them, but you cannot check them
+here, and that is a gap in the evidence rather than a detail about it. The
+recoverable percentages are auditable for every schedule.

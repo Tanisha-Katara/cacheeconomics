@@ -12,8 +12,16 @@ single number labelled "input tokens".
 cacheeconomics pulls that number apart. Point it at logs you already have and it
 tells you what each class actually cost, which part of your prompt is sitting in
 the expensive buckets, and how much of that you can get back. It runs on your
-machine, opens no sockets, and will not print a dollar figure it cannot tie to an
-invoice.
+machine and will not print a dollar figure about your traffic that it cannot tie
+to an invoice.
+
+To be precise about the network, because "runs locally" is the kind of claim
+that quietly stops being true: **the installed package opens no sockets.** It
+imports no network library and a test asserts it, so you can check by grepping
+the wheel. Two things in this repo do reach the network, both deliberately and
+both outside that package: `tier-b/count_tokens.py` sends prompt prefixes to a
+tokenizer, and `tier-b/capture_proxy.py` is a forwarding proxy. Every section
+below that tells you to run one says so.
 
 ## Try it in thirty seconds
 
@@ -25,8 +33,10 @@ cacheeconomics claude-code
 ```
 
 Nothing to instrument, no API key, nothing leaves the machine. This is what it
-said about my own history, from 190 transcripts and 14,362 requests. Section 1 is
-trimmed here; everything else is verbatim:
+said about my own history when this README was written. It reads whatever
+transcripts are on the machine, so your numbers and even the finding count will
+differ, and so will mine tomorrow — this is a sample of the shape, not output
+you can reproduce. Section 1 is trimmed:
 
 ```
   cacheeconomics · what your prompt caching actually costs
@@ -263,8 +273,14 @@ export ANTHROPIC_API_KEY=sk-ant-...
 python3 tier-b/run_diagnostic.py bodies.jsonl --invoice-usd 4820.16
 ```
 
-That counts, then analyses. The same measurement lands at 0.2% instead of 19.2%.
-It is free and fast, because the endpoint costs nothing and the work caches on the
+That counts, then analyses. **It sends prompt content to a tokenizer** — see the
+three notes below before you run it.
+
+Against the same tokenizer the split error effectively disappears, which is the
+whole point of counting rather than estimating. I have not committed an artifact
+measuring the residual the way `inferred-token-split.json` measures the 19.2%,
+so treat "near zero" as the claim and the 19.2% as the measured one.
+It is free, because the endpoint costs nothing and the work caches on the
 prefix. A prefix that is not shared is not being cached in the first place, so
 one count covers every request that shares it. On the demo trace, 286 requests
 needed 345 calls, and a second run costs nothing at all.
@@ -402,7 +418,7 @@ deciding to rewrite somebody's live traffic, and that second decision is yours.
 git clone https://github.com/Tanisha-Katara/cacheeconomics.git
 cd cacheeconomics && pip install .
 
-python3 -m pytest -q          # 1065 tests, no dependencies
+python3 -m pytest -q          # no dependencies
 python3 web/build_bundle.py   # after changing anything under harness/cacheeconomics
 ```
 

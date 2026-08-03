@@ -373,15 +373,15 @@
 <section class="sec" id="s5">
   <div class="lab">05 &middot; The comparison</div>
   <h2>The honest question is not whether caching beats no caching.</h2>
-  <div class="col"><p>Gateways already place cache markers for you. LiteLLM will put one on the system prompt and one on the newest turn, automatically, from a config flag. Any tool claiming to help has to beat that, not beat an agent with caching switched off. Comparing against nothing is how &ldquo;up to 90%&rdquo; gets printed.</p></div>
+  <div class="col"><p>We used to say a gateway would place markers for you automatically, and that beating it was the bar. We checked, and that is not what LiteLLM does. Read at 1.83.9: markers are injected only where an operator configures <code>cache_control_injection_points</code>, and a request through it with none configured sends no <code>cache_control</code> at all. So the gateway arm is the request as shipped unless somebody has configured placement.</p></div>
 
-  <div class="col"><p>So we built the placement work as four arms over the same requests, replayed against a cache model whose lifetime we measured directly. The agent as it ships. The gateway doing it automatically. Our marker placement. And our placement plus one reordering.</p></div>
+  <div class="col"><p>That correction cost us the flattering comparison, which is the point of making it. Comparing against nothing is how &ldquo;up to 90%&rdquo; gets printed, and inventing a competent baseline that does not exist is the same error wearing better clothes. The arms are still four over the same requests, replayed against a cache model whose lifetime we measured directly.</p></div>
 
   <table>
     <thead><tr><th>Arm</th><th>What it answers</th><th>Cost to deploy</th></tr></thead>
     <tbody>
       <tr><td>As shipped</td><td>What the code does today</td><td>&mdash;</td></tr>
-      <tr><td>Gateway automatic</td><td>The baseline worth beating</td><td>One config flag</td></tr>
+      <tr><td>Gateway configured</td><td>Placement an operator set up, where one exists</td><td>Injection points</td></tr>
       <tr><td>Marker placement</td><td>Does deliberate placement beat automatic?</td><td>Config change</td></tr>
       <tr><td>Placement + reorder</td><td>Does moving one block beat it further?</td><td>Needs a behavioural eval</td></tr>
     </tbody>
@@ -408,7 +408,9 @@
 
   <div class="col"><p>So every projection runs twice, once with those guesses set generously and once set against us, and the headline is always the pessimistic end. A single number from a model that leans one way is not a finding.</p></div>
 
-  <div class="col"><p>The second rule is that a dollar figure cannot be printed until it has been reconciled against a real invoice. Not warned about, not footnoted &mdash; withheld. Our own reports render an unreconciled figure as <code>[withheld]</code>, and the code physically refuses to turn one into a number. That rule exists because we kept catching ourselves publishing figures through paths that had skipped the check.</p></div>
+  <div class="col"><p>The second rule is that a dollar figure about <em>your</em> traffic cannot be printed until it has been reconciled against a real invoice. Not warned about, not footnoted &mdash; withheld. Our reports render an unreconciled figure as <code>[withheld]</code>, and the code refuses to turn one into a number. That rule exists because we kept catching ourselves publishing figures through paths that had skipped the check, and we are still finding them.</p></div>
+
+  <div class="col"><p>The calculator above is not covered by that rule and should not pretend to be. It is arithmetic on numbers you typed, at list prices, with no trace and no invoice behind it &mdash; a way to see the shape of the thing, not a claim about your bill.</p></div>
 
   <p class="note" style="margin-top:22px">Both rules cost us headline numbers. That is what they are for.</p>
 </section>
