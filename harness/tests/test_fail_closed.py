@@ -1021,3 +1021,65 @@ class TestTheRatePathNamesItsSurface(unittest.TestCase):
         with self.assertRaises(registry.UnpriceableSurface):
             registry.base_rate("claude-sonnet-4-6", "2026-08-01",
                                "amazon-bedrock/converse")
+
+
+class TestThePricingPrimitivesRefuseToInvent(unittest.TestCase):
+    """Four defects in the layer every dollar figure derives from."""
+
+    def test_an_explicit_zero_scalar_contradicting_a_split_is_refused(self):
+        """`created = usage.get(...) or 0` could not express "explicitly zero",
+        and the disagreement check was conditional on that value being truthy.
+        So "0 written" alongside a split claiming 1,000 priced the 1,000 --
+        while the mirror case raised. The guard failed loudly in one direction
+        and invented write spend in the other."""
+        from cacheeconomics import cost
+        with self.assertRaises(ValueError):
+            cost.Usage.from_anthropic({
+                "input_tokens": 10, "cache_creation_input_tokens": 0,
+                "cache_creation": {"ephemeral_5m_input_tokens": 1000}})
+
+    def test_an_absent_scalar_with_a_split_is_still_priced(self):
+        """Absent is not zero. The split is authoritative when nothing
+        contradicts it, and this must not become a blanket refusal."""
+        from cacheeconomics import cost
+        u = cost.Usage.from_anthropic({
+            "input_tokens": 10,
+            "cache_creation": {"ephemeral_5m_input_tokens": 1000}})
+        self.assertEqual(u.cache_write_5m, 1000)
+
+    def test_a_falsy_date_is_refused_rather_than_replaced_with_today(self):
+        """`on_date or now()` let "" and 0 past the strict parser, took today's
+        rate, and then stamped rate_source with the substituted date -- so the
+        report claimed an effective date the caller never gave."""
+        from cacheeconomics import cost, registry
+        with self.assertRaises(registry.RegistryError):
+            cost.price(cost.Usage(uncached_input=1_000_000), "claude-sonnet-5",
+                       on_date="")
+
+    def test_no_date_at_all_still_means_today(self):
+        from cacheeconomics import cost
+        got = cost.price(cost.Usage(uncached_input=1_000_000), "claude-sonnet-5")
+        self.assertIn("effective", got.breakdown["rate_source"])
+
+    def test_upcoming_rate_change_parses_its_dates(self):
+        """The one date selector that compared raw strings. "2026-8-1" sorts
+        above "2026-09-01" at the month digit, hiding a change a month away."""
+        from cacheeconomics import registry
+        for bad in ("2026-8-1", "not-a-date", 20260801):
+            with self.subTest(value=bad):
+                with self.assertRaises(registry.RegistryError):
+                    registry.upcoming_rate_change("claude-sonnet-5", bad)
+
+    def test_a_well_formed_date_still_finds_the_change(self):
+        from cacheeconomics import registry
+        got = registry.upcoming_rate_change("claude-sonnet-5", "2026-08-01")
+        self.assertEqual(got["effective"], "2026-09-01")
+
+    def test_counted_zeros_survive(self):
+        """`max(1, ...)` put back the invented token that `_scale_to_measured`
+        explicitly refuses to invent. Counting is the exact path; clamping its
+        answer upward skews every other segment's share of the billed input."""
+        from cacheeconomics.tokenizer import apply_counts
+        segs = [{"bytes": 0}, {"bytes": 0}, {"bytes": 0}]
+        self.assertEqual([s["bytes"] for s in apply_counts(segs, [0, 0, 1000])],
+                         [0, 0, 1000])

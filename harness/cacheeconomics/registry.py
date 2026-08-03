@@ -371,10 +371,18 @@ def require_priceable(target_id):
 
 def upcoming_rate_change(model, on_date):
     """The next scheduled rate change after `on_date`, or None."""
-    if isinstance(on_date, (date, datetime)):
-        on_date = on_date.strftime("%Y-%m-%d")
-    for start, rate in sorted(pricing()["models"][model]["rates"]):
-        if start > on_date:
+    # Through `_as_date`, like every other date selector here. This was the one
+    # that compared raw strings, so "2026-8-1" sorted above "2026-09-01" at the
+    # month digit and hid a rate change a month away, "not-a-date" silently
+    # returned None, and an int raised a bare TypeError that callers catching
+    # RegistryError do not catch.
+    try:
+        rows = pricing()["models"][model]["rates"]
+    except KeyError as e:
+        raise RegistryError(f"no recorded rates for {model}") from e
+    when = _as_date(on_date)
+    for start, rate in sorted(rows):
+        if _as_date(start) > when:
             return {"effective": start, "rate": rate}
     return None
 

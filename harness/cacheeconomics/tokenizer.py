@@ -149,5 +149,11 @@ def apply_counts(segments: list, counts: list) -> list:
     actually sent still cannot inflate the trace.
     """
     for s, n in zip(segments, counts):
-        s["bytes"] = max(1, int(n))
+        # Exact zeros preserved. `max(1, ...)` put back the invented token that
+        # `_scale_to_measured` refuses to invent -- its own comment says "a
+        # request with more segments than billed tokens is a real shape and
+        # inventing a token per segment is how the total ran away in the first
+        # place". Counting is the exact path; clamping its answer upward skews
+        # every other segment's share of the billed input.
+        s["bytes"] = max(0, int(n))
     return segments

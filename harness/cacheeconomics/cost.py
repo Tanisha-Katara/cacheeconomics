@@ -119,6 +119,15 @@ class Usage:
         # figure and the exclusion is reported. A malformed row must not be
         # priced, and it must not vanish quietly either.
         _check_counts(usage)
+        # Presence and value are different questions. `or 0` collapsed
+        # missing, None and an explicit 0 into one state, and the disagreement
+        # check below was conditional on the value being truthy -- so a
+        # provider response saying "0 written" alongside a split claiming 1,000
+        # priced the 1,000 and said nothing. The mirror case, a nonzero scalar
+        # against a zero split, raised. The guard failed loudly in one
+        # direction and invented write spend in the other, which is the
+        # direction that costs money.
+        _created_stated = usage.get("cache_creation_input_tokens") is not None
         created = usage.get("cache_creation_input_tokens", 0) or 0
         split = usage.get("cache_creation") or {}
         m5, h1 = split.get("ephemeral_5m_input_tokens"), split.get("ephemeral_1h_input_tokens")
@@ -149,7 +158,7 @@ class Usage:
 
         if m5 is not None or h1 is not None:
             m5, h1 = m5 or 0, h1 or 0
-            if created and m5 + h1 != created:
+            if _created_stated and m5 + h1 != created:
                 raise ValueError(
                     f"cache_creation breakdown sums to {m5 + h1:,} but "
                     f"cache_creation_input_tokens is {created:,}. These come from the "
@@ -269,7 +278,12 @@ def price(usage: Usage, model: str, target_id: str = "anthropic/direct",
     targets rarely pay list, and reconciling computed spend against an invoice
     at list price guarantees a mismatch that looks like a tool defect.
     """
-    on_date = on_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Only when nothing was supplied. `or` let "" and 0 through to today's rate
+    # without ever reaching the registry's strict parser, and then stamped
+    # `rate_source` with the substituted date -- so the report claimed an
+    # effective date the caller never gave.
+    if on_date is None:
+        on_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if effective_rate is not None:
         # Validated here rather than at each caller. This value is multiplied by
         # every token class and is the one number a *client* supplies, from an
