@@ -14,7 +14,7 @@ import html
 import textwrap
 from datetime import datetime, timezone
 
-from .analyzer import Analysis
+from .analyzer import Analysis, spend_caveats
 from .money import Figure
 from .trace import Tier
 
@@ -479,6 +479,12 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
 
     out = ["", "  cacheeconomics · what your prompt caching actually costs",
            "  " + "─" * (_WIDTH - 2)]
+    # Before anything else on a released-without-an-invoice run. This used to be
+    # the first of five notes at the bottom, which is where a warning about
+    # forwarding a document does the least good.
+    draft = next((n for n in a.notes if n.startswith("DRAFT")), None)
+    if draft:
+        out += [""] + _wrap(draft, _WIDTH, "  ")
     for para in _PRIMER:
         out += [""] + _wrap(para, _WIDTH, "  ")
 
@@ -619,6 +625,13 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
                       "reconciliation gate. Step 1 below releases it.")
     for line in legend:
         out += _wrap(line, _WIDTH, "  ")
+    # Caveats on the numbers directly above them. These used to sit in the
+    # notes block at the very bottom, so a figure and the sentence saying what
+    # it excludes were four sections apart, and folding that block away would
+    # have separated them entirely.
+    for note in spend_caveats(a.notes):
+        out.append("")
+        out += _wrap(f"caveat: {note}", _WIDTH, "  ")
     if not detail and a.findings:
         out.append("")
         out += _wrap("Every row above is the short version. Re-run with "
@@ -632,14 +645,27 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
             out += _cols([(f"{i}.", step)], [4, _WIDTH - 6])
             out.append("")
 
-    # Notes carry the coverage facts -- unpriced writes, partial structure,
-    # draft status. HTML printed them and text did not, so the same analysis
-    # disclosed different things depending on which renderer someone forwarded.
-    if a.notes:
+    # Notes carry the coverage facts: unpriced writes, partial structure, which
+    # records were excluded and why. They belong in the report and they do not
+    # belong in the reader's way, so they sit with the reasoning under --detail.
+    #
+    # The draft stamp is the exception and does not travel with them. It says
+    # "not for external use" about the document it is printed on, which is worth
+    # nothing at the bottom of a long report and is the first thing somebody
+    # about to forward one needs to see. It goes to the top, and a test asserts
+    # it is there in the default view -- nothing checked that before, which is
+    # how it nearly left with this section.
+    if a.notes and detail:
         out += _rule(5, "the fine print — what this is based on, and what it "
                         "could not see")
         for n in a.notes:
             out += _cols([("·", n)], [4, _WIDTH - 6])
+    elif a.notes:
+        out.append("")
+        rest = len(a.notes) - len(spend_caveats(a.notes))
+        if rest:
+            out += _wrap(f"{rest} note(s) on provenance and coverage are printed "
+                         f"with --detail.", _WIDTH, "  ")
     out.append("")
     return "\n".join(out)
 

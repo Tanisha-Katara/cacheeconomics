@@ -1820,3 +1820,69 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
                                   for s in segs])
                 for i in range(40)]
         return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"))
+
+
+class TestTheDraftStampSurvives(unittest.TestCase):
+    """`--allow-unreconciled` releases dollar figures that no invoice has
+    checked, and stamps the report DRAFT so nobody forwards it as fact.
+
+    That stamp used to be the first of five notes at the bottom of the report.
+    Every test on it asserted against `Analysis.notes` -- the object, not the
+    rendered page -- so nothing would have failed if a renderer stopped
+    printing it. Removing the notes section from the default text view nearly
+    did exactly that.
+    """
+
+    def _analysis(self, **kw):
+        segs = [Segment(id="vol", role="system", tokens=400, index=0),
+                Segment(id="tools", role="tools", tokens=30000, index=1,
+                        cache_marked=True, ttl="5m")]
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
+                        model="claude-opus-5", agent="a", session="s",
+                        ttl_requested="5m",
+                        usage={"input_tokens": 200, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 30400},
+                        segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
+                                  for s in segs])
+                for i in range(40)]
+        return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED,
+                                source="x"), **kw)
+
+    def test_both_renderers_stamp_a_released_report(self):
+        from cacheeconomics.report import render_html, render_text
+        a = self._analysis(allow_unreconciled=True)
+        self.assertTrue(any(n.startswith("DRAFT") for n in a.notes),
+                        "fixture is not a draft, so the check is vacuous")
+        for name, page in (("text", render_text(a)),
+                           ("text --detail", render_text(a, detail=True)),
+                           ("html", render_html(a))):
+            with self.subTest(renderer=name):
+                # Normalised: every renderer wraps, and the stamp is long
+                # enough to cross a wrap point in all three.
+                self.assertIn("not for external use", " ".join(page.split()).lower())
+
+    def test_it_is_near_the_top_where_somebody_forwarding_will_see_it(self):
+        """At the bottom of a five-section report it warns the one reader who
+        already finished reading."""
+        from cacheeconomics.report import render_text
+        page = render_text(self._analysis(allow_unreconciled=True))
+        self.assertLess(page.index("DRAFT"), len(page) // 4,
+                        "the stamp is buried below the first quarter")
+
+    def test_an_unreleased_report_is_not_stamped(self):
+        """Matched on the stamp, not on the word. `DRAFT` also appears in the
+        next-step that *offers* --allow-unreconciled, so asserting on the bare
+        word would have failed on a report that was never stamped at all."""
+        from cacheeconomics.report import render_text
+        page = " ".join(render_text(self._analysis()).split())
+        self.assertNotIn("DRAFT — figures released", page)
+        self.assertIn("--allow-unreconciled", page, "the offer should still be made")
+
+    def test_the_notes_are_folded_away_but_not_gone(self):
+        from cacheeconomics.report import render_text
+        a = self._analysis()
+        brief, full = render_text(a), render_text(a, detail=True)
+        for note in a.notes:
+            with self.subTest(note=note[:40]):
+                self.assertIn(" ".join(note.split())[:50], " ".join(full.split()))
+        self.assertIn("--detail", brief, "notes vanished with no way to reach them")

@@ -1113,10 +1113,48 @@ class TestDraftOverrideStillRespectsUnprovableWrites(unittest.TestCase):
 
     def test_the_text_renderer_surfaces_coverage_notes(self):
         """HTML printed notes and text did not, so the same analysis disclosed
-        different things depending on which file someone forwarded."""
-        out = render_text(analyze(self._ts(None), allow_unreconciled=True))
+        different things depending on which file someone forwarded.
+
+        Still true after the notes block was folded behind --detail: a note
+        that caveats a *published figure* is not provenance and does not fold.
+        It now prints beside the figures instead of four sections below them.
+        Normalised on whitespace because the report wraps.
+        """
+        out = " ".join(render_text(
+            analyze(self._ts(None), allow_unreconciled=True)).split())
         self.assertIn("without a provable 5m/1h lifetime", out)
         self.assertIn("excluded from every dollar figure", out)
+
+    def test_a_spend_caveat_shows_without_detail_and_provenance_does_not(self):
+        """The line the fold is drawn on. Provenance can wait for --detail; a
+        sentence saying what a published number leaves out cannot."""
+        from cacheeconomics.analyzer import spend_caveats
+        a = analyze(self._ts(None), allow_unreconciled=True)
+        brief = " ".join(render_text(a).split())
+        full = " ".join(render_text(a, detail=True).split())
+        caveats = spend_caveats(a.notes)
+        self.assertTrue(caveats, "fixture has no spend caveat, so this is vacuous")
+        for n in caveats:
+            self.assertIn(" ".join(n.split())[:60], brief)
+        others = [n for n in a.notes if n not in caveats]
+        self.assertTrue(others, "fixture has no provenance note")
+        for n in others:
+            self.assertNotIn(" ".join(n.split())[:60], brief)
+            self.assertIn(" ".join(n.split())[:60], full)
+
+    def test_the_marker_is_one_string_the_analyzer_owns(self):
+        """`spend_caveats` selects on a phrase. If a note is reworded without
+        the constant, it silently demotes itself from money-caveat to
+        provenance and stops printing beside the figure it qualifies."""
+        import inspect
+
+        from cacheeconomics import analyzer
+        src = inspect.getsource(analyzer)
+        literal = src.count('"' + analyzer.QUALIFIES_SPEND + '"')
+        self.assertLessEqual(
+            literal, 1,
+            "a note spells the marker out instead of interpolating "
+            "QUALIFIES_SPEND, so rewording it will not fail anything")
 
 
 class TestPrefixEfficiencyPricesTheRealLifetime(unittest.TestCase):

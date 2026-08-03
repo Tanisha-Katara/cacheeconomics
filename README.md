@@ -25,8 +25,8 @@ cacheeconomics claude-code
 ```
 
 Nothing to instrument, no API key, nothing leaves the machine. This is what it
-said about my own history, from 190 transcripts and 14,362 requests. Sections 1
-and 5 are trimmed here; everything else is verbatim:
+said about my own history, from 190 transcripts and 14,362 requests. Section 1 is
+trimmed here; everything else is verbatim:
 
 ```
   cacheeconomics · what your prompt caching actually costs
@@ -120,13 +120,7 @@ and 5 are trimmed here; everything else is verbatim:
       the highest-severity finding here, and the 'do this' line in its row is
       the change to make. Re-run with --detail for the reasoning behind it.
 
-── 5 · the fine print — what this is based on, and what it could not see ─────
-
-  ·   14,362 assistant turns from 43 sessions across 190 transcripts. Each is
-      one billed request.
-  ·   Transcripts record the conversation, not the wire request. The system
-      prompt and tool definitions are absent, so prefix structure cannot be
-      recovered and no counterfactual is derivable.
+  5 note(s) on provenance and coverage are printed with --detail.
 ```
 
 It always closes on numbered next steps chosen from what that particular run
@@ -408,7 +402,7 @@ deciding to rewrite somebody's live traffic, and that second decision is yours.
 git clone https://github.com/Tanisha-Katara/cacheeconomics.git
 cd cacheeconomics && pip install .
 
-python3 -m pytest -q          # 1059 tests, no dependencies
+python3 -m pytest -q          # 1065 tests, no dependencies
 python3 web/build_bundle.py   # after changing anything under harness/cacheeconomics
 ```
 

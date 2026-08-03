@@ -33,6 +33,19 @@ ALIGNMENT_FLOOR = 0.90
 # two rules cannot both recommend a change on one trace, which they did.
 BAND_IS_RARE = 0.10
 
+# Not every note is the same kind of thing. Most describe provenance -- which
+# records were read, which ids were normalised -- and can sit out of the way.
+# Some caveat a number that was published, and a caveat the reader never sees
+# is the same as no caveat. This phrase is how the analyzer marks the second
+# kind, and both renderers ask for the subset rather than pattern-matching
+# prose the analyzer happens to emit today.
+QUALIFIES_SPEND = "excluded from every dollar figure"
+
+
+def spend_caveats(notes) -> list:
+    """The notes that qualify a published figure, in the order they were made."""
+    return [n for n in notes if QUALIFIES_SPEND in n]
+
 # Measured on 2026-07-28: a five-minute entry is gone somewhere between 300 and
 # 420 seconds, and a one-hour entry survived 56 minutes.
 _TTL_SECONDS = {"5m": 300, "1h": 3600}
@@ -1403,7 +1416,7 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     if unprovable:
         notes.append(
             f"{len(unprovable)} of {len(reqs)} requests recorded cache writes without a "
-            f"provable 5m/1h lifetime and are excluded from every dollar figure. Anthropic "
+            f"provable 5m/1h lifetime and are {QUALIFIES_SPEND}. Anthropic "
             f"reports cache_creation_input_tokens as a single number, and a 1h write costs "
             f"2x where a 5m write costs 1.25x, so the lifetime cannot be inferred from usage "
             f"fields. Capture ttl_requested at source to price these.")
@@ -1427,7 +1440,7 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
                        .get(t, {}).get("official_pricing"))] if u})
         notes.append(
             f"The recorded rates are Anthropic first-party list prices and do not cover "
-            f"{detail}. Those requests are excluded from every dollar figure and the totals "
+            f"{detail}. Those requests are {QUALIFIES_SPEND} and the totals "
             f"below cover the remainder only. These surfaces are operated and invoiced by the "
             f"cloud provider, so pricing them at Anthropic rates would produce a total the "
             f"customer's bill contradicts. Pass their effective rate from that bill to include "
