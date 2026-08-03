@@ -1228,7 +1228,14 @@ class TestTheBakeOffFailsClosedOnAnUnknownSurface(unittest.TestCase):
         """A dropped row leaves the denominator quietly wrong."""
         from cacheeconomics.simulate import simulate
         s = simulate(self._reqs(), "litellm-auto")
-        self.assertEqual(sum(1 for u in s.usages if u.uncached_input == 9100), 1)
+        # Present, not dropped. This asserted exactly one such row back when
+        # litellm-auto invented markers for the others; with the faithful
+        # baseline placing none, every row prices uncached and the count is no
+        # longer the claim. The claim is that the unregistered row survives.
+        self.assertGreaterEqual(
+            sum(1 for u in s.usages if u.uncached_input == 9100), 1)
+        self.assertEqual(len(s.usages), len(self._reqs()),
+                         "a row was dropped rather than priced uncached")
 
     def test_the_verdict_refuses_rather_than_reporting_a_subset(self):
         from cacheeconomics.simulate import bake_off

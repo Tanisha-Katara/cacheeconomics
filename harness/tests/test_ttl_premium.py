@@ -851,3 +851,75 @@ class TestAPlacementIsShippedNotPublished(unittest.TestCase):
                            cadence_seconds=None, gaps=[60.0] * 20,
                            order=[0, 1, 2])
         self.assertIsNone(p.order)
+
+
+class TestTheLiteLLMBaselineIsWhatLiteLLMDoes(unittest.TestCase):
+    """The bake-off's competent baseline modelled behaviour that does not exist.
+
+    `litellm_auto` placed a marker on the system prompt and one on the trailing
+    turn, from a role heuristic, always 5m. Its own docstring said that came
+    from the published description rather than from reading the source.
+
+    litellm 1.83.9, checked two ways on 2026-08-03: the only injection path is
+    `AnthropicCacheControlHook`, which requires `cache_control_injection_points`
+    and returns unchanged without them; and a real completion routed through
+    `tier-b/capture_proxy.py` with none configured sent zero `cache_control`
+    keys anywhere in the body.
+
+    Getting a baseline wrong is worse than getting a finding wrong, because
+    every comparison is measured against it and nothing downstream re-checks it.
+    """
+
+    def _req(self, segs):
+        return Request(request_id="r", sent_at=T0, model="claude-opus-5",
+                       target_id="anthropic/direct", segments=segs, usage={})
+
+    def test_it_invents_no_markers_on_an_unmarked_request(self):
+        from cacheeconomics.allocate import litellm_auto
+        segs = [Segment(id="sys", role="system", tokens=6000, index=0),
+                Segment(id="u", role="user", tokens=200, index=1)]
+        p = litellm_auto(self._req(segs))
+        self.assertEqual(p.marker_indices, [],
+                         "still placing markers LiteLLM would not place")
+
+    def test_it_preserves_a_marker_the_caller_shipped(self):
+        """LiteLLM forwards the caller's markers. Replacing a 1h marker with
+        two 5m ones made the baseline look worse than the real thing, which
+        flatters whatever it is compared against."""
+        from cacheeconomics.allocate import litellm_auto
+        segs = [Segment(id="sys", role="system", tokens=6000, index=0),
+                Segment(id="t", role="tools", tokens=3000, index=1,
+                        cache_marked=True, ttl="1h")]
+        p = litellm_auto(self._req(segs))
+        self.assertEqual(p.marker_indices, [1])
+        self.assertEqual(p.ttls, {1: "1h"})
+
+    def test_configured_injection_points_do_place_markers(self):
+        from cacheeconomics.allocate import litellm_auto
+        segs = [Segment(id="sys", role="system", tokens=6000, index=0),
+                Segment(id="u", role="user", tokens=200, index=1)]
+        p = litellm_auto(self._req(segs),
+                         injection_points=[{"index": 0,
+                                            "control": {"type": "ephemeral"}}])
+        self.assertEqual(p.marker_indices, [0])
+        self.assertEqual(p.ttls, {0: "5m"})
+
+    def test_an_injection_point_honours_the_configured_lifetime(self):
+        from cacheeconomics.allocate import litellm_auto
+        segs = [Segment(id="sys", role="system", tokens=6000, index=0)]
+        p = litellm_auto(self._req(segs),
+                         injection_points=[{"index": 0,
+                                            "control": {"type": "ephemeral",
+                                                        "ttl": "1h"}}])
+        self.assertEqual(p.ttls, {0: "1h"})
+
+    def test_it_does_not_double_inject_where_the_caller_already_marked(self):
+        """`_safe_insert_cache_control_in_message` writes into the existing
+        message rather than adding a second entry."""
+        from cacheeconomics.allocate import litellm_auto
+        segs = [Segment(id="sys", role="system", tokens=6000, index=0,
+                        cache_marked=True, ttl="1h")]
+        p = litellm_auto(self._req(segs),
+                         injection_points=[{"index": 0,
+                                            "control": {"type": "ephemeral"}}])
+        self.assertEqual(p.ttls, {0: "1h"}, "overwrote the caller's lifetime")

@@ -24,3 +24,38 @@ python3 tier-a/verify_sources.py --refresh
 Pinned commits — `OpenHands/software-agent-sdk` @ `1f9f0b1aa0356e082d971e8a5cf82256d67fe576`
 
 Fetched and pinned 2026-07-28.
+
+## litellm_auto baseline — provenance
+
+**Checked:** 2026-08-03 against `litellm 1.83.9` (installed wheel, not the repo).
+
+The bake-off's `litellm-auto` arm previously modelled
+`enable_anthropic_prompt_caching` as a system-prompt marker plus an advancing
+trailing-turn marker, always 5m, from LiteLLM's published description. Two
+checks contradicted that:
+
+1. **Source.** `litellm/integrations/anthropic_cache_control_hook.py` is the
+   only injection path. `AnthropicCacheControlHook.get_chat_completion_prompt`
+   pops `cache_control_injection_points` from `non_default_params` and returns
+   `model, messages, non_default_params` unchanged when the list is empty.
+   There is no role heuristic and no automatic placement anywhere in it.
+   Every "automatic" in the Anthropic transformation
+   (`llms/anthropic/chat/transformation.py:374`,
+   `llms/anthropic/common_utils.py:399` and `:433`) reads "prompt caching now
+   works automatically *when cache_control is used in messages*" — automatic
+   handling of markers the caller supplied, not automatic placement.
+
+2. **Wire.** A `litellm.completion` call against `anthropic/claude-haiku-4-5`
+   with a 25k system prompt and one tool, routed through
+   `tier-b/capture_proxy.py` with no injection points configured, sent **zero**
+   `cache_control` keys anywhere in the request body.
+
+So the arm now models what LiteLLM does: forward the caller's markers, add none
+unless injection points are configured, honour the configured lifetime, and
+leave a segment the caller already marked alone.
+
+The old model was wrong in both directions. On an unmarked request it placed
+two markers where LiteLLM places none, making the baseline look better than
+reality. On a request already carrying a 1h marker it replaced that with two 5m
+ones, making it look worse — and a baseline that looks worse flatters whatever
+is compared against it.

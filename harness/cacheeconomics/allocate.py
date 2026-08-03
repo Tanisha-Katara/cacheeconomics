@@ -115,31 +115,88 @@ def as_shipped(req: Request, **_) -> Plan:
     return Plan("as-shipped", sorted(ttls), ttls)
 
 
-def litellm_auto(req: Request, max_markers: int | None = None, **_) -> Plan:
-    """The competent baseline: LiteLLM's `enable_anthropic_prompt_caching`.
+def litellm_auto(req: Request, max_markers: int | None = None,
+                 injection_points: list | None = None, **_) -> Plan:
+    """What LiteLLM actually does to a request's cache markers.
 
-    Documented behaviour is a checkpoint on the system prompt plus one on the
-    trailing turn that advances with the conversation, respecting the four-block
-    limit. Always the 5-minute default: LiteLLM exposes a 1h setting but the
-    auto-injection path does not choose it per request.
+    Which is nothing, unless an operator configured injection points.
 
-    Modelled from the published description, not from reading LiteLLM's source.
-    A bake-off result against this arm inherits that caveat.
+    This used to model `enable_anthropic_prompt_caching`: a checkpoint on the
+    system prompt plus one on the advancing trailing turn, always 5m. Its own
+    docstring said that came from the published description rather than from
+    reading the source, and the bake-off arm inherited the caveat. A review
+    challenged it, so both were checked.
+
+    litellm 1.83.9, read and captured 2026-08-03:
+
+    - `integrations/anthropic_cache_control_hook.py` is the only injection
+      path. `AnthropicCacheControlHook.get_chat_completion_prompt` pops
+      `cache_control_injection_points` and returns `model, messages,
+      non_default_params` unchanged when the list is empty. No role heuristic,
+      no automatic placement.
+    - Every "automatic" in the Anthropic transformation
+      (`llms/anthropic/chat/transformation.py:374`,
+      `llms/anthropic/common_utils.py:399,433`) reads "prompt caching now works
+      automatically *when cache_control is used in messages*". That is
+      automatic header handling for markers the caller supplied, not automatic
+      marker placement.
+    - Confirmed on the wire rather than by reading alone: a completion routed
+      through `tier-b/capture_proxy.py` with no injection points configured,
+      carrying a 25k system prompt and a tool, sent zero `cache_control` keys
+      anywhere in the body.
+
+    So the old model invented a baseline that does not exist, and it was wrong
+    in both directions depending on the input. On an unmarked request it placed
+    two markers where LiteLLM places none, making the baseline look better than
+    reality. On a request already carrying a 1h marker it replaced that with two
+    5m ones, making it look worse -- and a baseline that looks worse than the
+    real thing flatters whatever we compare against it, which is the direction
+    that should never be guessed at.
+
+    With injection points supplied this models them: each point contributes a
+    marker, the caller's own `control` decides the lifetime, and a segment the
+    caller already marked is left alone, because `_safe_insert_cache_control_in_message`
+    writes into the message rather than adding a second entry.
     """
     if max_markers is None:
         max_markers = registry.capability(req.target_id, "max_breakpoints") or 4
-    segs = sorted(req.segments, key=lambda s: s.index)
-    system_like = [s for s in segs if s.role in ("system", "tools")]
-    idx = []
-    if system_like:
-        idx.append(max(s.index for s in system_like))
-    trailing = [s for s in segs if s.role in ("user", "assistant", "tool")]
-    if trailing:
-        idx.append(max(s.index for s in trailing))
-    idx = sorted(set(idx))[:max_markers]
-    return Plan("litellm-auto", idx, {i: "5m" for i in idx},
-                ["TTL is always 5m on this path.",
-                 "Modelled from documented behaviour, not from LiteLLM source."])
+
+    shipped = req.ttl_by_marker_index()
+    if not injection_points:
+        # The default configuration. LiteLLM forwards the caller's markers and
+        # adds none of its own, so this arm is the request as it was sent.
+        return Plan("litellm-auto", sorted(shipped), dict(shipped),
+                    ["LiteLLM adds no cache markers unless "
+                     "`cache_control_injection_points` is configured, so this "
+                     "arm is the request as shipped. Verified against litellm "
+                     "1.83.9 by reading the injection hook and by capturing a "
+                     "request on the wire."])
+
+    by_index = {s.index: s for s in req.segments}
+    ttls = dict(shipped)
+    added = []
+    for point in injection_points:
+        i = point.get("index") if isinstance(point, dict) else None
+        if not isinstance(i, int):
+            continue
+        if i < 0:
+            i += len(req.segments)
+        if i not in by_index or i in shipped:
+            # Already marked by the caller: LiteLLM writes into the existing
+            # message rather than adding a second marker.
+            continue
+        control = (point.get("control") or {}) if isinstance(point, dict) else {}
+        ttls[i] = control.get("ttl") or "5m"
+        added.append(i)
+        if len(ttls) >= max_markers:
+            break
+
+    notes = [f"{len(added)} marker(s) injected at configured points; "
+             f"{len(shipped)} already carried one and were left alone"]
+    if len(ttls) >= max_markers:
+        notes.append(f"stopped at the {max_markers}-marker limit for "
+                     f"{req.target_id}, counting the caller's own markers")
+    return Plan("litellm-auto", sorted(ttls), ttls, notes)
 
 
 def allocator_lite(req: Request, volatility: dict | None = None,

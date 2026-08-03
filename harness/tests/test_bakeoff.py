@@ -112,8 +112,16 @@ class TestMultiBreakpointCache(unittest.TestCase):
     """
 
     def test_stable_breakpoint_hits_while_trailing_one_advances(self):
-        reqs = [req(i, [seg(0, "system", 6000, "sys"),
-                        seg(1, "user", 200, f"turn{i}")]) for i in range(6)]
+        """Markers on the request, not invented by the policy.
+
+        This drove `litellm_auto` for its two markers, back when that policy
+        placed them from a role heuristic. LiteLLM does no such thing -- it
+        forwards the caller's markers and adds none -- so the request now
+        carries them, which is what the simulator is being tested on anyway.
+        """
+        reqs = [req(i, [seg(0, "system", 6000, "sys", marked=True, ttl="5m"),
+                        seg(1, "user", 200, f"turn{i}", marked=True, ttl="5m")])
+                for i in range(6)]
         plan = litellm_auto(reqs[0])
         self.assertEqual(len(plan.marker_indices), 2)      # system + trailing
         res = simulate.simulate(reqs, "litellm-auto")
@@ -586,7 +594,12 @@ class TestNoFabricatedReads(unittest.TestCase):
         b = simulate.bake_off(volatile_head(n=30))
         self.assertLessEqual(b.delta_pct, b.delta_pct_optimistic,
                              "the reported verdict must not be the flattering end")
-        self.assertIn(f"{b.delta_pct:.1f}", b.verdict)
+        # A tie states itself in words rather than as "0.0%". That case became
+        # reachable once litellm-auto stopped inventing markers: on a request
+        # nobody marked, the automatic baseline and as-shipped are the same
+        # request, so the arms genuinely tie.
+        self.assertTrue(f"{b.delta_pct:.1f}" in b.verdict or "ties" in b.verdict,
+                        b.verdict)
 
     def test_identical_policies_produce_identical_spend(self):
         """A differential check: nothing about arm identity may change cost."""
