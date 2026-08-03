@@ -58,6 +58,11 @@ _lock = threading.Lock()
 _state = {"n": 0, "out": None, "errors": 0, "upstream": DEFAULT_UPSTREAM}
 
 
+class _BadChunkedBody(Exception):
+    """The client's chunked framing could not be parsed, so the body is not
+    knowable. A 400 to the caller and nothing forwarded upstream."""
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -72,27 +77,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
         for large or streamed uploads -- had its body read as zero bytes and
         forwarded empty. The provider then answered a request the caller never
         made, and the capture recorded that as what was sent.
+
+        Three things went wrong in the first version of the chunked branch, and
+        all three are about telling one kind of nothing from another.
+
+        `readline()` returns `b""` at end of file and `b"\\r\\n"` on a blank
+        line, and both are falsy after `.strip()`. The loop did `continue` on
+        falsy, so a client that hung up mid-upload -- an abort, a crash, a
+        timeout -- span that handler thread at 100% CPU for the life of the
+        process. Every aborted upload leaked another one.
+
+        A malformed length `break`s out and returned the bytes read so far. That
+        forwards a plausible-looking truncated request, which is harder to
+        notice than the empty body this function was written to fix, and the
+        capture records it as what the caller sent. Unparseable framing means
+        the body is not knowable, so nothing is forwarded.
+
+        Trailers after the final chunk were left unread in `rfile`. On a
+        keep-alive connection the next request then starts parsing at
+        `X-Checksum: abc`, so one capture with trailers corrupts every request
+        behind it on that socket.
         """
         if "chunked" in (self.headers.get("transfer-encoding") or "").lower():
             out = []
             while True:
-                line = self.rfile.readline().strip()
+                raw = self.rfile.readline()
+                if not raw:
+                    raise _BadChunkedBody("connection closed mid-body")
+                line = raw.strip()
                 if not line:
-                    continue
+                    continue                       # a genuine blank line
                 try:
                     size = int(line.split(b";")[0], 16)
                 except ValueError:
-                    break
+                    raise _BadChunkedBody(f"unparseable chunk length {line[:32]!r}")
+                if size < 0:
+                    raise _BadChunkedBody("negative chunk length")
                 if size == 0:
-                    self.rfile.readline()          # trailing CRLF
+                    # Drain trailers to the genuinely empty line that ends them.
+                    while True:
+                        raw = self.rfile.readline()
+                        if not raw:
+                            raise _BadChunkedBody("connection closed in trailers")
+                        if not raw.strip():
+                            break
                     break
-                out.append(self.rfile.read(size))
+                chunk = self.rfile.read(size)
+                if len(chunk) != size:
+                    raise _BadChunkedBody(
+                        f"chunk declared {size} bytes and {len(chunk)} arrived")
+                out.append(chunk)
                 self.rfile.readline()              # CRLF after each chunk
             return b"".join(out)
         return self.rfile.read(int(self.headers.get("content-length") or 0))
 
     def do_POST(self):                    # noqa: N802
-        raw = self._read_request_body()
+        try:
+            raw = self._read_request_body()
+        except _BadChunkedBody as e:
+            # Nothing goes upstream and nothing is recorded. A truncated body
+            # forwarded as if whole is a capture of a request nobody made.
+            body = json.dumps({"error": {
+                "type": "cacheeconomics_proxy_bad_request",
+                "message": f"could not read the request body: {e}"}}).encode()
+            self.send_response(400)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         sent_at = datetime.now(timezone.utc)
 
         # Refused, not silently reframed. `urllib` buffers the upstream

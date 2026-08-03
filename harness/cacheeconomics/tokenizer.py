@@ -49,6 +49,7 @@ implementation, which is a much weaker thing to ask someone to trust.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -82,11 +83,20 @@ def prefix_cuts(body: dict) -> list:
             msgs = out.setdefault("messages", [])
             while len(msgs) <= mi:
                 msgs.append(None)
-            if bi is None:
-                msgs[mi] = {"role": role, "content": block}
+            if msgs[mi] is None:
+                msgs[mi] = {"role": role}
+            if isinstance(bi, str):
+                # Tool history is a field on the message, not a content block.
+                # Appending it into `content` -- which is what happened when
+                # `walk` learned to yield these and this reader was not
+                # updated -- nested the whole `tool_calls` array inside the
+                # assistant's content and produced a body no provider accepts.
+                msgs[mi][bi] = block
+            elif bi is None:
+                msgs[mi]["content"] = block
             else:
-                if msgs[mi] is None:
-                    msgs[mi] = {"role": role, "content": []}
+                if not isinstance(msgs[mi].get("content"), list):
+                    msgs[mi]["content"] = []
                 msgs[mi]["content"].append(block)
         seen += 1
         snapshot = json.loads(json.dumps(
@@ -104,6 +114,26 @@ def _countable(cut: dict) -> dict:
     return body
 
 
+def _cache_key(cut: dict) -> str:
+    """A digest of the prefix, not the prefix.
+
+    The key used to be `json.dumps(cut)`, so `<out>.cache.json` was a verbatim
+    plaintext copy of every prompt counted -- and it was not gitignored. That
+    directly contradicts the README's own promise that "prompt text is optional;
+    hashes, structure and token counts are enough", in the one file this tool
+    writes to a client's disk without being asked.
+
+    Unkeyed sha256 rather than the keyed HMAC segment ids use. Segment ids are
+    published in reports and joined across tenants, so they need a secret. This
+    is a local resume file whose whole purpose is that a re-run finds the same
+    key, which a per-run secret would defeat. A digest still lets somebody
+    confirm a prompt they already guessed; it does not hand them the prompt,
+    which is what this replaced.
+    """
+    return hashlib.sha256(
+        json.dumps(cut, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def count_segments(body: dict, count, cache: dict | None = None) -> list:
     """Exact token count per segment, in segment order.
 
@@ -117,12 +147,12 @@ def count_segments(body: dict, count, cache: dict | None = None) -> list:
         return []
 
     def counted(cut):
-        key = json.dumps(cut, sort_keys=True, default=str)
+        key = _cache_key(cut)
         if key not in cache:
             cache[key] = count(_countable(cut))
         return cache[key]
 
-    base_key = json.dumps({}, sort_keys=True)
+    base_key = _cache_key({})
     if base_key not in cache:
         cache[base_key] = count(_countable({}))
     prev = cache[base_key]

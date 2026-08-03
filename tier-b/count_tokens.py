@@ -145,7 +145,20 @@ def main() -> int:
         print(f"  DRY RUN: nothing will be sent. Host that would receive the "
               f"prompt content: {args.endpoint}", file=sys.stderr)
 
-    rows, counted, skipped, failed = [], 0, 0, 0
+    # Streamed, not buffered. This held every enriched row in a list and then
+    # built a second full copy with `"\n".join(rows)`, so peak memory was twice
+    # the export -- on the one tool in this repo whose input is a client's
+    # entire month of traffic. Rows go to a temp file as they are produced and
+    # it is renamed once `partial` is known, because the final name depends on
+    # whether anything failed and that is not known until the end.
+    counted, skipped, failed = 0, 0, 0
+    tmp_path = args.out + ".partial-write"
+    sink = None if args.dry_run else open(tmp_path, "w")
+
+    def emit(text):
+        if sink is not None:
+            sink.write(text + "\n")
+
     with open(args.path) as f:
         for line in f:
             line = line.strip()
@@ -154,12 +167,12 @@ def main() -> int:
             try:
                 row = json.loads(line)
             except ValueError:
-                rows.append(line)          # passed through untouched
+                emit(line)                 # passed through untouched
                 skipped += 1
                 continue
             body = _find_body(row) if isinstance(row, dict) else None
             if not body:
-                rows.append(json.dumps(row))
+                emit(json.dumps(row))
                 skipped += 1
                 continue
             try:
@@ -172,7 +185,7 @@ def main() -> int:
                 print(f"  row {counted + failed + skipped}: {type(e).__name__}: {e}",
                       file=sys.stderr)
                 failed += 1
-            rows.append(json.dumps(row))
+            emit(json.dumps(row))
             if counted % 25 == 0 and counted and not args.dry_run:
                 # Not during a dry run. The dry-run counter returns 0 for every
                 # prefix, and this checkpoint fires before the guard below, so
@@ -185,6 +198,9 @@ def main() -> int:
                     json.dump(cache, cf)
                 print(f"  {counted:,} rows, {stats['calls']:,} calls, "
                       f"{len(cache):,} cached", file=sys.stderr)
+
+    if sink is not None:
+        sink.close()
 
     if args.dry_run:
         # Deliberately writes nothing. A dry run produced an output file whose
@@ -206,8 +222,7 @@ def main() -> int:
     # nothing downstream could tell.
     partial = failed > 0
     out_path = args.out if not partial or args.allow_partial else args.out + ".partial"
-    with open(out_path, "w") as f:
-        f.write("\n".join(rows) + "\n")
+    os.replace(tmp_path, out_path)
     with open(cache_path, "w") as cf:
         json.dump(cache, cf)
 

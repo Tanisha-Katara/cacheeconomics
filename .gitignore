@@ -34,3 +34,8 @@ dist/
 *.egg-info/
 __pycache__/
 *.pyc
+
+# Token-count resume files. Keys are digests now, but the file still records
+# which prefixes a client's traffic contains and how large each one is, and it
+# is written next to whatever `--out` the operator chose.
+*.cache.json

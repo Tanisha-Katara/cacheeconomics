@@ -15,8 +15,11 @@ and the proxy is exercised against a stub upstream on loopback, so these run in
 CI with no key and no egress.
 """
 
+import contextlib
 import http.client
 import http.server
+import io
+import signal
 import importlib.util
 import json
 import os
@@ -35,6 +38,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TIER_B = os.path.normpath(os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     "tier-b"))
+
+
+@contextlib.contextmanager
+def _deadline(seconds):
+    """Fail rather than hang. Two of the defects below are infinite loops, and a
+    test that hangs the suite reads as CI being slow."""
+    def bail(*a):
+        raise TimeoutError(f"still running after {seconds}s")
+    old = signal.signal(signal.SIGALRM, bail)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
 
 
 def load(name):
@@ -645,3 +663,136 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
         money = [k for k in got if "usd" in k]
         self.assertTrue(money, "fixture produced no dollar fields; vacuous")
         self.assertIs(got.get("unreconciled"), True)
+
+
+class TestTheDechunkerTellsOneNothingFromAnother(unittest.TestCase):
+    """`readline()` returns b"" at EOF and b"\\r\\n" on a blank line, and both
+    are falsy after `.strip()`.
+
+    The loop treated them alike and did `continue`, so a client that hung up
+    mid-upload span that handler thread at 100% CPU for the life of the process
+    and every aborted upload leaked another one. Driven directly rather than
+    through a socket, so a regression fails in milliseconds instead of hanging
+    the suite.
+    """
+
+    def setUp(self):
+        self.proxy = load("capture_proxy")
+
+    def _read(self, raw):
+        """Every read is deadlined, not only the two that look like loops. A
+        short chunk also spins under the old code, and finding that out by
+        hanging the suite for two minutes is how this deadline earned its
+        place."""
+        class Fake:
+            def __init__(self, b):
+                self.rfile = io.BytesIO(b)
+                self.headers = {"transfer-encoding": "chunked"}
+        with _deadline(5):
+            return self.proxy.Handler._read_request_body(Fake(raw))
+
+    def test_a_well_formed_body_still_arrives(self):
+        self.assertEqual(self._read(b"5\r\nhello\r\n0\r\n\r\n"), b"hello")
+
+    def test_eof_mid_body_raises_instead_of_spinning(self):
+        with self.assertRaises(self.proxy._BadChunkedBody):
+            self._read(b"5\r\nhello\r\n")
+
+    def test_an_empty_stream_raises_instead_of_spinning(self):
+        with self.assertRaises(self.proxy._BadChunkedBody):
+            self._read(b"")
+
+    def test_malformed_framing_forwards_nothing(self):
+        """It used to `break` and return the bytes read so far -- a plausible
+        truncated request, harder to notice than the empty body this function
+        was written to fix."""
+        with self.assertRaises(self.proxy._BadChunkedBody):
+            self._read(b"5\r\nhello\r\nZZZZ\r\nworld\r\n0\r\n\r\n")
+
+    def test_a_short_chunk_is_not_accepted_as_whole(self):
+        with self.assertRaises(self.proxy._BadChunkedBody):
+            self._read(b"99\r\nhello\r\n0\r\n\r\n")
+
+    def test_trailers_are_drained_so_keep_alive_survives(self):
+        """Left unread, the next request on that socket starts parsing at
+        `X-Checksum: abc` -- one capture corrupting every request behind it."""
+        class Fake:
+            def __init__(self, b):
+                self.rfile = io.BytesIO(b)
+                self.headers = {"transfer-encoding": "chunked"}
+        f = Fake(b"5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n"
+                 b"POST /v1/messages HTTP/1.1\r\n")
+        with _deadline(5):
+            self.assertEqual(self.proxy.Handler._read_request_body(f), b"hello")
+        self.assertTrue(f.rfile.read().startswith(b"POST "))
+
+
+class TestTheCountCacheIsNotAPromptStore(unittest.TestCase):
+    """Keys were `json.dumps(cut)`, so `<out>.cache.json` was a verbatim copy of
+    every prompt counted -- and it was not gitignored.
+
+    That contradicts the README's own promise that hashes, structure and token
+    counts are enough, in the one file this tool writes to a client's disk
+    without being asked.
+    """
+
+    def test_no_prompt_text_survives_into_the_cache(self):
+        from cacheeconomics.tokenizer import count_segments
+        body = {"system": [{"type": "text", "text": "SECRET-POLICY-TEXT"}],
+                "messages": [{"role": "user", "content": "CONFIDENTIAL-QUESTION"}]}
+        cache = {}
+        count_segments(body, lambda b: 100, cache)
+        blob = json.dumps(cache)
+        self.assertNotIn("SECRET-POLICY-TEXT", blob)
+        self.assertNotIn("CONFIDENTIAL-QUESTION", blob)
+        self.assertTrue(cache)
+
+    def test_the_cache_still_hits(self):
+        """A digest that changed per call would be private and useless."""
+        from cacheeconomics.tokenizer import count_segments
+        body = {"messages": [{"role": "user", "content": "hello"}]}
+        calls = []
+        cache = {}
+        count_segments(body, lambda b: (calls.append(1), 10)[1], cache)
+        first = len(calls)
+        count_segments(body, lambda b: (calls.append(1), 10)[1], cache)
+        self.assertEqual(len(calls), first, "the second run re-counted everything")
+
+    def test_the_cache_file_is_gitignored(self):
+        root = os.path.dirname(TIER_B)
+        with open(os.path.join(root, ".gitignore")) as f:
+            self.assertIn("*.cache.json", f.read())
+
+
+class TestCountingLargeExportsStaysLinear(unittest.TestCase):
+    """The suite had no benchmark anywhere, and this is the one tool whose input
+    is a client's entire month of traffic.
+
+    Not a wall-clock threshold, which would be flaky on shared CI. It asserts the
+    shape: ten times the segments must not cost anywhere near a hundred times the
+    work. `prefix_cuts` is inherently quadratic in total output size -- every cut
+    is a full snapshot -- so this pins that nothing *further* quadratic creeps in
+    on top, which is what per-cut key serialization was.
+    """
+
+    @staticmethod
+    def _elapsed(n):
+        from cacheeconomics.tokenizer import count_segments
+        body = {"messages": [{"role": "user",
+                              "content": [{"type": "text", "text": f"block {i} " * 20}
+                                          for i in range(n)]}]}
+        cache = {}
+        start = time.perf_counter()
+        count_segments(body, lambda b: 10, cache)
+        return time.perf_counter() - start
+
+    def test_ten_times_the_segments_is_not_a_hundred_times_the_cost(self):
+        self._elapsed(20)                      # warm the interpreter
+        small = self._elapsed(20)
+        large = self._elapsed(200)
+        # Quadratic in output size gives ~100x. Anything past 100x means a
+        # second quadratic factor -- which is what hashing the full prefix into
+        # a dict key on every cut was.
+        self.assertLess(large, small * 100 + 0.5,
+                        f"200 segments cost {large:.3f}s against {small:.3f}s "
+                        f"for 20 -- worse than the shape of the search itself")
