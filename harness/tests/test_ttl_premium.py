@@ -194,3 +194,79 @@ class TestItDoesNotContradictTTL1(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestInBandGapsThatReadNothing(unittest.TestCase):
+    """An in-band gap whose request read nothing did not have an entry to use.
+
+    `band_gaps` did double duty: the count of gaps in the band, and the count of
+    gaps whose rebuild cost could be priced. It only incremented inside
+    `if prefix`, so an in-band gap with no read vanished from the rarity
+    denominator entirely.
+
+    Twenty fast gaps beside twenty in-band ones then reported "100.0% of gaps
+    are under five minutes" -- a false statement of fact in the detail text --
+    and recommended shortening the lifetime. That is the worst case to get
+    backwards: no read at an in-band gap means the prefix is not surviving, and
+    a shorter lifetime makes that harder to see rather than better.
+    """
+
+    def _mix(self, fast, band_read, band_unread, prefix=200_000):
+        reqs, t = [], 0
+        for _ in range(fast):
+            t += 30
+            reqs.append(req(t, write_1h=5_000, read=prefix))
+        for _ in range(band_read):
+            t += 900
+            reqs.append(req(t, write_1h=5_000, read=prefix))
+        for _ in range(band_unread):
+            t += 900
+            reqs.append(req(t, write_1h=40_000, read=0))
+        return reqs
+
+    def test_unread_in_band_gaps_count_toward_the_rarity_premise(self):
+        """Half the gaps are in the band. The rule's premise does not hold and
+        it must stay quiet, whatever the arithmetic says."""
+        got = findings(self._mix(20, 0, 20), allow_unreconciled=True)
+        self.assertNotIn("TTL-2", got,
+                         "in-band gaps with no read were dropped from the "
+                         "denominator, so the band looked empty")
+
+    def test_the_percentage_it_prints_is_true(self):
+        """The detail said 100% of gaps were under five minutes when half were
+        not. A reader acts on that sentence."""
+        got = findings(self._mix(96, 4, 0), allow_unreconciled=True)
+        f = got.get("TTL-2")
+        self.assertIsNotNone(f)
+        import re
+        m = re.search(r"([\d.]+)% of gaps between requests", f.detail)
+        self.assertIsNotNone(m)
+        self.assertAlmostEqual(float(m.group(1)), 96.0, delta=1.0,
+                               msg="the share it prints is not the real share")
+
+    def test_no_saving_is_published_when_band_gaps_read_nothing(self):
+        """Their rebuild cost cannot be priced, so `net` counts them as free and
+        is biased toward recommending the switch.
+
+        Small prefix on purpose: that is the shape where the bias actually
+        changes the answer. With a large prefix the net is already negative and
+        "keep the hour" is correct regardless, so the bias is harmless there and
+        this branch is not the one that should fire.
+        """
+        f = findings(self._mix(96, 2, 2, prefix=3_000),
+                     allow_unreconciled=True)["TTL-2"]
+        self.assertIn("not being read back", f.title)
+        self.assertIsNone(f.avoidable_usd_month)
+        self.assertIn("EFF-1", f.fix, "does not point at the real cause")
+
+    def test_the_priceable_case_still_prices(self):
+        """The guard must not swallow the finding it was built for."""
+        f = findings(self._mix(96, 4, 0, prefix=3_000),
+                     allow_unreconciled=True)["TTL-2"]
+        self.assertIn("premium where five minutes would do", f.title)
+        self.assertGreater(f.avoidable_usd_month.raw(), 0)
+
+    def test_a_large_prefix_still_flips_to_keeping_the_hour(self):
+        f = findings(self._mix(96, 4, 0, prefix=900_000),
+                     allow_unreconciled=True)["TTL-2"]
+        self.assertIn("earning its premium", f.title)

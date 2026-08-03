@@ -1886,3 +1886,84 @@ class TestTheDraftStampSurvives(unittest.TestCase):
             with self.subTest(note=note[:40]):
                 self.assertIn(" ".join(note.split())[:50], " ".join(full.split()))
         self.assertIn("--detail", brief, "notes vanished with no way to reach them")
+
+
+class TestNoteKindIsRecordedNotInferred(unittest.TestCase):
+    """A note's kind is decided where it is raised, not where it is rendered.
+
+    Both renderers used to search note prose for one phrase to decide whether a
+    note qualified a published figure. That means a rewording silently demotes
+    a release blocker to provenance, and provenance is folded behind --detail --
+    so the sentence saying what a dollar figure excludes stops being printed
+    beside the dollar figure, with nothing failing.
+    """
+
+    def _analysis(self, **kw):
+        """No segments and no declared TTL, so the write lifetime is unprovable
+        and those requests are excluded from the dollar figures. That exclusion
+        is the blocker this class is about."""
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
+                        model="claude-opus-5", agent="a", session="s",
+                        ttl_requested=None,
+                        usage={"input_tokens": 200,
+                               "cache_creation_input_tokens": 30000},
+                        segments=[]) for i in range(20)]
+        return analyze(TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x"),
+                       **kw)
+
+    def test_the_analysis_carries_the_classification(self):
+        from cacheeconomics.analyzer import spend_caveats
+        a = self._analysis(allow_unreconciled=True)
+        self.assertTrue(a.blocking_notes, "fixture raises no blocker; vacuous")
+        self.assertEqual(spend_caveats(a), a.blocking_notes)
+        for n in a.blocking_notes:
+            self.assertIn(n, a.notes, "a blocker that is not among the notes")
+
+    def test_renderers_read_the_field_not_the_prose(self):
+        """Rewriting a blocker's wording must not change whether it is shown."""
+        from dataclasses import replace
+
+        from cacheeconomics.analyzer import spend_caveats
+        from cacheeconomics.report import render_text
+        a = self._analysis(allow_unreconciled=True)
+        original = a.blocking_notes[0]
+        reworded = "Some requests were left out of the totals. " + original[-40:]
+        b = replace(a, notes=[reworded] + a.notes[1:],
+                    blocking_notes=[reworded])
+        self.assertEqual(spend_caveats(b), [reworded])
+        self.assertIn(" ".join(reworded.split())[:50],
+                      " ".join(render_text(b).split()),
+                      "a reworded blocker stopped being printed by default")
+
+    def test_a_bare_list_still_works_for_callers_without_an_analysis(self):
+        """Adapters hold notes before an Analysis exists."""
+        from cacheeconomics.analyzer import spend_caveats
+        from cacheeconomics.trace import QUALIFIES_SPEND
+        notes = [f"9 rows are {QUALIFIES_SPEND}.", "ids were normalised"]
+        self.assertEqual(len(spend_caveats(notes)), 1)
+
+    def test_an_ingest_blocker_survives_into_the_analysis(self):
+        """The adapter knows things the analyzer cannot see -- that a row stated
+        no surface, for one -- so its classification has to travel."""
+        import json
+        import os
+        import tempfile
+
+        from cacheeconomics.adapters.litellm import load_litellm
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "x.jsonl")
+            with open(p, "w") as f:
+                for i in range(30):
+                    f.write(json.dumps({
+                        "id": f"r{i}", "startTime": 1_780_000_000 + i * 60,
+                        "model": "claude-opus-5",
+                        "response": {"usage": {
+                            "prompt_tokens": 1000, "completion_tokens": 10,
+                            "prompt_tokens_details": {"cached_tokens": 0},
+                            "cache_creation_input_tokens": 0,
+                            "cache_read_input_tokens": 0}}}) + "\n")
+            ts = load_litellm(p)
+            self.assertTrue(ts.blocking_notes, "adapter classified nothing")
+            a = analyze(ts, allow_unreconciled=True)
+            self.assertTrue(any("surface is unknown" in n for n in a.blocking_notes),
+                            "the ingest blocker did not survive into the analysis")

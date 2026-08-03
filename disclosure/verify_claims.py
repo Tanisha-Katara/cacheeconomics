@@ -67,7 +67,13 @@ CLAIMS = [
         "3-browser-use",
         "browser-use/browser-use",
         "browser_use/llm/anthropic/chat.py",
-        [(195, "ephemeral_5m_input_tokens"), (196, "ephemeral_1h_input_tokens")],
+        # Filed against 195/196 on 2026-07-28; upstream moved them to 200/201
+        # by 2026-08-03. The claim is unchanged -- the file still reads both
+        # counters and still never emits a 1h marker -- but the issue text
+        # points at line numbers that are now wrong, which is exactly the
+        # "maintainer looks, sees something else, stops reading" failure this
+        # script exists to catch. Worth a correcting comment on #5321.
+        [(200, "ephemeral_5m_input_tokens"), (201, "ephemeral_1h_input_tokens")],
         [],
     ),
 ]

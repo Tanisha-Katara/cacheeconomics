@@ -41,7 +41,9 @@ from datetime import datetime, timezone
 
 from .. import registry
 from ..segment import usage_from_details as _from_details
-from ..trace import (Request, Tier, TraceSet, _is_token_count, _text,
+from ..registry import UNATTRIBUTED
+from ..trace import (QUALIFIES_SPEND, note_blocks_spend as _note_blocks_spend,
+                     Request, Tier, TraceSet, _is_token_count, _text,
                      session_of, write_tokens)
 
 # `custom_llm_provider` -> a surface the registry carries. Only mappings the
@@ -58,7 +60,8 @@ PROVIDER_TO_TARGET = {
 }
 
 
-def target_from_row(row: dict, default: str | None = None) -> str:
+def target_from_row(row: dict, default: str | None = None, *,
+                    when_absent: str | None = None) -> str:
     """Which provider surface a LiteLLM request is bound for.
 
     One reader, because this is consumed by two paths that had already
@@ -75,6 +78,19 @@ def target_from_row(row: dict, default: str | None = None) -> str:
     (`bedrock/anthropic.claude-...`). An unrecognised provider is returned
     unmapped rather than folded into the default, so the registry refuses it
     instead of quietly pricing it as Anthropic.
+
+    `when_absent` is what the caller wants when the row states no surface at
+    all, and the two callers want opposite things because their failure modes
+    are opposite. Analysing a log: guessing produces a dollar figure that looks
+    reconciled and matches no invoice, silently, so the answer is
+    `UNATTRIBUTED` and the money is withheld. Rewriting a live request: the
+    plugin has to pick minimums, TTL support and a breakpoint budget to decide
+    anything at all, and a wrong guess produces a provider error on the next
+    call. Loud and immediate beats silent and expensive, so that path may
+    assume.
+
+    Kept as one function with a parameter rather than two functions, because
+    two functions is exactly how these paths diverged before.
     """
     provider = (_text(row.get("custom_llm_provider")) or "").lower()
     if not provider:
@@ -84,7 +100,22 @@ def target_from_row(row: dict, default: str | None = None) -> str:
             if head in PROVIDER_TO_TARGET:
                 provider = head
     if not provider:
-        return default or "anthropic/direct"
+        # No provider field, no routing prefix. The surface was never stated,
+        # so it is not known -- and it is emphatically not Anthropic direct.
+        #
+        # This returned "anthropic/direct" until a review found it. The rate
+        # scope is default-deny and refuses to price a partner surface, but it
+        # can only refuse a surface it is shown, and this handed it a
+        # first-party one manufactured out of an absence. A proxy export
+        # fronting Bedrock therefore priced at Anthropic list and published a
+        # reconciled-looking total no AWS bill would match: the exact failure
+        # the scope exists to prevent, entering through the one door it could
+        # not see.
+        #
+        # `UNATTRIBUTED` is registered as unpriceable, so dollar figures are
+        # withheld and structural findings still report. `--target-id` states
+        # the surface and restores them.
+        return default or when_absent or UNATTRIBUTED
     return PROVIDER_TO_TARGET.get(provider, provider)
 
 
@@ -386,15 +417,22 @@ def load_litellm(path: str, *, default_tenant: str | None = None,
             f"cache as absent. Upgrade the LiteLLM version writing these logs, or "
             f"export the provider usage object alongside them.")
     if providerless:
-        chosen = default_target or "anthropic/direct"
-        notes.append(
-            f"{providerless:,} row(s) carry no `custom_llm_provider` and were "
-            f"attributed to {chosen}"
-            + ("" if default_target else
-               " (the default -- pass --target-id if this proxy fronts Bedrock or "
-               "Vertex, whose rates are not Anthropic's)")
-            + ". Caches and prices are per surface, so a wrong attribution here "
-              "moves real money.")
+        if default_target:
+            notes.append(
+                f"{providerless:,} row(s) carry no `custom_llm_provider` and were "
+                f"attributed to {default_target} because you passed --target-id. "
+                f"Caches and prices are per surface, so this attribution is "
+                f"load-bearing: everything downstream trusts it.")
+        else:
+            notes.append(
+                f"{providerless:,} row(s) carry no `custom_llm_provider` and no "
+                f"routing prefix on the model, so the surface is unknown and "
+                f"they are {QUALIFIES_SPEND}. Guessing Anthropic first-party "
+                f"here would price a proxy fronting Bedrock or Vertex at rates "
+                f"nobody bills, and the result reconciles against nothing. "
+                f"Pass --target-id to state the surface, or --effective-rate to "
+                f"price it from the invoice.")
+    blocking = [n for n in notes if _note_blocks_spend(n)]
     if unparseable:
         notes.append(f"{unparseable:,} line(s) were not valid JSON and were skipped.")
     if malformed:
@@ -423,5 +461,5 @@ def load_litellm(path: str, *, default_tenant: str | None = None,
         "not reported. Usage-driven findings, spend and invoice reconciliation "
         "are unaffected.")
     return TraceSet(requests=requests, tier=Tier.USAGE_ONLY, source=path,
-                    notes=notes,
+                    notes=notes, blocking_notes=blocking,
                     skipped_rows=unparseable + skipped + malformed)

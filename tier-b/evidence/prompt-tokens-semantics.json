@@ -1,0 +1,92 @@
+{
+  "artifact": "prompt-tokens-semantics",
+  "artifact_version": 1,
+  "why": "Establishes what `prompt_tokens` (LiteLLM) and `input_tokens` (Anthropic SDK) mean when a prompt is cached. Both disclosure drafts 4-aider and 5-crewai rest on this and cited no artifact until a review pointed it out.",
+  "recorded_at": "2026-08-03T15:31:09.397580+00:00",
+  "run_stamp": "a1c6cdf130cb46dc",
+  "model": "claude-haiku-4-5",
+  "litellm": "1.83.9",
+  "anthropic_sdk": "0.120.2",
+  "python": "3.9.6",
+  "calls": [
+    {
+      "path": "anthropic-sdk",
+      "tag": "1 unmarked",
+      "at": "2026-08-03T15:31:04.324613+00:00",
+      "usage": {
+        "input_tokens": 17111,
+        "output_tokens": 4,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      }
+    },
+    {
+      "path": "anthropic-sdk",
+      "tag": "2 marked",
+      "at": "2026-08-03T15:31:05.274438+00:00",
+      "usage": {
+        "input_tokens": 9,
+        "output_tokens": 4,
+        "cache_creation_input_tokens": 17102,
+        "cache_read_input_tokens": 0
+      }
+    },
+    {
+      "path": "anthropic-sdk",
+      "tag": "3 marked",
+      "at": "2026-08-03T15:31:06.201288+00:00",
+      "usage": {
+        "input_tokens": 9,
+        "output_tokens": 8,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 17102
+      }
+    },
+    {
+      "path": "litellm",
+      "tag": "1 unmarked",
+      "at": "2026-08-03T15:31:07.661605+00:00",
+      "usage": {
+        "prompt_tokens": 17111,
+        "completion_tokens": 8,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0
+      }
+    },
+    {
+      "path": "litellm",
+      "tag": "2 marked",
+      "at": "2026-08-03T15:31:08.463367+00:00",
+      "usage": {
+        "prompt_tokens": 17111,
+        "completion_tokens": 4,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 17102
+      }
+    },
+    {
+      "path": "litellm",
+      "tag": "3 marked",
+      "at": "2026-08-03T15:31:09.397536+00:00",
+      "usage": {
+        "prompt_tokens": 17111,
+        "completion_tokens": 8,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 17102
+      }
+    }
+  ],
+  "findings": {
+    "litellm_prompt_tokens_constant": true,
+    "litellm_prompt_tokens": [
+      17111
+    ],
+    "anthropic_input_tokens_excludes_cache": true,
+    "anthropic_input_tokens": [
+      17111,
+      9,
+      9
+    ]
+  },
+  "label_note": "Call tags are positional, not assertions about cache state. An earlier version of this file tagged call 2 'marked cold' on both paths; the LiteLLM leg ran after the SDK leg had already warmed the same prefix, so its call 2 reports a read. The usage fields are what happened. Only the tags were wrong and only they were changed."
+}

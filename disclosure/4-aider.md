@@ -4,7 +4,9 @@
 **Verified at:** `5dc9490bb35f9729ef2c95d00a19ccd30c26339c` (2026-05-22)
 **Status:** not yet filed
 **Reproduction:** `python3 disclosure/verify_aider_cost.py` — no key, no network,
-no aider install. `--live` adds one real API call, about a tenth of a cent.
+no aider install; it reads the committed artifact rather than hard-coded
+numbers. `--live` makes three calls (uncached, write, read — one cannot show
+`prompt_tokens` staying constant across them) for under a cent.
 
 ---
 
@@ -34,15 +36,21 @@ three consecutive calls, `litellm 1.83.9`, `claude-haiku-4-5`:
 
 | call | `prompt_tokens` | `cache_creation` | `cache_read` | remainder |
 |---|---|---|---|---|
-| unmarked | 5,415 | 0 | 0 | 5,415 |
-| marked, cold | 5,415 | 5,402 | 0 | 13 |
-| marked, warm | 5,415 | 0 | 5,402 | 13 |
+| 1, unmarked | 17,111 | 0 | 0 | 17,111 |
+| 2, marked | 17,111 | 0 | 17,102 | 9 |
+| 3, marked | 17,111 | 0 | 17,102 | 9 |
 
 `prompt_tokens` does not move. It is the total input with the cache classes
-included, not the uncached remainder. An independent run on 2026-07-31 at a
-different prefix size shows the same thing (15,635 constant across all three);
-both are in
-[`tier-b/evidence/litellm-marker-survival.json`](https://github.com/Tanisha-Katara/cacheeconomics/blob/main/tier-b/evidence/litellm-marker-survival.json).
+included, not the uncached remainder. Raw usage for every call is in
+[`tier-b/evidence/prompt-tokens-semantics.json`](https://github.com/Tanisha-Katara/cacheeconomics/blob/main/tier-b/evidence/prompt-tokens-semantics.json),
+recorded 2026-08-03. An independent run on 2026-07-31 at a different prefix size
+shows the same behaviour (15,635 constant across all three) in
+[`litellm-marker-survival.json`](https://github.com/Tanisha-Katara/cacheeconomics/blob/main/tier-b/evidence/litellm-marker-survival.json).
+
+Call tags there are positional rather than claims about cache state: the
+LiteLLM leg ran after a direct-SDK leg had already warmed the same prefix, so
+its second call reports a read. That does not affect the premise, which is only
+that `prompt_tokens` is identical in all three.
 
 ## Anthropic branch — `base_coder.py:2094-2097`
 
@@ -61,9 +69,13 @@ Applying it to the rows above, at haiku's $1/M input:
 
 | call | aider | correct | overstated |
 |---|---|---|---|
-| uncached | $0.0054150 | $0.0054150 | 1.0x |
-| cache write | $0.0121675 | $0.0067655 | 1.8x |
-| cache read | $0.0059552 | $0.0005532 | **10.8x** |
+| 1, uncached | $0.0171110 | $0.0171110 | 1.0x |
+| 2, cached | $0.0188212 | $0.0017192 | **10.9x** |
+| 3, cached | $0.0188212 | $0.0017192 | **10.9x** |
+
+On the 31 July run, which caught a genuine cold write, the same arithmetic gives
+1.8x on the write and 10.9x on the read. `verify_aider_cost.py` prints both runs
+from the artifacts.
 
 ## deepseek branch — `base_coder.py:2089-2092`
 

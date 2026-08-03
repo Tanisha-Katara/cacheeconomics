@@ -743,7 +743,13 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
             # rewrites the request rather than merely reporting on it, where
             # being wrong produces a provider error.
             from .adapters.litellm import target_from_row
-            target_id = target_from_row(data, self.target_id)
+            # This path rewrites a request rather than reporting on it. It
+            # must resolve a surface to pick minimums, TTLs and a breakpoint
+            # budget, and a wrong guess surfaces as a provider error on the
+            # next call. The analysis path takes the opposite default, because
+            # there a wrong guess is a silent dollar figure.
+            target_id = target_from_row(data, self.target_id,
+                                        when_absent="anthropic/direct")
             out, decision = self.plugin.on_request(
                 prompt, model=data.get("model", ""),
                 target_id=target_id,

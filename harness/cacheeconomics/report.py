@@ -629,7 +629,7 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
     # notes block at the very bottom, so a figure and the sentence saying what
     # it excludes were four sections apart, and folding that block away would
     # have separated them entirely.
-    for note in spend_caveats(a.notes):
+    for note in spend_caveats(a):
         out.append("")
         out += _wrap(f"caveat: {note}", _WIDTH, "  ")
     if not detail and a.findings:
@@ -662,7 +662,7 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
             out += _cols([("·", n)], [4, _WIDTH - 6])
     elif a.notes:
         out.append("")
-        rest = len(a.notes) - len(spend_caveats(a.notes))
+        rest = len(a.notes) - len(spend_caveats(a))
         if rest:
             out += _wrap(f"{rest} note(s) on provenance and coverage are printed "
                          f"with --detail.", _WIDTH, "  ")

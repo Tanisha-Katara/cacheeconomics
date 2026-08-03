@@ -324,6 +324,13 @@ def base_rate(model, on_date):
     return applicable[-1]
 
 
+# The surface an ingest reports when a row states no provider at all. Registered
+# in `unpriced_surfaces`, so default-deny refuses to price it. Named here rather
+# than in the adapter because the registry owns what a surface is, and because
+# more than one adapter will eventually need it.
+UNATTRIBUTED = "unknown/unattributed"
+
+
 def rate_scope():
     """Which surfaces the base rate table is valid for."""
     return pricing().get("rate_scope") or {}

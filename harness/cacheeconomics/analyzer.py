@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 
 from . import cost, money, registry
 from .allocate import reuse_chain_of
+from .trace import QUALIFIES_SPEND as _QUALIFIES_SPEND
+from .trace import note_blocks_spend as _note_blocks_spend
 from .trace import Request, Tier, TraceSet, _billed_input, write_tokens
 
 MEASURED = money.MEASURED
@@ -39,12 +41,23 @@ BAND_IS_RARE = 0.10
 # is the same as no caveat. This phrase is how the analyzer marks the second
 # kind, and both renderers ask for the subset rather than pattern-matching
 # prose the analyzer happens to emit today.
-QUALIFIES_SPEND = "excluded from every dollar figure"
+QUALIFIES_SPEND = _QUALIFIES_SPEND      # re-exported; defined in trace.py
 
 
-def spend_caveats(notes) -> list:
-    """The notes that qualify a published figure, in the order they were made."""
-    return [n for n in notes if QUALIFIES_SPEND in n]
+def spend_caveats(analysis_or_notes) -> list:
+    """The notes that qualify a published figure, in the order they were made.
+
+    Reads `blocking_notes`, which the analyzer records when each note is raised.
+    A bare list is still accepted -- several tests and the ingest adapters hold
+    notes without an Analysis around them -- and falls back to the predicate.
+    That fallback is the old behaviour and is why the structured field exists:
+    deciding a note's kind by searching its prose means a rewording silently
+    demotes a blocker to provenance.
+    """
+    blocking = getattr(analysis_or_notes, "blocking_notes", None)
+    if blocking is not None:
+        return list(blocking)
+    return [n for n in (analysis_or_notes or []) if _note_blocks_spend(n)]
 
 # Measured on 2026-07-28: a five-minute entry is gone somewhere between 300 and
 # 420 seconds, and a one-hour entry survived 56 minutes.
@@ -112,6 +125,9 @@ class Analysis:
     reconciliation: dict | None = None
     window_days: float | None = None
     notes: list[str] = field(default_factory=list)
+    # The subset of `notes` that qualifies a published figure. Recorded when the
+    # note is raised, not recovered from its wording afterwards.
+    blocking_notes: list[str] = field(default_factory=list)
 
     @property
     def total_avoidable_month(self) -> money.Figure:
@@ -761,7 +777,15 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
 
     written_1h = 0
     band_prefix = 0            # tokens that would be rewritten if 1h became 5m
-    band_gaps = under_5m = over_1h = 0
+    # `band_gaps` counts every gap in the band. `band_priced` counts the subset
+    # carrying a read, which is the only subset whose rebuild cost can be
+    # measured. Conflating the two put the rarity premise on the priced subset,
+    # so in-band gaps that read nothing vanished from the denominator: 20 fast
+    # gaps beside 20 in-band ones with unstable prefixes reported "100% of gaps
+    # are under five minutes" and recommended shortening the lifetime. That is
+    # the worst case to be wrong on -- no reads at an in-band gap means the
+    # prefix is not surviving, and a shorter lifetime makes that harder to see.
+    band_gaps = band_priced = under_5m = over_1h = 0
     saving = cost_of_switch = 0.0
     surfaces = set()
     for (tenant, target_id, model, session), rows in by_scope.items():
@@ -793,9 +817,10 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
                 else:
                     # The entry the 1h lifetime kept alive. Under 5m it is gone
                     # and this request rewrites what it would have read.
+                    band_gaps += 1
                     prefix = r.usage.get("cache_read_input_tokens") or 0
                     if prefix:
-                        band_gaps += 1
+                        band_priced += 1
                         band_prefix += prefix
                         cost_of_switch += prefix * per_token * (w5 - read)
             prev = (sent_at, r, u)
@@ -823,6 +848,13 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
     # first makes the second problem harder to see.
     if share_band > BAND_IS_RARE:
         return None
+    # An in-band gap that read nothing is a prefix that did not survive its own
+    # lifetime. The rebuild it would cost under 5m cannot be priced -- there is
+    # no read to price it from -- so `net` is computed as though those gaps were
+    # free, which biases it toward recommending the switch. They are also the
+    # signal that the prefix itself is the problem, and shortening the lifetime
+    # buries that. Report the observation, publish no saving.
+    unread_band = band_gaps - band_priced
     monthly = _monthly(abs(net), window)
     common = (
         f"{written_1h:,} tokens were written at the one-hour lifetime, which "
@@ -830,11 +862,33 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
         f"{share_short:.1%} of gaps between requests in a cache scope are under "
         f"five minutes, so a five-minute entry would have survived them too. "
         f"{band_gaps:,} gap(s) fall in the five-minute-to-one-hour band, where "
-        f"only the one-hour entry survives; those sit on {band_prefix:,} tokens "
-        f"of prefix that a five-minute lifetime would have forced to be written "
-        f"again."
+        f"only the one-hour entry survives; {band_priced:,} of those carry a "
+        f"read and sit on {band_prefix:,} tokens of prefix that a five-minute "
+        f"lifetime would have forced to be written again."
+        + (f" {unread_band:,} in-band gap(s) read nothing at all, so the entry "
+           f"the one-hour lifetime was holding did not survive to be used. "
+           f"Their rebuild cost cannot be priced and no saving is published."
+           if unread_band else "")
         + (f" {unprovable} request(s) had writes of unprovable lifetime and are "
            f"excluded." if unprovable else ""))
+
+    if net > 0 and unread_band:
+        return Finding(
+            code="TTL-2",
+            title="One-hour writes whose entries are not being read back",
+            severity="medium", evidence_class=MODELED,
+            detail=common + (
+                " Shortening the lifetime is not the indicated change. The "
+                "arithmetic favours it only because the unpriced gaps are "
+                "counted as free, and a prefix that expires unread would expire "
+                "unread faster."),
+            affected_requests=sum(len(v) for v in by_scope.values()),
+            avoidable_usd_month=None,
+            confidence="low", quality_risk="medium",
+            fix="Find what invalidates the prefix between requests before "
+                "touching the lifetime. EFF-1 and REB-1 name the usual causes. "
+                "Once the prefix survives, re-run and this rule can price the "
+                "lifetime question properly.")
 
     if net > 0:
         return Finding(
@@ -866,7 +920,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
         detail=common + (
             f" Netting the two: the rewrites a five-minute lifetime would force "
             f"outweigh the cheaper writes it would buy, because those band gaps "
-            f"sit on prefixes averaging {band_prefix // max(1, band_gaps):,} "
+            f"sit on prefixes averaging {band_prefix // max(1, band_priced):,} "
             f"tokens. Switching is modelled to cost money rather than save it. "
             f"The band gaps are rare and expensive, which is why counting them "
             f"by frequency gives the wrong answer."),
@@ -1476,7 +1530,18 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         if unpriceable_models:
             return f"no pricing recorded for {', '.join(sorted(unpriceable_models))}"
         if unpriceable_surfaces:
-            return (f"{', '.join(sorted(unpriceable_surfaces))} is invoiced by the "
+            # Two different reasons wear the same refusal. A partner surface is
+            # unpriceable because somebody else sets the rate; an unattributed
+            # one is unpriceable because nobody said what it is. Telling a
+            # reader whose export lacks a provider field to "supply the rate
+            # from that bill" sends them to the wrong fix -- they need to state
+            # the surface, and may well be on Anthropic direct.
+            named = sorted(unpriceable_surfaces)
+            if named == [registry.UNATTRIBUTED]:
+                return ("the surface is not stated anywhere in this export, so "
+                        "no rate table can be shown to apply to it; pass "
+                        "--target-id to state it")
+            return (f"{', '.join(named)} is invoiced by the "
                     f"cloud provider and the recorded rates are Anthropic first-party "
                     f"list prices; supply the effective rate from that bill")
         if undated:
@@ -1682,6 +1747,13 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         "window_days": window,
     }, gate_ok, why)
 
+    # Classified once, here, where every note has been collected and the code
+    # still knows why each was raised. Renderers read the field; none of them
+    # searches the prose. `ts.blocking_notes` carries anything an ingest adapter
+    # already marked, because the adapter knows things the analyzer cannot see
+    # -- that a row stated no surface, for one.
+    blocking = [n for n in notes
+                if _note_blocks_spend(n) or n in set(ts.blocking_notes)]
     return Analysis(ratios=ratios, coverage=ts.coverage, tier=ts.tier,
                     findings=findings, spend=spend, reconciliation=recon,
-                    window_days=window, notes=notes)
+                    window_days=window, notes=notes, blocking_notes=blocking)

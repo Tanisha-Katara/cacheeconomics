@@ -175,6 +175,11 @@
         "operator": "partner",
         "official_pricing": "https://cloud.google.com/vertex-ai/generative-ai/pricing",
         "why_no_rows": "Not recorded. The Vertex AI generative-ai pricing page (checked 2026-07-31) has no Anthropic section at all -- it covers Google's own models, CodeMender and grounding. The #claude-models anchor that Anthropic's docs link to no longer resolves to a Claude table. Re-check before assuming this is still true."
+      },
+      "unknown/unattributed": {
+        "operator": "unknown",
+        "official_pricing": null,
+        "why_no_rows": "Not a real surface. This is what an ingest uses when a row carries no provider metadata at all, so the surface was never stated and cannot be inferred. It used to default to anthropic/direct, which meant a proxy export fronting Bedrock or Vertex was priced at Anthropic first-party rates and published a reconciled-looking total no cloud bill would match -- the exact failure the rate scope exists to prevent, entering through the one door the scope could not see, because the surface it was checking had been fabricated from an absence. Pass --target-id to state the surface, or --effective-rate to price it from the bill."
       }
     },
     "how_to_price_these": "Supply the rate from the customer's own cloud invoice via --effective-rate / effective_rate=. That is the better number regardless: partner rates vary by region and endpoint type, Anthropic documents a 10% premium on regional and multi-region endpoints over global ones for Sonnet 4.5, Haiku 4.5, Opus 4.5 and later, and enterprises at this volume rarely pay list anyway.",

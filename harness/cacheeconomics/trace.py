@@ -30,6 +30,28 @@ from datetime import datetime, timezone
 from enum import Enum
 
 
+# Not every note is the same kind of thing. Most describe provenance -- which
+# records were read, which ids were normalised -- and can sit out of the way.
+# Some caveat a number that was published, and a caveat the reader never sees is
+# the same as no caveat.
+#
+# The phrase below used to be the only marker, and both renderers decided a
+# note's kind by searching for it. That made a rewording silently demote a
+# blocker to provenance, which a review called correctly: classification driven
+# by prose is not classification. It survives as wording that belongs in those
+# sentences anyway, but `blocking_notes` is what the renderers read.
+QUALIFIES_SPEND = "excluded from every dollar figure"
+
+
+def note_blocks_spend(text: str) -> bool:
+    """Does this note qualify a number that was published?
+
+    One predicate, used at the point a note is raised rather than at the point
+    it is rendered, so the decision is made by the code that knows why.
+    """
+    return QUALIFIES_SPEND in text
+
+
 class Tier(Enum):
     INSTRUMENTED = "instrumented"
     INFERRED = "inferred"
@@ -236,6 +258,9 @@ class TraceSet:
     alignment: float | None = None      # INFERRED only: 0..1 segmentation confidence
     source: str = ""
     notes: list[str] = field(default_factory=list)
+    # The subset of `notes` that qualifies a published figure. Recorded when the
+    # note is raised, not recovered from its wording afterwards.
+    blocking_notes: list[str] = field(default_factory=list)
     # Fraction of rows carrying prompt structure. 1.0 means every request can
     # take part in a counterfactual; anything less means some cannot, and the
     # difference has to be stated rather than averaged away.

@@ -84,3 +84,10 @@ Happy to open a PR for whichever you prefer.
 Harness and pinned sources available if you want to reproduce this. The measurement uses a synthetic text prefix on a controlled schedule, so it establishes the mechanism rather than what it's worth on browser-use's actual traffic.
 
 Filed by Tanisha Katara, CEO, KCG Consulting LLC.
+
+
+---
+
+## Line-number drift since filing
+
+Filed 2026-07-28 citing `chat.py:195-196`. As of 2026-08-03 upstream has those counters at lines 200-201. The claim is unchanged: the file still reads both `ephemeral_5m_input_tokens` and `ephemeral_1h_input_tokens`, and the serializer still never emits a 1h marker. But a maintainer opening line 195 today sees something else and stops reading, so the filed issue is worth a short correcting comment. `disclosure/verify_claims.py` now tracks 200/201.

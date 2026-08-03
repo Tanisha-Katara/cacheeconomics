@@ -557,3 +557,82 @@ class TestSegmentIdsAreScopedToTheTenant(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAnUnstatedSurfaceIsNotAnthropic(unittest.TestCase):
+    """A LiteLLM row with no provider field used to be priced as Anthropic.
+
+    The rate scope is default-deny and refuses to price a partner surface, but
+    it can only refuse a surface it is shown. `target_from_row` handed it
+    `anthropic/direct` manufactured out of an absence, so a proxy export
+    fronting Bedrock priced at first-party list and published a
+    reconciled-looking total no AWS bill would match.
+
+    That is the same defect the scope was built for, entering through the one
+    door the scope could not see. The guard was checking the answer rather than
+    where the answer came from.
+    """
+
+    def _rows(self, tmp, **extra):
+        p = os.path.join(tmp, "x.jsonl")
+        with open(p, "w") as f:
+            for i in range(30):
+                row = {"id": f"r{i}", "startTime": 1_780_000_000 + i * 60,
+                       "model": "claude-opus-5",
+                       "response": {"usage": {
+                           "prompt_tokens": 100000, "completion_tokens": 10,
+                           "prompt_tokens_details": {"cached_tokens": 0},
+                           "cache_creation_input_tokens": 0,
+                           "cache_read_input_tokens": 0}}}
+                row.update(extra)
+                f.write(json.dumps(row) + "\n")
+        return p
+
+    def test_no_provider_metadata_is_not_attributed_to_anthropic(self):
+        from cacheeconomics.adapters.litellm import load_litellm
+        from cacheeconomics.registry import UNATTRIBUTED
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_litellm(self._rows(tmp))
+            self.assertEqual({r.target_id for r in ts.requests}, {UNATTRIBUTED})
+
+    def test_and_therefore_publishes_no_dollar_figure(self):
+        from cacheeconomics.adapters.litellm import load_litellm
+        with tempfile.TemporaryDirectory() as tmp:
+            a = analyze(load_litellm(self._rows(tmp)), allow_unreconciled=True)
+            self.assertFalse(a.spend["input_usd"].released)
+
+    def test_the_reason_names_the_right_remedy(self):
+        """"Supply the rate from that bill" is the partner-surface remedy and
+        the wrong instruction here: this reader needs to state the surface, and
+        may well be on Anthropic direct."""
+        from cacheeconomics.adapters.litellm import load_litellm
+        with tempfile.TemporaryDirectory() as tmp:
+            a = analyze(load_litellm(self._rows(tmp)), allow_unreconciled=True)
+            why = a.spend["input_usd"].withheld_because
+            self.assertIn("--target-id", why)
+            self.assertNotIn("cloud provider", why)
+
+    def test_stating_the_surface_restores_the_figure(self):
+        """The refusal has to be escapable, or every LiteLLM export that simply
+        omits the field becomes unanalysable."""
+        from cacheeconomics.adapters.litellm import load_litellm
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_litellm(self._rows(tmp), default_target="anthropic/direct")
+            a = analyze(ts, allow_unreconciled=True)
+            self.assertTrue(a.spend["input_usd"].released)
+
+    def test_an_explicit_provider_is_still_honoured(self):
+        from cacheeconomics.adapters.litellm import load_litellm
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = load_litellm(self._rows(tmp, custom_llm_provider="bedrock"))
+            self.assertNotIn("anthropic/direct", {r.target_id for r in ts.requests})
+
+    def test_the_reason_reaches_the_default_report(self):
+        """A blocker folded behind --detail is a blocker the reader never sees."""
+        from cacheeconomics.adapters.litellm import load_litellm
+        from cacheeconomics.report import render_text
+        with tempfile.TemporaryDirectory() as tmp:
+            a = analyze(load_litellm(self._rows(tmp)), allow_unreconciled=True)
+            flat = " ".join(render_text(a).split())
+            self.assertIn("surface is unknown", flat)
+            self.assertIn("--target-id", flat)

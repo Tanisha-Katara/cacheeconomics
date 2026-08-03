@@ -3,6 +3,8 @@
 **Repo:** `crewAIInc/crewAI` · 56,569★ · MIT
 **Verified at:** `main`, 2026-08-03 · line numbers checked live by
 `disclosure/verify_claims.py`
+**Reproduction:** `python3 disclosure/verify_crewai_tokens.py` — no key, no
+network, no crewAI install
 **Status:** not yet filed
 
 ---
@@ -32,16 +34,19 @@ result: dict[str, Any] = {
 
 Anthropic's `usage.input_tokens` is the **uncached remainder**, not the input
 total. Measured against the API directly, one prompt, three consecutive calls,
-`claude-haiku-4-5`:
+`claude-haiku-4-5`, anthropic-sdk 0.120.2. Raw usage for every call is in
+[`tier-b/evidence/prompt-tokens-semantics.json`](https://github.com/Tanisha-Katara/cacheeconomics/blob/main/tier-b/evidence/prompt-tokens-semantics.json):
 
-| call | `input_tokens` | `cache_creation` | `cache_read` | actually sent |
-|---|---|---|---|---|
-| unmarked | 5,411 | 0 | 0 | 5,411 |
-| marked, cold | 9 | 5,402 | 0 | 5,411 |
-| marked, warm | 9 | 0 | 5,402 | 5,411 |
+| call | `input_tokens` | `cache_creation` | `cache_read` | `output` | sent |
+|---|---|---|---|---|---|
+| 1, unmarked | 17,111 | 0 | 0 | 4 | 17,115 |
+| 2, marked | 9 | 17,102 | 0 | 4 | 17,115 |
+| 3, marked | 9 | 0 | 17,102 | 8 | 17,119 |
 
-So on the third call `total_tokens` is `9 + 4 = 13` for a request that sent
-5,411 input tokens. The dict is then consumed by
+So on the third call `total_tokens` is `9 + 8 = 17` for a request that moved
+17,119 tokens — an understatement of about 1,000x, and 1,317x on the second.
+`verify_crewai_tokens.py` recomputes both columns straight from that artifact.
+The dict is then consumed by
 `base_llm.py:954-964` via `UsageMetrics.from_provider_dict`, which recomputes
 `total_tokens = prompt_tokens + completion_tokens` with `prompt_tokens` resolved
 from the `input_tokens` alias (`usage_metrics.py:127-129, 149`), so the
@@ -56,14 +61,18 @@ without touching the total (`base_token_process.py:25-26`), which is right and
 does not double-count.
 
 Same crew, same model, `is_litellm=True` versus the native provider
-(`llm.py:478`), and `total_tokens` differs by about 400x on a fully-cached call.
+(`llm.py:478`), and `total_tokens` differs by three orders of magnitude on a
+fully-cached call. The exact ratio is a property of the fixture, not of crewAI —
+it is set by how much of the prompt is cacheable. What generalises is the sign
+and the mechanism.
 
 ## How big in practice
 
-The 400x above is a near-100% cache hit and is the ceiling, not a typical run.
-For a realistic figure: across 14,375 requests of my own agent traffic, cache
-reads and writes were 97% of all input tokens. A `total_tokens` built this way
-would report about 3% of what was sent.
+Those ratios come from a near-100% cache hit on a deliberately large static
+prefix, which is the ceiling rather than a typical run. For a realistic figure:
+across 14,375 requests of my own agent traffic, cache reads and writes were 97%
+of all input tokens. A `total_tokens` built this way would report about 3% of
+what was sent.
 
 CrewAI reports tokens rather than dollars, so nothing here is a wrong invoice.
 It is a wrong denominator for anything computed from it — cost estimates
@@ -124,8 +133,14 @@ reason for the version above, but it is your call.
 
 ## Scope and caveats
 
-- Measured against Anthropic directly and through LiteLLM 1.83.9. Both runs are
-  reproducible with the snippet above; nothing here depends on my tooling.
+- Measured against Anthropic directly (sdk 0.120.2) and through LiteLLM 1.83.9,
+  recorded in the artifact linked above. `verify_crewai_tokens.py` recomputes
+  the claim from it with no key and no network, so nothing here has to be taken
+  on trust.
+- The measurement is of the Anthropic API's reporting, not of crewAI running.
+  I have not executed a crew end to end and watched `UsageMetrics`; the link
+  from those usage fields to `total_tokens` is read from source and traced
+  above. If you run one and see something different, I would want to know.
 - Line numbers are against `main` on 2026-08-03 and drift; `disclosure/verify_claims.py` re-checks them.
 - The Bedrock provider (`llms/providers/bedrock/completion.py:2071`) reads
   `usage.get("totalTokens", ...)`, which Bedrock populates itself, so it is

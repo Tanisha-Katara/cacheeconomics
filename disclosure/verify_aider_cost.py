@@ -6,17 +6,21 @@ token twice -- once at its cache rate, and again at the full input rate inside
 remainder. It is not. LiteLLM reports it as the total, cache included.
 
     python3 disclosure/verify_aider_cost.py           # arithmetic only
-    python3 disclosure/verify_aider_cost.py --live    # + one real API call
+    python3 disclosure/verify_aider_cost.py --live    # + THREE real API calls
 
 The arithmetic path takes no key, no network and no aider install, so a
-maintainer can run it in five seconds. `--live` re-establishes the premise
-against whatever LiteLLM is installed, and costs about a tenth of a cent.
+maintainer can run it in five seconds. `--live` makes three calls -- uncached,
+cache write, cache read -- because one call cannot show that `prompt_tokens`
+stays constant across them, which is the whole premise. Under a cent at
+claude-haiku-4-5 rates.
 
-Observed values below come from two independent runs recorded in
-`tier-b/evidence/litellm-marker-survival.json` (litellm 1.83.9, 2026-07-31,
-claude-haiku-4-5) and a re-run on 2026-08-03. Both show `prompt_tokens` holding
-constant across an uncached call, a cache write and a cache read, which is the
-whole premise.
+Every value in OBSERVED is read from
+`tier-b/evidence/prompt-tokens-semantics.json`, recorded 2026-08-03 against
+litellm 1.83.9 and anthropic 0.120.2, rather than transcribed by hand. An
+earlier version hard-coded numbers from a session that was never committed,
+which a review correctly called a reproducibility gap in a public disclosure.
+`tier-b/evidence/litellm-marker-survival.json` (2026-07-31) shows the same
+behaviour independently at a different prefix size.
 """
 
 import sys
@@ -46,14 +50,32 @@ def correct_cost(prompt_tokens, cache_write, cache_read, rate, hit_rate=0.0):
     return cache_write * rate * 1.25 + cache_read * rate * 0.10 + uncached * rate
 
 
-# (label, prompt_tokens, cache_creation, cache_read) as reported by litellm.
-OBSERVED = [
-    ("uncached",                5415,    0,    0),
-    ("cache write",             5415, 5402,    0),
-    ("cache read",              5415,    0, 5402),
-    # 2026-07-31 run, same shape at a different prefix size
-    ("cache read (31 Jul run)", 15635,   0, 15624),
-]
+def _observed():
+    """(label, prompt_tokens, cache_creation, cache_read), read from the
+    committed artifact so the numbers in this file cannot drift from the
+    evidence it cites."""
+    import json
+    import os
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    rows = []
+    for name, extra in (("prompt-tokens-semantics.json", ""),
+                        ("litellm-marker-survival.json", " (31 Jul run)")):
+        path = os.path.join(here, "tier-b", "evidence", name)
+        if not os.path.exists(path):
+            continue
+        for c in json.load(open(path))["calls"]:
+            if c.get("path") not in (None, "litellm"):
+                continue
+            u = c["usage"]
+            if "prompt_tokens" not in u:
+                continue
+            rows.append((c["tag"] + extra, u["prompt_tokens"],
+                         u.get("cache_creation_input_tokens", 0) or 0,
+                         u.get("cache_read_input_tokens", 0) or 0))
+    return rows
+
+
+OBSERVED = _observed()
 
 RATE = 1e-6            # claude-haiku-4-5 input, from litellm.model_cost
 
