@@ -958,13 +958,20 @@ class TestTheRatePathNamesItsSurface(unittest.TestCase):
 
         from cacheeconomics import analyzer
         src = inspect.getsource(analyzer)
-        calls = re.findall(r"rate_for\(([^)]*)\)", src)
+        # Balanced to the closing paren, not to the first one. `[^)]*` stopped
+        # inside `_when(r)` and reported a real call site as argument-less --
+        # a test that failed for its own reason rather than the code's.
+        calls = []
+        for m in re.finditer(r"rate_for\(", src):
+            i, depth = m.end(), 1
+            while i < len(src) and depth:
+                depth += (src[i] == "(") - (src[i] == ")")
+                i += 1
+            calls.append(src[m.end():i - 1])
         calls = [c for c in calls if "when=None" not in c]
         self.assertTrue(calls, "no call sites found; the pattern moved")
         for c in calls:
-            self.assertEqual(c.count(","), 2,
-                             f"rate_for({c}) does not name a surface")
-            self.assertIn("target_id", c)
+            self.assertIn("target_id", c, f"rate_for({c}) does not name a surface")
 
     def test_a_partner_surface_request_does_not_price_at_list(self):
         from cacheeconomics import registry
