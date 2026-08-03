@@ -466,6 +466,27 @@ class TestTargetAwareModelNormalization(unittest.TestCase):
         self.assertEqual(registry.min_cacheable_tokens(self.T, base), 4096)
 
 
+def _cell(text, label):
+    """Pull one table row out of the report, wrap and all.
+
+    The text report wraps its cells to a fixed width, so a row is a run of
+    lines rather than one line. `[l for l in ... if l.startswith(label)][0]`
+    read the first fragment only, which means an assertion about the rest of
+    the cell passed whatever the rest of the cell said -- and after the report
+    gained an indent it stopped matching at all.
+    """
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith(label):
+            cell = [line.strip()]
+            for nxt in lines[i + 1:]:
+                if not nxt.strip() or not nxt.startswith(" " * 25):
+                    break
+                cell.append(nxt.strip())
+            return " ".join(cell)
+    raise AssertionError(f"no {label!r} row in the report")
+
+
 class TestZeroInvoiceRenders(unittest.TestCase):
     """analyze() sets delta_pct to None for a zero invoice deliberately. Three
     copies of abs(delta_pct) lived in the renderers, and fixing two left the
@@ -509,8 +530,7 @@ class TestZeroInvoiceRenders(unittest.TestCase):
                                         (float("inf"), "not a finite number", "zero"),
                                         ("credit", "not a number", "zero")):
             with self.subTest(invoice=invoice):
-                line = [l for l in render_text(self._analysis(invoice)).splitlines()
-                        if l.startswith("reconciliation")][0]
+                line = _cell(render_text(self._analysis(invoice)), "reconciliation")
                 self.assertIn(expect, line)
                 self.assertIn("not attempted", line)
                 self.assertNotIn(forbid, line)
@@ -518,8 +538,7 @@ class TestZeroInvoiceRenders(unittest.TestCase):
 
     def test_a_valid_invoice_still_reports_the_percentage(self):
         from cacheeconomics.report import render_text
-        line = [l for l in render_text(self._analysis(5.0)).splitlines()
-                if l.startswith("reconciliation")][0]
+        line = _cell(render_text(self._analysis(5.0)), "reconciliation")
         self.assertIn("%", line)
         self.assertIn("the 5% gate", line)
 

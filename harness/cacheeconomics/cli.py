@@ -176,7 +176,7 @@ def cmd_analyze(args) -> int:
         out = report.render_html(a, client=args.client or "",
                                  window_label=args.window_label or "")
     else:
-        out = report.render_text(a)
+        out = report.render_text(a, detail=args.detail)
 
     if args.out:
         with open(args.out, "w") as f:
@@ -259,7 +259,7 @@ def cmd_claude_code(args) -> int:
                 effective_rate=args.effective_rate, on_date=args.on_date,
                 allow_unreconciled=args.allow_unreconciled)
     print(_coverage_line(ts), file=sys.stderr)
-    print(report.render_text(a))
+    print(report.render_text(a, detail=args.detail))
     return 0
 
 
@@ -341,6 +341,19 @@ def _pricing_args(p):
                         "abstains until you supply the rate off that bill")
 
 
+def _detail_arg(p):
+    """Both report commands, one definition.
+
+    The findings table is the short version of each finding. This turns the
+    reasoning back on. Defined here rather than twice because `analyze` and
+    `claude-code` render through the same function and a flag on only one of
+    them is the twin-path shape this codebase keeps getting bitten by.
+    """
+    p.add_argument("--detail", action="store_true",
+                   help="print the reasoning behind each finding, the counts "
+                        "it rests on, and what it excluded")
+
+
 def _release_args(p):
     p.add_argument("--invoice-usd", type=float, metavar="USD",
                    help="the provider invoice for this window. Dollar figures "
@@ -367,6 +380,7 @@ def build_parser() -> argparse.ArgumentParser:
     _ingest_args(a)
     _pricing_args(a)
     _release_args(a)
+    _detail_arg(a)
     a.add_argument("--format", default="text", choices=("text", "html", "json"))
     a.add_argument("--out", metavar="PATH", help="write here instead of stdout")
     a.add_argument("--client", help="client name, for the HTML header")
@@ -413,6 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
     cc.add_argument("--limit", type=int, help="most recent N sessions only")
     _pricing_args(cc)
     _release_args(cc)
+    _detail_arg(cc)
     cc.set_defaults(func=cmd_claude_code)
 
     r = sub.add_parser("registry", help="what the registry knows")

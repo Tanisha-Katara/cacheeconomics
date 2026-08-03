@@ -1701,11 +1701,14 @@ class TestBothRenderersSayWhatToDo(unittest.TestCase):
         from cacheeconomics.report import render_html, render_text
         a = self._analysis()
         html, text = render_html(a), render_text(a)
+        # Normalised: both renderers wrap, so a fix that survives intact still
+        # fails a raw substring check the moment it crosses a wrap point.
+        flat_text, flat_html = " ".join(text.split()), " ".join(html.split())
         missing = [f.code for f in a.findings
-                   if f.fix and f.fix[:40] not in text]
+                   if f.fix and " ".join(f.fix.split())[:40] not in flat_text]
         self.assertEqual(missing, [], "findings whose remedy the text report drops")
         missing_html = [f.code for f in a.findings
-                        if f.fix and f.fix[:40] not in html]
+                        if f.fix and " ".join(f.fix.split())[:40] not in flat_html]
         self.assertEqual(missing_html, [], "findings whose remedy the HTML report drops")
 
     def test_a_first_run_says_what_to_run_next(self):
@@ -1715,7 +1718,7 @@ class TestBothRenderersSayWhatToDo(unittest.TestCase):
         a = self._analysis()
         steps = _next_steps(a)
         self.assertTrue(steps, "no next steps offered")
-        self.assertIn("next:", render_text(a))
+        self.assertIn("what to do next", render_text(a))
 
     def test_the_steps_name_real_flags(self):
         """A step telling someone to pass a flag that does not exist is worse
@@ -1727,6 +1730,7 @@ class TestBothRenderersSayWhatToDo(unittest.TestCase):
         p = argparse.ArgumentParser()
         cli._ingest_args(p)
         cli._pricing_args(p)
+        cli._detail_arg(p)
         p.add_argument("--invoice-usd", type=float)
         p.add_argument("--allow-unreconciled", action="store_true")
         known = {s for a_ in p._actions for s in a_.option_strings}
@@ -1735,3 +1739,84 @@ class TestBothRenderersSayWhatToDo(unittest.TestCase):
                 flag = word.strip(".,'\"")
                 if flag.startswith("--"):
                     self.assertIn(flag, known, f"step names unknown flag {flag}")
+
+
+class TestTheShortVersionLosesNothing(unittest.TestCase):
+    """The findings table is the short version of each finding.
+
+    That is a real reduction: on a live run the default output dropped from
+    five screens of prose to one table. The risk it introduces is that the
+    reasoning becomes unreachable rather than merely folded away, which would
+    turn a readability fix into a disclosure regression.
+    """
+
+    def _analysis(self):
+        segs = [Segment(id="vol", role="system", tokens=400, index=0),
+                Segment(id="tools", role="tools", tokens=30000, index=1,
+                        cache_marked=True, ttl="5m"),
+                Segment(id="turn", role="user", tokens=200, index=2)]
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
+                        model="claude-opus-5", agent="a", session="s",
+                        ttl_requested="5m",
+                        usage={"input_tokens": 200, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 30400},
+                        segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
+                                  for s in segs])
+                for i in range(40)]
+        return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"),
+                       allow_unreconciled=True)
+
+    def test_detail_carries_every_finding_s_reasoning(self):
+        from cacheeconomics.report import render_text
+        a = self._analysis()
+        flat = " ".join(render_text(a, detail=True).split())
+        missing = [f.code for f in a.findings
+                   if " ".join(f.detail.split())[:60] not in flat]
+        self.assertEqual(missing, [], "--detail drops a finding's reasoning")
+
+    def test_the_default_says_how_to_reach_it(self):
+        """Folded away is fine. Folded away silently is not: a reader who cannot
+        see the reasoning and is not told it exists has no way to audit a
+        number, which is the whole premise of this report."""
+        from cacheeconomics.report import render_text
+        out = render_text(self._analysis())
+        self.assertIn("--detail", out)
+
+    def test_the_default_is_actually_shorter(self):
+        from cacheeconomics.report import render_text
+        a = self._analysis()
+        brief, full = render_text(a), render_text(a, detail=True)
+        self.assertLess(len(brief), len(full),
+                        "--detail added nothing, so the default hid nothing")
+
+    def test_the_money_column_never_shows_a_number_the_gate_withheld(self):
+        """The table is a new surface for a figure to escape through. It reads
+        each Figure's own release state, so this checks the wiring rather than
+        restating the gate: same trace, no `allow_unreconciled`, no amounts."""
+        import re
+
+        from cacheeconomics.report import render_text
+        released = self._analysis()
+        self.assertRegex(render_text(released), r"~\$[\d,]+/mo",
+                         "fixture produces no amounts, so the check is vacuous")
+
+        gated = self._gated()
+        self.assertFalse(any(f.avoidable_usd_month and f.avoidable_usd_month.released
+                             for f in gated.findings))
+        self.assertIsNone(re.search(r"~\$[\d,]+/mo", render_text(gated)))
+
+    def _gated(self):
+        """The same analysis with the gate left on."""
+        segs = [Segment(id="vol", role="system", tokens=400, index=0),
+                Segment(id="tools", role="tools", tokens=30000, index=1,
+                        cache_marked=True, ttl="5m"),
+                Segment(id="turn", role="user", tokens=200, index=2)]
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
+                        model="claude-opus-5", agent="a", session="s",
+                        ttl_requested="5m",
+                        usage={"input_tokens": 200, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 30400},
+                        segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
+                                  for s in segs])
+                for i in range(40)]
+        return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"))

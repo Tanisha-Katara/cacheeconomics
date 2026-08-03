@@ -124,13 +124,19 @@ class TestFiguresStayWithheldByDefault(unittest.TestCase):
         code, out, _err = run("analyze", FIXTURE)
         self.assertEqual(code, 0)
         self.assertIn("FIGURES WITHHELD", out)
-        self.assertIn("[figure withheld]", out)
+        # Per-finding, not just the banner. The money column reads "withheld"
+        # where a figure exists and has not been released; the banner alone
+        # would still be printed if a single row leaked its number.
+        self.assertIn("withheld", out)
         self.assertNotRegex(out, r"~\$[\d,]+/mo")
 
     def test_the_draft_flag_is_what_releases_them(self):
         code, out, _err = run("analyze", FIXTURE, "--allow-unreconciled")
         self.assertEqual(code, 0)
-        self.assertNotIn("[figure withheld]", out)
+        # `[figure withheld]` no longer appears anywhere, so asserting its
+        # absence had stopped testing anything. The claim is that the released
+        # run prints amounts and no row still reads as withheld.
+        self.assertNotRegex(out, r"\bwithheld\b\s{2,}")
         self.assertRegex(out, r"~\$[\d,.]+/mo")
 
     def test_json_output_serialises_a_withheld_figure_as_text(self):
@@ -149,7 +155,12 @@ class TestTheSubcommandsRun(unittest.TestCase):
     def test_analyze_text(self):
         code, out, _err = run("analyze", FIXTURE, "--allow-unreconciled")
         self.assertEqual(code, 0)
-        self.assertIn("ingest tier", out)
+        # The sections a reader walks through, in order. `ingest tier` was the
+        # old label for what section 1 now calls depth.
+        for label in ("what I read", "how your caching is doing",
+                      "what it is costing you", "what to do next",
+                      "depth", "prefix efficiency"):
+            self.assertIn(label, out)
         # The header is padded to its longest label; it used to render
         # "prefix efficiency17%" with no gap.
         self.assertNotRegex(out, r"prefix efficiency\d")

@@ -11,6 +11,7 @@ than printed with a caveat underneath.
 from __future__ import annotations
 
 import html
+import textwrap
 from datetime import datetime, timezone
 
 from .analyzer import Analysis
@@ -357,6 +358,74 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
     return "\n".join(parts)
 
 
+_WIDTH = 78
+
+# What the four prices are, in words, before any of them is used. Somebody
+# running this for the first time has no reason to know that "cache read" is a
+# billing class rather than an event, and every number below is a ratio between
+# these four. Stated once, at the top, so nothing after it has to explain itself.
+_PRIMER = (
+    "Your provider charges four different prices for the same token. Sending "
+    "text fresh costs 1x. Reading it back out of the cache costs 0.1x. Putting "
+    "it into the cache costs 1.25x, or 2x for the version that survives an "
+    "hour. Your bill adds all four together and shows you one number called "
+    "\"input tokens\".",
+    "This pulls that number back apart, from logs you already have, and tells "
+    "you which of the four you have been buying.",
+)
+
+
+def _fill(text: str, width: int) -> list:
+    # break_on_hyphens off, break_long_words off: the default settings split
+    # `--allow-unreconciled` across two lines at the hyphen, so the report's own
+    # instructions could not be copied out of it.
+    return textwrap.wrap(str(text), width=max(8, width),
+                         break_on_hyphens=False, break_long_words=False) or [""]
+
+
+def _wrap(text: str, width: int, indent: str = "") -> list:
+    return [indent + line for line in _fill(text, width - len(indent))]
+
+
+def _rule(n: int, title: str, width: int = _WIDTH) -> list:
+    head = f"── {n} · {title} "
+    return ["", head + "─" * max(0, width - len(head)), ""]
+
+
+def _cols(rows: list, widths: list, indent: str = "  ") -> list:
+    """One table, last column wrapped and hung under itself.
+
+    Written by hand rather than pulled in from anywhere: this package has no
+    dependencies and a test asserts it, and a table is not worth breaking that
+    for.
+    """
+    out = []
+    for row in rows:
+        head, tail = row[:-1], row[-1]
+        stem = indent + "".join(f"{c:<{w}}" for c, w in zip(head, widths[:-1]))
+        lines = _fill(tail, widths[-1])
+        out.append(stem + lines[0])
+        pad = " " * len(stem)
+        out.extend(pad + line for line in lines[1:])
+    return out
+
+
+def _impact(f) -> str:
+    """The money column, in words a first-time reader can act on.
+
+    "[figure withheld]" is accurate and tells somebody who has never seen this
+    tool anything at all. The two reasons a row carries no number are different
+    and have different remedies, so they read differently and the legend under
+    the table says which is which.
+    """
+    fig = f.avoidable_usd_month
+    if fig is None:
+        return "not costed"
+    if fig.released:
+        return f"~${fig:,.0f}/mo"
+    return "withheld"
+
+
 def _headline(a: Analysis) -> str:
     """One plain sentence saying how the cache is doing, before any percentage.
 
@@ -384,35 +453,66 @@ def _headline(a: Analysis) -> str:
             f"written tokens are paid for at a premium and then thrown away.")
 
 
-def render_text(a: Analysis) -> str:
+def render_text(a: Analysis, *, detail: bool = False) -> str:
     """The same gate as the HTML report, because the text one forwards just as easily.
 
     These two renderers diverged once: HTML withheld dollars on a failed
     reconciliation while text printed them through Finding.__str__ and then
     totalled them. A number that survives in either renderer has escaped the
     gate, and the text output is the one that ends up pasted into an email.
+
+    Laid out as a sequence someone can read top to bottom: what the four prices
+    are, what was read, how the cache is doing, what it is costing, what to do.
+    It used to open on four unlabelled values and then print every finding as a
+    150-word paragraph, which on a real run is five screens of prose with the
+    two actionable lines buried inside it.
+
+    `detail=False` keeps the reasoning behind the table. Nothing is lost -- the
+    same strings render with `--detail`, and the HTML report has room and always
+    carries them.
     """
     # The gate is whatever the figures themselves say. Recomputing it from the
     # reconciliation dict is how these two renderers disagreed in the first
     # place, and it also reads a missing invoice as a pass.
     gate_ok = a.total_avoidable_month.released or a.spend.get("input_usd") is not None \
         and a.spend["input_usd"].released
-    # Padded to the longest label rather than hand-spaced. "prefix efficiency"
-    # is exactly as wide as the hand-written column, so it rendered as
-    # "prefix efficiency17%" with no gap at all.
-    _w = len("prefix efficiency") + 1
-    # Two bare percentages with no gloss, which is what this printed for a long
-    # time, are two numbers nobody can act on. The reader has to already know
-    # that a high `input from cache` is not itself good news.
-    _v = 8
-    out = [_headline(a), "",
-           f"{'ingest tier':<{_w}}{a.tier}",
-           f"{'coverage':<{_w}}{a.coverage['analysed']}/{a.coverage['total']} "
-           f"({_pct(a.coverage['fraction'])})",
-           f"{'input from cache':<{_w}}{_pct(a.ratios['input_from_cache']):<{_v}}"
-           f"share of input billed at the cheap read rate",
-           f"{'prefix efficiency':<{_w}}{_pct(a.ratios['prefix_efficiency']):<{_v}}"
-           f"of every token written to cache, the share later read"]
+
+    out = ["", "  cacheeconomics · what your prompt caching actually costs",
+           "  " + "─" * (_WIDTH - 2)]
+    for para in _PRIMER:
+        out += [""] + _wrap(para, _WIDTH, "  ")
+
+    out += _rule(1, "what I read")
+    reqs = a.ratios.get("requests") or a.coverage.get("total") or 0
+    span = f" over {a.window_days:.0f} days" if a.window_days else ""
+    out += _cols([
+        ("volume", f"{reqs:,} requests{span}"),
+        ("could be read", f"{a.coverage['analysed']:,} of {a.coverage['total']:,} "
+                          f"({_pct(a.coverage['fraction'])})"),
+        ("depth", {Tier.USAGE_ONLY: "token counts only. Enough for spend and "
+                                    "cadence; the prompts themselves are not here, "
+                                    "so nothing can say which *part* of a prompt "
+                                    "costs you",
+                   }.get(a.tier, f"{a.tier} — prompt structure is available, so "
+                                 f"findings can name the part of the prompt at "
+                                 f"fault")),
+        ("privacy", "read on this machine. Nothing was sent anywhere"),
+    ], [16, _WIDTH - 18])
+
+    out += _rule(2, "how your caching is doing")
+    out += _wrap(_headline(a), _WIDTH, "  ") + [""]
+    out += _cols([("measure", "value", "in plain english"),
+                  ("─" * 19, "─" * 6, "─" * 48)],
+                 [20, 8, _WIDTH - 30])
+    out += _cols([
+        ("input from cache", _pct(a.ratios["input_from_cache"]),
+         "of everything you sent, the share billed at the cheap 0.1x read rate "
+         "instead of full price"),
+        ("prefix efficiency", _pct(a.ratios["prefix_efficiency"]),
+         "of every token you paid to put into cache, the share something read "
+         "back before it expired. This is the one that says whether caching is "
+         "working"),
+    ], [20, 8, _WIDTH - 30])
     if a.reconciliation:
         r = a.reconciliation
         pct = r.get("delta_pct")
@@ -430,12 +530,19 @@ def render_text(a: Analysis) -> str:
                                   f"({r.get('invoice_usd')})",
                       "not-finite": "the invoice supplied is not a finite number",
                       }.get(invalid, "the invoice supplied is not a number")
-            out.append(f"reconciliation   not attempted: {reason}")
+            out += _cols([("reconciliation", "—",
+                           f"not attempted: {reason}")], [20, 8, _WIDTH - 30])
         else:
-            out.append(f"reconciliation   "
-                       + (f"{abs(pct):.1f}% " if pct is not None
-                          else "no difference could be computed, ")
-                       + f"({'within' if gate_ok else 'OUTSIDE'} the 5% gate)")
+            out += _cols([("reconciliation",
+                           f"{abs(pct):.1f}%" if pct is not None else "—",
+                           ("the gap between what this priced and the invoice you "
+                            "gave it. " if pct is not None
+                            else "no difference could be computed. ")
+                           + ("Inside the 5% gate, so the dollar figures below are "
+                              "published" if gate_ok else
+                              "Outside the 5% gate, so no dollar figure is "
+                              "published"))],
+                         [20, 8, _WIDTH - 30])
         if r.get("unpriced_requests"):
             # Broken out by cause. One label for three different exclusions told
             # an operator to go hunting for cache lifetimes when the row was
@@ -449,38 +556,91 @@ def render_text(a: Analysis) -> str:
                 (b.get("skipped_rows", 0), "the loader could not read"),
                 (b.get("no_usage", 0), "carrying no usage fields"),
                 (b.get("failed_but_billed", 0), "that failed but still billed")) if n]
-            out.append("unpriced         " + (
-                "; ".join(parts) if parts
-                else f"{r['unpriced_requests']} request(s)"))
-    out.append("")
+            out += _cols([("unpriced", f"{r['unpriced_requests']:,}",
+                           ("requests this could not price: "
+                            + "; ".join(parts)) if parts
+                           else "requests this could not price")],
+                         [20, 8, _WIDTH - 30])
+
+    n = len(a.findings)
+    out += _rule(3, f"what it is costing you — {n} finding{'' if n == 1 else 's'}, "
+                    f"worst first" if n else "what it is costing you")
     if not gate_ok:
         # Say which reason. "Insufficient reconciliation" was printed even when
         # the real cause was that no invoice existed at all, which sends the
         # reader to fix the wrong thing.
         why = (a.spend["input_usd"].withheld_because
                if a.spend.get("input_usd") is not None else "not reconciled")
-        out.append(f"FIGURES WITHHELD — {why}.")
-        out.append("Findings below are structural only. No dollar figure is published.")
+        # The literal marker stays. It is what a reader greps for before
+        # forwarding a report, and three tests treat it as the signal that no
+        # number escaped, so burying it inside a friendlier sentence would have
+        # removed the thing that makes the sentence trustworthy.
+        out += _wrap(f"FIGURES WITHHELD — {why}.", _WIDTH, "  ")
         out.append("")
-    for f in a.findings:
-        out.append(f.describe())
+        out += _wrap("The findings themselves still stand. This is a rule about "
+                     "publishing money, not a doubt about the analysis. Step 1 "
+                     "at the end turns the numbers on.", _WIDTH, "  ")
+        out.append("")
+    if not a.findings:
+        out += _wrap("Nothing to act on. No rule here fired on this data.",
+                     _WIDTH, "  ")
+    # Cost before title, deliberately. The first question anybody brings to this
+    # is "where is the money going", so the money column sits where the eye
+    # lands rather than at the far right of a wrapped title.
+    _c = [4, 10, 15, _WIDTH - 33]
+    out += _cols([("#", "severity", "what it costs", "what is happening"),
+                  ("─" * 3, "─" * 9, "─" * 14, "─" * (_c[3] - 1))], _c)
+    for i, f in enumerate(a.findings, 1):
+        out += _cols([(str(i), f.severity.upper(), _impact(f), f.title)], _c)
+        if f.fix:
+            out += _cols([("", "do this", f.fix)], [4, 10, _WIDTH - 16])
+        if detail:
+            out += _cols([("", "why", f.detail)], [4, 10, _WIDTH - 16])
+        out += _cols([("", "basis", f"{f.code} · {f.evidence_class} · confidence "
+                                    f"{f.confidence} · quality risk "
+                                    f"{f.quality_risk}")], [4, 10, _WIDTH - 16])
         out.append("")
     if a.total_avoidable_month.released:
-        out.append(f"total avoidable  ~${a.total_avoidable_month:,.0f}/month (modeled, pessimistic)")
+        out += _cols([("", "TOTAL", f"~${a.total_avoidable_month:,.0f}/month, "
+                                    f"modeled and deliberately pessimistic")],
+                     [4, 10, _WIDTH - 16])
+        out.append("")
+    # The two blanks in the cost column mean different things and have different
+    # remedies. Printed only where they appear, so this is a legend rather than
+    # boilerplate.
+    legend = []
+    if any(f.avoidable_usd_month is None for f in a.findings):
+        legend.append("'not costed' — this rule names a mechanism and does not "
+                      "produce a dollar amount at this depth. Section 1 says "
+                      "what depth you gave it.")
+    if any(f.avoidable_usd_month is not None and not f.avoidable_usd_month.released
+           for f in a.findings):
+        legend.append("'withheld' — a figure exists and has not passed the "
+                      "reconciliation gate. Step 1 below releases it.")
+    for line in legend:
+        out += _wrap(line, _WIDTH, "  ")
+    if not detail and a.findings:
+        out.append("")
+        out += _wrap("Every row above is the short version. Re-run with "
+                     "--detail for the reasoning behind each one, the counts, "
+                     "and what was excluded from them.", _WIDTH, "  ")
+
+    steps = _next_steps(a)
+    if steps:
+        out += _rule(4, "what to do next")
+        for i, step in enumerate(steps, 1):
+            out += _cols([(f"{i}.", step)], [4, _WIDTH - 6])
+            out.append("")
+
     # Notes carry the coverage facts -- unpriced writes, partial structure,
     # draft status. HTML printed them and text did not, so the same analysis
     # disclosed different things depending on which renderer someone forwarded.
     if a.notes:
-        out.append("")
+        out += _rule(5, "the fine print — what this is based on, and what it "
+                        "could not see")
         for n in a.notes:
-            out.append(f"note: {n}")
-
-    steps = _next_steps(a)
-    if steps:
-        out.append("")
-        out.append("next:")
-        for i, step in enumerate(steps, 1):
-            out.append(f"  {i}. {step}")
+            out += _cols([("·", n)], [4, _WIDTH - 6])
+    out.append("")
     return "\n".join(out)
 
 
@@ -528,9 +688,10 @@ def _next_steps(a: Analysis) -> list:
     acted = [f for f in a.findings if f.fix and f.severity in ("high", "medium")]
     if acted:
         top = acted[0]
-        steps.append(f"Act on {top.code} first. It is the highest-severity "
-                     f"finding here and the 'do this' line under it is the "
-                     f"change; the detail above it is why.")
+        steps.append(f"Act on {top.code} first ({top.title.lower()}). It is the "
+                     f"highest-severity finding here, and the 'do this' line in "
+                     f"its row is the change to make. Re-run with --detail for "
+                     f"the reasoning behind it.")
     elif a.findings:
         steps.append("Nothing here is high severity. The findings above are "
                      "measurements rather than problems.")

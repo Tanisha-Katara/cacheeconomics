@@ -312,9 +312,21 @@ class TestTextReportHonoursTheGate(unittest.TestCase):
         self.assertFalse(a.reconciliation["within_ship_gate"])
         out = render_text(a)
         self.assertIn("FIGURES WITHHELD", out)
-        self.assertIn("outside the ±5% gate", out, "the banner names the real reason")
+        # Normalised: the report wraps to a fixed width, so a phrase that spans
+        # the wrap point is present and still fails a raw substring check.
+        self.assertIn("outside the ±5% gate", " ".join(out.split()),
+                      "the banner names the real reason")
         self.assertNotIn("$", out, "no dollar figure may appear anywhere")
-        self.assertIn("[figure withheld]", out, "withholding is visible, not silent")
+        # Visible per finding, not only in the banner. The literal moved from
+        # "[figure withheld]" into the report's money column; the claim it
+        # guards is that a reader can see *which* rows are missing a number,
+        # which a banner on its own does not tell them.
+        self.assertIn("withheld", out, "withholding is visible, not silent")
+        self.assertEqual(
+            sum(1 for f in a.findings
+                if f.avoidable_usd_month and not f.avoidable_usd_month.released),
+            out.count("withheld  "),
+            "every unreleased finding says so in its own row")
         self.assertNotIn("total avoidable", out)
 
     def test_a_correct_invoice_publishes(self):

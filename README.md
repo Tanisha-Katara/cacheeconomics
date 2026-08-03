@@ -24,57 +24,130 @@ pip install cacheeconomics
 cacheeconomics claude-code
 ```
 
-Nothing to instrument, no API key, nothing leaves the machine. Here is what it
-said about my own history, from 190 transcripts and 14,274 requests, trimmed to
-fit:
+Nothing to instrument, no API key, nothing leaves the machine. This is what it
+said about my own history, from 190 transcripts and 14,362 requests. Sections 1
+and 5 are trimmed here; everything else is verbatim:
 
 ```
-Caching is working: most of what gets written to cache is read back before it expires.
+  cacheeconomics · what your prompt caching actually costs
+  ────────────────────────────────────────────────────────────────────────────
 
-ingest tier       usage_only
-coverage          14274/14274 (100%)
-input from cache  97%     share of input billed at the cheap read rate
-prefix efficiency 97%     of every token written to cache, the share later read
+  Your provider charges four different prices for the same token. Sending text
+  fresh costs 1x. Reading it back out of the cache costs 0.1x. Putting it into
+  the cache costs 1.25x, or 2x for the version that survives an hour. Your
+  bill adds all four together and shows you one number called "input tokens".
 
-FIGURES WITHHELD — no invoice was supplied, so nothing here has been reconciled
-against money actually spent.
+  This pulls that number back apart, from logs you already have, and tells you
+  which of the four you have been buying.
 
-[MEDIUM] SPL-1 Sessions switching model mid-conversation
-    4 sessions used more than one model. Caches are per-model, so the accumulated
-    prefix does not carry across the switch and is written again from cold.
-    do this: Keep a session on one model. Where a cheaper model is wanted for a
-    sub-task, run it as a separate call rather than switching the main loop.
-    evidence: measured · confidence: high · quality risk: medium
+── 1 · what I read ───────────────────────────────────────────────────────────
 
-[MEDIUM] REB-1 The cached prefix is being rebuilt, not extended
-    530 of 14,187 in-session turns rewrote at least half the prefix they had
-    already established, about one every 27 turns, covering 99,267,034 written
-    tokens. Extending a prefix writes only what was added and reads the rest at
-    0.1x. A rebuild writes the lot again at 1.25x or 2x. 528 of them have no
-    innocent explanation, so something is changing the prefix itself. Context
-    compaction, a rotating identifier and reordered tool definitions are what
-    this usually turns out to be.
-    do this: Find what changes the prefix between turns before touching a TTL.
-    evidence: measured · confidence: high · quality risk: low
+  volume          14,362 requests over 31 days
+  could be read   14,362 of 14,362 (100%)
+  depth           token counts only. Enough for spend and cadence; the prompts
+                  themselves are not here, so nothing can say which *part* of
+                  a prompt costs you
+  privacy         read on this machine. Nothing was sent anywhere
 
-  ... plus 2 more findings and 5 notes
+── 2 · how your caching is doing ─────────────────────────────────────────────
 
-next:
-  1. Get a dollar figure: re-run with --invoice-usd <amount> from the provider
-     bill covering this window.
-  2. Or, for an internal look before the bill arrives: add --allow-unreconciled.
-  3. Reach the structural findings: export request bodies from your gateway and
-     re-run with --from bodies.
-  4. Act on SPL-1 first.
+  Caching is working: most of what gets written to cache is read back before
+  it expires.
+
+  measure             value   in plain english
+  ─────────────────── ──────  ────────────────────────────────────────────────
+  input from cache    97%     of everything you sent, the share billed at the
+                              cheap 0.1x read rate instead of full price
+  prefix efficiency   97%     of every token you paid to put into cache, the
+                              share something read back before it expired.
+                              This is the one that says whether caching is
+                              working
+
+── 3 · what it is costing you — 3 findings, worst first ──────────────────────
+
+  FIGURES WITHHELD — no invoice was supplied, so nothing here has been
+  reconciled against money actually spent.
+
+  The findings themselves still stand. This is a rule about publishing money,
+  not a doubt about the analysis. Step 1 at the end turns the numbers on.
+
+  #   severity  what it costs  what is happening
+  ─── ───────── ────────────── ────────────────────────────────────────────
+  1   MEDIUM    not costed     Sessions switching model mid-conversation
+      do this   Keep a session on one model. Where a cheaper model is wanted
+                for a sub-task, run it as a separate call rather than
+                switching the main loop.
+      basis     SPL-1 · measured · confidence high · quality risk medium
+
+  2   MEDIUM    not costed     The cached prefix is being rebuilt, not
+                               extended
+      do this   Find what changes the prefix between turns before touching a
+                TTL. Compaction in particular trades a smaller prompt for a
+                full rewrite, and immediately after it every read you were
+                getting at 0.1x is rebought at 1.25x.
+      basis     REB-1 · measured · confidence high · quality risk low
+
+  3   LOW       not costed     Caching is paying for itself
+      do this   No action indicated on this measure. If the bill is still too
+                high, the driver is input volume rather than cache
+                configuration, and the questions are prompt size and turn
+                count.
+      basis     CAC-1 · measured · confidence high · quality risk low
+
+  'not costed' — this rule names a mechanism and does not produce a dollar
+  amount at this depth. Section 1 says what depth you gave it.
+
+  Every row above is the short version. Re-run with --detail for the reasoning
+  behind each one, the counts, and what was excluded from them.
+
+── 4 · what to do next ───────────────────────────────────────────────────────
+
+  1.  Get a dollar figure: re-run with --invoice-usd <amount> from the
+      provider bill covering this window. Every number stays hidden until it
+      reconciles to within 5% of money that actually left an account.
+
+  2.  Or, for an internal look before the bill arrives: add
+      --allow-unreconciled. It releases the figures and stamps the report
+      DRAFT, which is not something to forward.
+
+  3.  Reach the structural findings: this input carries usage counters but not
+      prompt structure, so nothing here can say *which part* of the prompt
+      costs you. Export request bodies from your gateway and re-run with
+      --from bodies, or point the agent at tier-b/capture_proxy.py if you
+      cannot export.
+
+  4.  Act on SPL-1 first (sessions switching model mid-conversation). It is
+      the highest-severity finding here, and the 'do this' line in its row is
+      the change to make. Re-run with --detail for the reasoning behind it.
+
+── 5 · the fine print — what this is based on, and what it could not see ─────
+
+  ·   14,362 assistant turns from 43 sessions across 190 transcripts. Each is
+      one billed request.
+  ·   Transcripts record the conversation, not the wire request. The system
+      prompt and tool definitions are absent, so prefix structure cannot be
+      recovered and no counterfactual is derivable.
 ```
 
-Every report ends with a numbered `next:` block that reads the run it just did.
-You should never have to guess what to type after this.
+It always closes on numbered next steps chosen from what that particular run
+could not do, so you never have to guess what to type after it. `--detail` puts
+the reasoning back under each row.
 
-Add your invoice and the dollars appear:
+Give it your invoice and the money column fills in:
 
 ```bash
 cacheeconomics claude-code --invoice-usd 4820.16
+```
+
+```
+  #   severity  what it costs  what is happening
+  ─── ───────── ────────────── ────────────────────────────────────────────
+  1   HIGH      ~$214/mo       'research-agent' request cadence sits inside
+                               the one-hour window
+      do this   Set a one-hour TTL on the static prefix for this agent.
+                Outside the five-minute-to-one-hour band the five-minute
+                default is cheaper, so this is not a blanket change.
+      basis     TTL-1 · modeled · confidence medium · quality risk low
 ```
 
 ## What the clock does to your bill

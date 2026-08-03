@@ -77,6 +77,10 @@ class TestBundleIsCurrent(unittest.TestCase):
             "__future__", "collections", "copy", "dataclasses", "datetime",
             "enum", "statistics", "hashlib", "hmac", "html", "inspect", "json",
             "os", "re", "threading", "typing", "math", "itertools", "functools",
+            # Pure Python in CPython's Lib/, no extension module behind it, so
+            # Pyodide ships it. The bar for this list is "no native dependency",
+            # not "already on the list".
+            "textwrap",
         }
         for path, src in self._built().sources().items():
             if not path.endswith(".py"):
