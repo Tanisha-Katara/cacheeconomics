@@ -33,6 +33,8 @@ duplication, they make drift fail loudly the moment it happens.
 """
 
 import os
+import tempfile
+import json
 import sys
 import unittest
 from dataclasses import replace
@@ -2528,3 +2530,84 @@ class TestTheRuntimeAndTheReportAgreePerFindingCode(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestBothLoadersMeasureCoverageInMoney(unittest.TestCase):
+    """`tokens_counted` decides whether structural dollars are published, and
+    the two loaders computed it differently.
+
+    `load_jsonl` weights by billed input tokens and carries the reasoning:
+    ninety-nine tiny counted rows beside one huge uncounted one is 99% of rows
+    and can be 0.02% of the spend. `load_bodies` divided counted rows by
+    segmented rows, so a bodies export whose dominant cost was never counted
+    reported near-perfect coverage and released money resting on a byte-share
+    estimate -- which measures 19.2% off at the median.
+
+    The lesson was learned in one loader and never reached the other. Both call
+    `trace.counted_share` now; these pin that they answer alike.
+    """
+
+    KEY = b"k" * 32
+
+    @staticmethod
+    def _body(n):
+        return {"model": "claude-opus-5",
+                "system": [{"type": "text", "text": "x" * n}],
+                "messages": [{"role": "user", "content": "hi"}]}
+
+    def _write(self, rows):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("\n".join(json.dumps(r) for r in rows))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _bodies(self, big_counted):
+        rows = [{"request": self._body(40),
+                 "response": {"usage": {"input_tokens": 10}},
+                 "segment_tokens": [5, 5]} for _ in range(99)]
+        big = {"request": self._body(400_000),
+               "response": {"usage": {"input_tokens": 1_000_000}}}
+        if big_counted:
+            big["segment_tokens"] = [500_000, 500_000]
+        rows.append(big)
+        from cacheeconomics.adapters.bodies import load_bodies
+        return load_bodies(self._write(rows), self.KEY,
+                           target_id="anthropic/direct").tokens_counted
+
+    def _jsonl(self, big_counted):
+        def row(i, tokens, counted):
+            return {"request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i % 60:02d}:00Z",
+                    "model": "claude-opus-5", "session": "s",
+                    "target_id": "anthropic/direct",
+                    "usage": {"input_tokens": tokens},
+                    "tokens_counted": counted,
+                    "segments": [{"id": "hmac:" + "a" * 64, "role": "system",
+                                  "tokens": tokens, "index": 0,
+                                  "cache_marked": False, "ttl": None}]}
+        rows = [row(i, 10, True) for i in range(99)]
+        rows.append(row(99, 1_000_000, big_counted))
+        from cacheeconomics.trace import load_jsonl
+        return load_jsonl(self._write(rows), self.KEY).tokens_counted
+
+    def test_the_expensive_uncounted_row_dominates_in_both(self):
+        b, j = self._bodies(False), self._jsonl(False)
+        self.assertLess(b, 0.05, f"bodies reported {b:.2%} on 0.001 of the money")
+        self.assertLess(j, 0.05)
+        self.assertAlmostEqual(b, j, places=3)
+
+    def test_counting_the_expensive_row_clears_both(self):
+        """The other direction, so the fix cannot be 'always report near zero'."""
+        b, j = self._bodies(True), self._jsonl(True)
+        self.assertGreater(b, 0.95)
+        self.assertGreater(j, 0.95)
+        self.assertAlmostEqual(b, j, places=3)
+
+    def test_a_zero_usage_trace_falls_back_to_rows_in_both(self):
+        """With no billed tokens to weight by, dividing by zero would read as
+        fully counted. Both fall back to counting rows."""
+        self.assertEqual(trace.counted_share([], lambda x: True, lambda x: 0), 0.0)
+        items = [("a", True), ("b", False)]
+        self.assertEqual(
+            trace.counted_share(items, lambda p: p[1], lambda p: 0), 0.5)

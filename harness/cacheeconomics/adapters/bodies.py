@@ -28,7 +28,7 @@ import json
 from datetime import datetime
 
 from ..registry import UNATTRIBUTED
-from ..trace import QUALIFIES_SPEND
+from ..trace import QUALIFIES_SPEND, counted_share
 from ..segment import (_billed_input, _requested_ttl, _scale_to_measured,
                        segments_from_request, usage_from_response)
 
@@ -155,6 +155,10 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
     requests, notes = [], []
     skipped_no_body = unparseable = dropped_no_body = 0
     counted = uncounted = 0
+    # Which requests got exact counts, in lockstep with `requests`, so coverage
+    # can be weighted by what each one cost. `counted / segmented` counted rows,
+    # and rows are the wrong denominator for a gate that releases dollars.
+    counted_flags: list = []
     count_errors: list = []
     renamed: dict = {}
     with open(path) as f:
@@ -184,6 +188,10 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
         body = _find_body(row)
         resp = _find_response(row)
         usage = usage_from_response(resp) if resp else {}
+        # Set in the body branch below. Hoisted so both branches define it: a
+        # no-body row is never exactly counted, and it still needs a flag,
+        # because it carries billed tokens and therefore weight.
+        was_counted = False
         if not body:
             # Kept, not dropped. A row with usage counters and no body is a real
             # request that cost real money; discarding it shrank the denominator
@@ -227,9 +235,11 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
                     _is_token_count(n) for n in pre):
                 apply_counts(segs, pre)
                 counted += 1
+                was_counted = True
             elif pre is not None:
                 uncounted += 1
             _scale_to_measured(segs, _billed_input(usage) if usage else None)
+        counted_flags.append(was_counted)
         requests.append(request_from_row(
             row,
             [Segment(id=sg["id"], role=sg["role"], tokens=sg["tokens"],
@@ -314,7 +324,16 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
     return TraceSet(requests=requests, tier=Tier.INFERRED, alignment=None,
                     source=path, notes=notes,
                     structural_coverage=(segmented / len(requests)) if requests else 0.0,
-                    tokens_counted=(counted / segmented) if segmented else 0.0,
+                    # Weighted by billed input tokens through the same helper
+                    # `load_jsonl` uses. This was `counted / segmented`, so 99
+                    # tiny counted rows beside one huge uncounted one reported
+                    # 99% coverage on 0.02% of the money and released structural
+                    # dollars resting on a byte-share estimate.
+                    tokens_counted=counted_share(
+                        [(r, flag) for r, flag in zip(requests, counted_flags)
+                         if r.segments],
+                        lambda pair: pair[1],
+                        lambda pair: _billed_input(pair[0].usage or {})),
                     skipped_rows=unparseable + dropped_no_body)
 
 

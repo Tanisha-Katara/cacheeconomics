@@ -670,6 +670,33 @@ def resolve_litellm_tenant(data, key=None) -> str | None:
     return read_field(data or {}, "end_user", "user")
 
 
+def counted_share(items, is_counted, billed) -> float:
+    """Share of *billed input tokens* whose segment sizes were exactly counted.
+
+    Weighted by money, not by row count. Ninety-nine tiny counted rows beside
+    one huge uncounted one is 99% of rows and can be 0.02% of the spend -- and
+    99% clears the publish threshold, so every structural dollar figure would
+    rest on a byte-share estimate covering essentially all of the money.
+
+    One implementation, because the two loaders had two. `load_jsonl` learned
+    this and `load_bodies` did not, so a bodies export whose dominant cost was
+    never counted reported near-perfect coverage and released structural money
+    on it. That is the same divergence this module exists to close, in the one
+    number that decides whether dollars are published at all.
+
+    The row-count fallback is deliberate: with no billed tokens to weight by, a
+    trace of zero-usage requests would otherwise divide by zero and read as
+    fully counted.
+    """
+    items = list(items)
+    if not items:
+        return 0.0
+    total = sum(billed(x) or 0 for x in items)
+    if not total:
+        return sum(1 for x in items if is_counted(x)) / len(items)
+    return sum(billed(x) or 0 for x in items if is_counted(x)) / total
+
+
 def marked_prefixes(segments) -> list[int]:
     """Token count of the prefix ending at each cache marker, in index order.
 
@@ -1372,16 +1399,9 @@ def load_jsonl(path: str, key: bytes | None = None, *,
         return (_billed_input(u) or 0) if isinstance(u, dict) else 0
 
     structured = [r for r in rows if _segment_list(r)]
-    counted_rows = sum(_weight(r) for r in structured if _counted(r))
-    structured_rows = sum(_weight(r) for r in structured)
-    if not structured_rows:
-        # No billed tokens to weight by. Fall back to rows so a trace of
-        # zero-usage requests is not silently treated as fully counted.
-        counted_rows = sum(1 for r in structured if _counted(r))
-        structured_rows = len(structured) or 1
     return TraceSet(requests=requests, tier=tier, alignment=alignment,
                     source=path, notes=notes,
-                    tokens_counted=counted_rows / structured_rows,
+                    tokens_counted=counted_share(structured, _counted, _weight),
                     structural_coverage=structural_coverage,
                     token_sums_reconciled=token_sums_reconciled,
                     token_sums_publishable=token_sums_publishable,
