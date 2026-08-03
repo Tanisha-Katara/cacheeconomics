@@ -41,6 +41,19 @@ from datetime import datetime, timezone
 # cannot change their export pipeline.
 DEFAULT_UPSTREAM = "https://api.anthropic.com"
 
+_HOP_BY_HOP = frozenset((
+    "content-length", "transfer-encoding", "connection", "content-encoding",
+    "keep-alive", "te", "trailer", "upgrade"))
+
+
+def _wants_stream(raw: bytes) -> bool:
+    """Did the caller ask for a streamed response?"""
+    try:
+        return bool(json.loads(raw or b"{}").get("stream"))
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
 _lock = threading.Lock()
 _state = {"n": 0, "out": None, "errors": 0, "upstream": DEFAULT_UPSTREAM}
 
@@ -51,10 +64,65 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):            # noqa: A003
         pass                              # the run's own output is the log
 
+    def _read_request_body(self) -> bytes:
+        """The request body, however the client framed it.
+
+        This read `content-length` alone, so an HTTP/1.1 client using
+        `Transfer-Encoding: chunked` -- which is legal and which some SDKs use
+        for large or streamed uploads -- had its body read as zero bytes and
+        forwarded empty. The provider then answered a request the caller never
+        made, and the capture recorded that as what was sent.
+        """
+        if "chunked" in (self.headers.get("transfer-encoding") or "").lower():
+            out = []
+            while True:
+                line = self.rfile.readline().strip()
+                if not line:
+                    continue
+                try:
+                    size = int(line.split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    self.rfile.readline()          # trailing CRLF
+                    break
+                out.append(self.rfile.read(size))
+                self.rfile.readline()              # CRLF after each chunk
+            return b"".join(out)
+        return self.rfile.read(int(self.headers.get("content-length") or 0))
+
     def do_POST(self):                    # noqa: N802
-        length = int(self.headers.get("content-length") or 0)
-        raw = self.rfile.read(length)
+        raw = self._read_request_body()
         sent_at = datetime.now(timezone.utc)
+
+        # Refused, not silently reframed. `urllib` buffers the upstream
+        # response, so an event stream reaches the client only once the model
+        # has finished -- or hits the 300s timeout and becomes a synthetic 502.
+        # A capture that changes the behaviour it exists to observe is worse
+        # than no capture, and a proxy that claims to forward byte for byte
+        # should say when it cannot.
+        #
+        # Relaying the stream chunk by chunk was tried and measured: first byte
+        # still arrived at 1.22s on a stream spanning 1.2s, so the buffering is
+        # upstream of the relay. Fixing it properly means replacing urllib with
+        # a socket-level client, which is a different tool than this one.
+        if _wants_stream(raw):
+            msg = {"error": {
+                "type": "cacheeconomics_proxy_unsupported",
+                "message": (
+                    "capture_proxy does not forward streaming responses "
+                    "faithfully and will not pretend to. Re-run the capture "
+                    "with stream disabled, or point the agent straight at the "
+                    "provider and export bodies from your gateway instead.")}}
+            payload = json.dumps(msg).encode()
+            with _lock:
+                _state["refused"] = _state.get("refused", 0) + 1
+            self.send_response(501)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
 
         upstream = _state["upstream"] + self.path
         # `accept-encoding` is dropped so upstream replies uncompressed. urllib
@@ -62,9 +130,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # `content-encoding` header stripped hands the client a body it decodes
         # as text: measured as "'utf-8' codec can't decode byte 0x8b", which is
         # the gzip magic number, six steps into a real agent run.
+        # Hop-by-hop headers describe this connection, not the request, and
+        # forwarding them upstream is how a proxy corrupts framing.
         headers = {k: v for k, v in self.headers.items()
                    if k.lower() not in ("host", "content-length", "connection",
-                                        "accept-encoding")}
+                                        "accept-encoding", "transfer-encoding",
+                                        "keep-alive", "te", "trailer",
+                                        "upgrade", "proxy-authorization")}
         headers["accept-encoding"] = "identity"
         headers.setdefault("x-api-key", os.environ.get("ANTHROPIC_API_KEY", ""))
         headers.setdefault("anthropic-version", "2023-06-01")
@@ -73,8 +145,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                      method="POST")
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
-                body, status = r.read(), r.status
                 out_headers = dict(r.headers)
+                status = r.status
+                body = r.read()
         except urllib.error.HTTPError as e:
             body, status = e.read(), e.code
             out_headers = dict(e.headers)
@@ -91,8 +164,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         payload = body
         self.send_response(status)
         for k, v in out_headers.items():
-            if k.lower() in ("content-length", "transfer-encoding", "connection",
-                             "content-encoding"):
+            if k.lower() in _HOP_BY_HOP:
                 continue
             self.send_header(k, v)
         self.send_header("content-length", str(len(payload)))

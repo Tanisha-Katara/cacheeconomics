@@ -92,7 +92,19 @@ def analyse(path: str) -> dict:
             rec = float(ttl["avoidable_usd_month"].replace("$", "").replace(",", ""))
         except ValueError:
             rec = 0.0
-    return {"monthly_input_usd": monthly, "ttl1_usd_month": rec,
+    # The gate state travels with the numbers. `--allow-unreconciled` releases
+    # figures the analyzer stamps DRAFT and marks not for external use, and this
+    # parsed the released strings into a committed artifact that said nothing
+    # about it -- so a sweep JSON in tier-b/evidence carried dollar projections
+    # the normal gate would have withheld, with the caveat left behind in a
+    # report nobody keeps.
+    draft = [n for n in d.get("notes") or [] if n.startswith("DRAFT")]
+    return {"unreconciled": True,
+            "gate": ("figures released with --allow-unreconciled and no "
+                     "invoice; not reconciled against money that left an "
+                     "account"),
+            "draft_notes": draft,
+            "monthly_input_usd": monthly, "ttl1_usd_month": rec,
             "recoverable_share": (rec / monthly) if monthly else 0.0,
             "ttl1_raised": ttl is not None,
             "window_days": d["window_days"],

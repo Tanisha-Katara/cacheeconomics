@@ -15,6 +15,7 @@ and the proxy is exercised against a stub upstream on loopback, so these run in
 CI with no key and no egress.
 """
 
+import http.client
 import http.server
 import importlib.util
 import json
@@ -26,6 +27,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -344,3 +346,165 @@ class TestCountingCannotFakeAnExactResult(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertIn("--allow-partial", r.stdout)
         self.assertIn("estimates them", r.stdout)
+
+
+class _StreamStub(http.server.BaseHTTPRequestHandler):
+    """An upstream that answers with an event stream, like a streaming model."""
+
+    hits = 0
+    seen_body = b""
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        type(self).hits += 1
+        if "chunked" in (self.headers.get("transfer-encoding") or "").lower():
+            buf = []
+            while True:
+                line = self.rfile.readline().strip()
+                if not line:
+                    continue
+                n = int(line.split(b";")[0], 16)
+                if n == 0:
+                    self.rfile.readline()
+                    break
+                buf.append(self.rfile.read(n))
+                self.rfile.readline()
+            type(self).seen_body = b"".join(buf)
+        else:
+            type(self).seen_body = self.rfile.read(
+                int(self.headers.get("content-length") or 0))
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("transfer-encoding", "chunked")
+        self.end_headers()
+        for i in range(3):
+            piece = b"data: {\"i\": %d}\n\n" % i
+            self.wfile.write(b"%X\r\n%s\r\n" % (len(piece), piece))
+            self.wfile.flush()
+            time.sleep(0.4)               # so buffering is measurable
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+
+class TestTheProxyDoesNotReframeLiveTraffic(_ProxyCase):
+    """It claimed to forward byte for byte and did not, on two ordinary shapes.
+
+    A chunked upload has no `content-length`, so the body read as zero bytes and
+    was forwarded empty -- the provider answered a request the caller never
+    made, and the capture recorded that as what was sent. And every response was
+    buffered whole, so an event stream was held until the model finished, or hit
+    the 300s timeout and became a synthetic 502.
+    """
+
+    def setUp(self):
+        _StreamStub.hits = 0
+        _StreamStub.seen_body = b""
+        self.stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _StreamStub)
+        self.port = self.stub.server_address[1]
+        threading.Thread(target=self.stub.serve_forever, daemon=True).start()
+        self.addCleanup(self.stub.shutdown)
+        self.out = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        self.out.close()
+        self.addCleanup(lambda: os.path.exists(self.out.name) and os.unlink(self.out.name))
+        self.proxy_port = self._free_port()
+        self.proxy = subprocess.Popen(
+            [sys.executable, os.path.join(TIER_B, "capture_proxy.py"),
+             "--out", self.out.name, "--port", str(self.proxy_port),
+             "--upstream", f"http://127.0.0.1:{self.port}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        self.addCleanup(self.proxy.terminate)
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", self.proxy_port), 0.1):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            self.skipTest("proxy did not come up")
+
+    def test_a_chunked_upload_arrives_intact(self):
+        payload = json.dumps(self.BODY).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", self.proxy_port, timeout=5)
+        conn.putrequest("POST", "/v1/messages")
+        conn.putheader("content-type", "application/json")
+        conn.putheader("transfer-encoding", "chunked")
+        conn.endheaders()
+        conn.send(b"%X\r\n%s\r\n0\r\n\r\n" % (len(payload), payload))
+        conn.getresponse().read()
+        conn.close()
+        self.assertEqual(_StreamStub.seen_body, payload,
+                         "the chunked body was dropped or truncated")
+
+    def test_a_streaming_request_is_refused_not_reframed(self):
+        """urllib buffers the upstream response, so an event stream reaches the
+        client only once the model has finished -- or times out and becomes a
+        synthetic 502.
+
+        Relaying it chunk by chunk was tried and measured: first byte still
+        arrived at 1.22s on a stream spanning 1.2s, so the buffering is above
+        the relay. A capture that changes the behaviour it exists to observe is
+        worse than no capture, so the proxy says so instead of pretending.
+        """
+        body = dict(self.BODY, stream=True)
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy_port}/v1/messages",
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(req, timeout=5)
+        self.assertEqual(caught.exception.code, 501)
+        detail = json.loads(caught.exception.read())["error"]["message"]
+        self.assertIn("will not pretend", detail)
+        self.assertEqual(_StreamStub.hits, 0,
+                         "the request was forwarded before being refused")
+
+    def test_a_non_streaming_request_is_still_captured(self):
+        """The refusal must be narrow: ordinary traffic still goes through."""
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.proxy_port}/v1/messages",
+            data=json.dumps(self.BODY).encode(),
+            headers={"content-type": "application/json"})
+        urllib.request.urlopen(req, timeout=5).read()
+        for _ in range(40):
+            rows = [l for l in open(self.out.name) if l.strip()]
+            if rows:
+                break
+            time.sleep(0.05)
+        self.assertTrue(rows, "a streamed request was not captured at all")
+
+
+class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
+    """`sweep_report.py` runs the CLI with --allow-unreconciled.
+
+    That releases figures the analyzer stamps DRAFT and labels not for external
+    use. The script parsed the released strings into a committed artifact that
+    said nothing about it, so a file in tier-b/evidence carried dollar
+    projections the normal gate would have withheld -- with the caveat left
+    behind in a report nobody keeps.
+    """
+
+    def test_the_artifact_declares_it_is_unreconciled(self):
+        import ast
+        src = open(os.path.join(TIER_B, "sweep_report.py")).read()
+        tree = ast.parse(src)
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == "analyse")
+        returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+        dicts = [r.value for r in returns if isinstance(r.value, ast.Dict)]
+        self.assertTrue(dicts, "analyse() no longer returns a dict literal")
+        keyed = {k.value for d in dicts for k in d.keys
+                 if isinstance(k, ast.Constant)}
+        self.assertIn("monthly_input_usd", keyed, "fixture is stale")
+        self.assertIn("unreconciled", keyed,
+                      "dollar fields ship without their gate state")
+        self.assertIn("gate", keyed)
+
+    def test_it_still_uses_the_draft_flag_knowingly(self):
+        """If the flag ever goes away the declaration must go with it, rather
+        than sitting there claiming a caveat that no longer applies."""
+        src = open(os.path.join(TIER_B, "sweep_report.py")).read()
+        self.assertIn("--allow-unreconciled", src)
+        self.assertIn("DRAFT", src)
