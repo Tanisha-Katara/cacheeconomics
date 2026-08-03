@@ -92,5 +92,16 @@ jobs:
           /tmp/venv/bin/cacheeconomics analyze \
             "$GITHUB_WORKSPACE/harness/fixtures/demo-traces.jsonl" > out.txt
           grep -q "FIGURES WITHHELD" out.txt
-          grep -q "\[figure withheld\]" out.txt
+          # Per finding, not only in the banner: the money column reads
+          # "withheld" on every row whose figure the gate held back. This step
+          # used to grep for the literal "[figure withheld]", which the report
+          # stopped emitting, and being outside the test suite it was the last
+          # copy of that string still being asserted anywhere.
+          grep -q "withheld" out.txt
+          # The claim underneath both greps. A banner that prints while a row
+          # leaks its number is the failure this step exists to catch, so assert
+          # the absence directly rather than trusting the marker.
+          if grep -qE '~\$[0-9,]+/mo' out.txt; then
+            echo "a dollar figure escaped the gate in the shipped wheel"; exit 1
+          fi
           echo "withheld by default, as shipped"

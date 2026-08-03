@@ -255,3 +255,66 @@ class TestNothingHereReachesTheNetwork(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCiAssertsThingsTheReportStillSays(unittest.TestCase):
+    """CI greps the shipped wheel's output for literal strings.
+
+    That step is the only place the *installed artifact* is checked, and it
+    lives outside pytest, so a rename in the report passes the whole suite and
+    fails on push. It has now done exactly that: the workflow grepped for
+    `[figure withheld]` for one commit after the report stopped emitting it.
+
+    The same shape as the twin-path bugs this codebase keeps finding -- two
+    copies of one claim, one of them unreachable from the tests. This makes the
+    workflow's literals reachable.
+    """
+
+    WORKFLOW = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..", "..", ".github", "workflows", "ci.yml"))
+
+    def _report(self):
+        from cacheeconomics.analyzer import analyze
+        from cacheeconomics.report import render_text
+        from cacheeconomics.trace import load_jsonl
+        return render_text(analyze(load_jsonl(FIXTURE)))
+
+    @unittest.skipUnless(os.path.exists(WORKFLOW), "workflow not in this checkout")
+    def test_every_positive_grep_matches_the_real_report(self):
+        import re
+        with open(self.WORKFLOW) as f:
+            body = f.read()
+        # `grep -q "X" out.txt` only -- the negative form is checked below, and
+        # a grep against any other file is not making a claim about the report.
+        wanted = re.findall(r'^\s*grep -q "([^"]+)" out\.txt\s*$',
+                            body, re.MULTILINE)
+        self.assertTrue(wanted, "no report greps found; has the step moved?")
+        report = self._report()
+        for pattern in wanted:
+            with self.subTest(pattern=pattern):
+                self.assertRegex(report, pattern.replace("\\[", "["),
+                                 f"CI greps for {pattern!r}, which this report "
+                                 f"no longer says")
+
+    @unittest.skipUnless(os.path.exists(WORKFLOW), "workflow not in this checkout")
+    def test_the_negative_grep_is_not_vacuous(self):
+        """A pattern that can never match anything passes forever and guards
+        nothing. It has to match a *released* report to be worth having."""
+        import re
+
+        from cacheeconomics.analyzer import analyze
+        from cacheeconomics.report import render_text
+        from cacheeconomics.trace import load_jsonl
+        with open(self.WORKFLOW) as f:
+            body = f.read()
+        forbidden = re.findall(r"if grep -qE '([^']+)' out\.txt", body)
+        self.assertTrue(forbidden, "no negative grep found; has the step moved?")
+        released = render_text(analyze(load_jsonl(FIXTURE), invoice_usd=17.45))
+        for pattern in forbidden:
+            with self.subTest(pattern=pattern):
+                self.assertRegex(released, pattern,
+                                 "the forbidden pattern never appears even when "
+                                 "figures ARE released, so CI is asserting the "
+                                 "absence of something the tool cannot emit")
+                self.assertNotRegex(self._report(), pattern)
