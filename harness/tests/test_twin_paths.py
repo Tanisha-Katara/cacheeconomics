@@ -1967,3 +1967,78 @@ class TestNoteKindIsRecordedNotInferred(unittest.TestCase):
             a = analyze(ts, allow_unreconciled=True)
             self.assertTrue(any("surface is unknown" in n for n in a.blocking_notes),
                             "the ingest blocker did not survive into the analysis")
+
+
+class TestReconciliationDollarsGoThroughTheGate(unittest.TestCase):
+    """The reconciliation block published the number the gate had just refused.
+
+    On a failed reconciliation the HTML report printed "$16.97" and
+    `--format json` emitted `computed_usd: 16.97244499999996` as a bare float,
+    while every other figure in the same document read "[withheld: ...]". The
+    text report printed neither, so this was also a twin-path divergence: two
+    renderers of one analysis disagreeing about whether a number was publishable.
+
+    `invoice_usd` is deliberately still a plain number. It is the reader's own
+    input, not a claim the tool is making. `delta_pct` is deliberately still a
+    plain number too: a ratio is not a spend total, and it is the entire
+    diagnostic -- the reason for a refusal has to survive the refusal.
+    """
+
+    FIXTURE = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "fixtures", "demo-traces.jsonl")
+
+    def _analysis(self, invoice):
+        from cacheeconomics.trace import load_jsonl
+        return analyze(load_jsonl(self.FIXTURE), invoice_usd=invoice)
+
+    def test_a_failed_gate_withholds_the_computed_total(self):
+        a = self._analysis(1.00)
+        self.assertFalse(a.reconciliation["within_ship_gate"])
+        for key in ("computed_usd", "delta_usd"):
+            with self.subTest(key=key):
+                self.assertFalse(a.reconciliation[key].released)
+
+    def test_no_renderer_prints_it(self):
+        import re
+
+        from cacheeconomics.report import render_html, render_text
+        a = self._analysis(1.00)
+        for name, page in (("text", render_text(a)), ("html", render_html(a))):
+            with self.subTest(renderer=name):
+                amounts = set(re.findall(r"\$[0-9][0-9,]*\.?[0-9]*", page))
+                # The invoice is the reader's own number and may appear.
+                self.assertEqual(amounts - {"$1.00"}, set(),
+                                 f"{name} printed a figure the gate withheld")
+
+    def test_json_does_not_serialise_it_as_a_number(self):
+        """A dashboard consuming this would read the float as authoritative."""
+        import json
+        import subprocess
+        import sys
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out = subprocess.run(
+            [sys.executable, "-m", "cacheeconomics.cli", "analyze", self.FIXTURE,
+             "--invoice-usd", "1.00", "--format", "json"],
+            capture_output=True, text=True,
+            env=dict(os.environ, PYTHONPATH=root)).stdout
+        recon = json.loads(out)["reconciliation"]
+        for key in ("computed_usd", "delta_usd"):
+            with self.subTest(key=key):
+                self.assertIsInstance(recon[key], str)
+                self.assertIn("withheld", recon[key])
+
+    def test_a_passing_gate_still_publishes_both(self):
+        """The refusal has to be escapable, or reconciliation stops being
+        readable on the path where it worked."""
+        a = self._analysis(17.45)
+        self.assertTrue(a.reconciliation["within_ship_gate"])
+        self.assertTrue(a.reconciliation["computed_usd"].released)
+        self.assertIn("$", str(a.reconciliation["computed_usd"]))
+
+    def test_the_reason_survives_the_refusal(self):
+        """delta_pct is not money and must keep rendering, or the reader cannot
+        tell a 3% miss from a 1,600% one."""
+        a = self._analysis(1.00)
+        self.assertIsInstance(a.reconciliation["delta_pct"], float)
+        self.assertGreater(a.reconciliation["delta_pct"], 100)
+        self.assertEqual(a.reconciliation["invoice_usd"], 1.00)

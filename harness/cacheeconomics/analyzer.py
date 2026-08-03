@@ -1465,6 +1465,28 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             },
             "gate": "±5% to publish a figure; ±1–2% before savings-share pricing is defensible",
         }
+        # The two reconciliation dollars are money and go through the same gate
+        # as every other figure. They did not, and it showed: on a failed
+        # reconciliation the HTML report printed "$16.97" and `--format json`
+        # emitted `computed_usd: 16.97244499999996` as a bare float, while
+        # every other figure in the same document read "[withheld: ...]". That
+        # is the number the gate had just refused to publish, in the document
+        # explaining why it was refused.
+        #
+        # `invoice_usd` stays a plain number: it is the reader's own input, not
+        # a claim this tool is making. `delta_pct` stays too -- a ratio is not a
+        # spend total, and it is the whole diagnostic. Without it the reader
+        # cannot tell a 3% miss from a 1,600% one, and the reason for the
+        # refusal has to survive the refusal.
+        _why = ("reconciliation did not pass the gate, so the computed total is "
+                "not published; delta_pct states how far off it was")
+        recon["computed_usd"] = money.Figure(
+            spend_total, money.MEASURED, released=recon["within_ship_gate"],
+            withheld_because=_why)
+        if recon["delta_usd"] is not None:
+            recon["delta_usd"] = money.Figure(
+                recon["delta_usd"], money.MEASURED,
+                released=recon["within_ship_gate"], withheld_because=_why)
 
     notes = list(ts.notes)
     if unprovable:
