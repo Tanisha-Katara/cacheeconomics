@@ -382,7 +382,7 @@ class CachePlugin:
             return body, Decision(False, reason=str(e), estimated_tokens=estimated)
 
         placements, notes = self._filter_near_minimum(alloc, segs, target_id, model,
-                                                      markable)
+                                                      markable, body)
         # Only the positions where inheriting a neighbour's history would have
         # changed the answer. A trailing turn is new content on every request by
         # design; saying so each time would bury the case that matters.
@@ -541,7 +541,8 @@ class CachePlugin:
 
     # --- abstention -------------------------------------------------------
 
-    def _filter_near_minimum(self, alloc, segs, target_id, model, markable=None):
+    def _filter_near_minimum(self, alloc, segs, target_id, model, markable=None,
+                             body=None):
         """Drop markers this cannot prove are safe to place.
 
         Two gates, and both fail closed, because this one mutates a live request
@@ -571,9 +572,33 @@ class CachePlugin:
                 f"nothing and the provider returns no error, so placing one "
                 f"without knowing it risks paying the write premium for nothing."]
         floor = minimum * (1 + self.minimum_margin)
+        # Positions no caller may ever mark, whatever transport it has. Tool
+        # history is on the wire and therefore segmented, so drift in a rotating
+        # `tool_call_id` is visible -- but it is not content, and `segment._mark`
+        # refuses to write a `cache_control` there.
+        #
+        # That refusal was reachable as a crash. This filter only excluded a
+        # position when the caller passed `markable`, and `on_request` leaves it
+        # None, so a direct caller with a large stable `tool_calls` block had it
+        # chosen, handed to `apply_markers`, and got ValueError out of the public
+        # API -- with `apply=False` too, and before `observe_shape`, so the
+        # LiteLLM fail-open swallowed it and the request went unobserved as well.
+        #
+        # Unconditional, and deliberately not folded into `markable`: that
+        # parameter answers "what can this integration patch", which varies by
+        # caller. This answers "what is a marker location at all", which does not.
+        unmarkable = {i for i, (_r, _l, _b, path) in enumerate(walk(body or {}))
+                      if len(path) > 2 and isinstance(path[2], str)}
         keep, notes = {}, []
         for t in alloc.tiers:
             seg = by_pos.get(t.marker_position)
+            if t.marker_position in unmarkable:
+                notes.append(
+                    f"ABSTAIN at wire position {t.marker_position}: it is tool "
+                    f"history, not content. It is segmented so that a rotating "
+                    f"call id shows up as the drift it is, and it is not a place "
+                    f"a cache marker can go.")
+                continue
             if markable is not None and t.marker_position not in markable:
                 where = f"{seg.role!r} block" if seg is not None else "block"
                 notes.append(

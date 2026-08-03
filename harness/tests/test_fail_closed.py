@@ -1279,3 +1279,65 @@ class TestSilentDegradationIsSpokenAloud(unittest.TestCase):
         self.assertEqual(len(plan.ttls), 3)
         self.assertFalse([n for n in plan.notes if "stopped at the" in n],
                          "claimed a limit it never reached")
+
+
+class TestToolHistoryIsNeverAnAllocationTarget(unittest.TestCase):
+    """`segment._mark` refuses to write a cache_control onto tool history, and
+    that refusal was reachable as a crash.
+
+    `_filter_near_minimum` excluded unmarkable positions only when the caller
+    passed `markable`, and `CachePlugin.on_request` leaves it None. A direct
+    caller with a large stable `tool_calls` block had it chosen, handed to
+    `apply_markers`, and got ValueError out of the public API -- with
+    `apply=False` as well, and *before* `observe_shape`, so the LiteLLM
+    fail-open swallowed it and the request went unobserved too.
+
+    The fixture matters: the tool block is large and perfectly stable, so the
+    allocator wants it. A small or churning one would make this test pass with
+    the fix reverted, which is how three tests in this session passed for the
+    wrong reason.
+    """
+
+    @staticmethod
+    def _body(i):
+        return {"model": "claude-opus-5", "messages": [
+            {"role": "system", "content": "policy " * 4000},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"id": "call_stable", "type": "function",
+                             "function": {"name": "f", "arguments": "x" * 20000}}]},
+            {"role": "user", "content": f"turn {i}"}]}
+
+    def _drive(self, apply):
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=4)
+        last = None
+        for i in range(20):
+            _, last = p.on_request(self._body(i), model="claude-opus-5",
+                                   target_id="anthropic/direct",
+                                   at=T0 + timedelta(seconds=90 * i), apply=apply)
+        return p, last
+
+    def test_observe_only_does_not_raise(self):
+        _, last = self._drive(apply=False)
+        self.assertIsNotNone(last)
+
+    def test_mutating_does_not_raise(self):
+        _, last = self._drive(apply=True)
+        self.assertIsNotNone(last)
+
+    def test_no_marker_lands_on_tool_history(self):
+        from cacheeconomics.segment import walk
+        _, last = self._drive(apply=True)
+        named = {i for i, (_r, _l, _b, path) in enumerate(walk(self._body(0)))
+                 if len(path) > 2 and isinstance(path[2], str)}
+        self.assertTrue(named, "fixture no longer contains tool history")
+        self.assertFalse(set(last.placements) & named)
+
+    def test_the_abstention_says_which_position_and_why(self):
+        _, last = self._drive(apply=True)
+        self.assertTrue([n for n in last.notes if "tool history" in n],
+                        "abstained silently, which reads as nothing being wrong")
+
+    def test_it_still_places_where_it_can(self):
+        """Excluding tool history must not become placing nothing."""
+        _, last = self._drive(apply=True)
+        self.assertTrue(last.placements, "stood down entirely instead of skipping one position")
