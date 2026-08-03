@@ -214,12 +214,32 @@ def _place(req: Request, emission: list[Segment], policy: str,
                              f"{minimum:,} minimum for {req.model}; marking it would "
                              f"cost without caching"], order)
 
-    ttl = "5m"
+    # What the surface and model will actually accept. Cadence chose the
+    # lifetime on its own, so a Bedrock model the registry narrows to 5m got a
+    # 1h marker and a note saying the longer lifetime pays -- a recommendation
+    # the provider rejects, or silently ignores, on the one output of this tool
+    # that gets applied to somebody's production prompt rather than published.
+    try:
+        supported = list(registry.supported_ttls(req.target_id, req.model))
+    except registry.RegistryError:
+        # Nothing recorded is not permission. The short lifetime is the one
+        # every explicit-breakpoint surface has, so it is the safe floor.
+        supported = ["5m"]
+        notes.append(f"no supported lifetimes recorded for {req.model} on "
+                     f"{req.target_id}, so only the 5m write is assumed")
+
+    ttl = "5m" if "5m" in supported else (supported[0] if supported else "5m")
     if cadence_seconds is not None:
-        if 300 < cadence_seconds < 3600:
+        in_band = 300 < cadence_seconds < 3600
+        if in_band and "1h" in supported:
             ttl = "1h"
             notes.append(f"median gap {cadence_seconds/60:.1f} min falls inside the "
                          f"one-hour window, so the longer lifetime pays")
+        elif in_band:
+            notes.append(f"median gap {cadence_seconds/60:.1f} min falls inside the "
+                         f"one-hour window, but {req.model} on {req.target_id} "
+                         f"supports only {', '.join(supported)}, so the longer "
+                         f"lifetime is not available here")
         else:
             notes.append(f"median gap {cadence_seconds/60:.1f} min is outside the "
                          f"5min-1hr window, so the cheaper 5m write wins")

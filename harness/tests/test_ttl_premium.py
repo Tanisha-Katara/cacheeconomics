@@ -781,3 +781,73 @@ class TestTheAllocatorSearchesPlansItCanCost(unittest.TestCase):
                            target_id="anthropic/direct", model="claude-opus-5",
                            gaps=[60.0] * 20, budget=1)
         self.assertTrue(a.tiers)
+
+
+class TestAPlacementIsShippedNotPublished(unittest.TestCase):
+    """Allocator output goes into somebody's production prompt.
+
+    There is no reconciliation gate in front of it, so a wrong placement is
+    applied rather than merely printed. These two were both silent: one
+    recommends a lifetime the provider will not honour, the other prices one
+    breakpoint and returns another.
+    """
+
+    def _req(self, segs, **kw):
+        base = dict(request_id="r", sent_at=T0, model="claude-opus-5",
+                    target_id="anthropic/direct", segments=segs, usage={})
+        base.update(kw)
+        return Request(**base)
+
+    def test_lite_will_not_recommend_a_lifetime_the_model_lacks(self):
+        """Bedrock narrows claude-opus-4-1 to 5m. Cadence chose the lifetime on
+        its own, so a ten-minute median produced a 1h marker and a note saying
+        the longer lifetime pays."""
+        from cacheeconomics import registry
+        from cacheeconomics.allocate import allocator_lite
+        self.assertEqual(
+            list(registry.supported_ttls("amazon-bedrock/converse",
+                                         "claude-opus-4-1")), ["5m"],
+            "registry changed; this fixture no longer tests what it says")
+        segs = [Segment(id="s", role="system", tokens=2000, index=0),
+                Segment(id="u", role="user", tokens=100, index=1)]
+        p = allocator_lite(self._req(segs, model="claude-opus-4-1",
+                                     target_id="amazon-bedrock/converse"),
+                           volatility={0: 1, 1: 2}, cadence_seconds=600)
+        self.assertNotIn("1h", p.ttls.values())
+        self.assertTrue(any("not available here" in n for n in p.notes),
+                        "silently downgraded without saying why")
+
+    def test_lite_still_takes_the_long_lifetime_where_it_exists(self):
+        """The guard must not suppress the recommendation it was built for."""
+        from cacheeconomics.allocate import allocator_lite
+        segs = [Segment(id="s", role="system", tokens=2000, index=0),
+                Segment(id="u", role="user", tokens=100, index=1)]
+        p = allocator_lite(self._req(segs), volatility={0: 1, 1: 2},
+                           cadence_seconds=600)
+        self.assertEqual(set(p.ttls.values()), {"1h"})
+
+    def test_full_keeps_the_order_it_priced(self):
+        """`wire_order if applied else None` dropped an explicit order when no
+        Move justified it, so the allocation was costed over the reordered
+        emission and the plan reverted to authored order. `Plan.prefixes` then
+        marks segments nobody priced."""
+        from cacheeconomics.allocator import allocator_full
+        segs = [Segment(id=c, role="system", tokens=6000, index=i)
+                for i, c in enumerate("abc")]
+        p = allocator_full(self._req(segs), volatility={0: 0, 1: 0, 2: 0},
+                           cadence_seconds=None, gaps=[60.0] * 20,
+                           order=[2, 1, 0])
+        self.assertEqual(p.order, [2, 1, 0])
+        self.assertEqual([s.index for s in p.emission(segs)], [2, 1, 0],
+                         "the plan emits a different order than it was costed on")
+
+    def test_full_leaves_the_authored_order_alone(self):
+        """An order equal to the authored one carries no information and should
+        not be stamped onto the plan."""
+        from cacheeconomics.allocator import allocator_full
+        segs = [Segment(id=c, role="system", tokens=6000, index=i)
+                for i, c in enumerate("abc")]
+        p = allocator_full(self._req(segs), volatility={0: 0, 1: 0, 2: 0},
+                           cadence_seconds=None, gaps=[60.0] * 20,
+                           order=[0, 1, 2])
+        self.assertIsNone(p.order)

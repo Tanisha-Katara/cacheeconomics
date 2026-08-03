@@ -100,8 +100,15 @@ def allocator_full(req: Request, rates: dict | None = None,
                      "is Modeled and not claimable until a behavioural eval shows "
                      "no material regression.")
 
+    # The order the allocation was actually costed on, whenever it differs from
+    # the authored one. This said `wire_order if applied else None`, so a caller
+    # passing an explicit `order` with no Move to justify it got an allocation
+    # priced over the reordered emission and a plan that reverts to authored
+    # order -- `Plan.prefixes` then marks different segments than were costed,
+    # and the client ships a breakpoint nobody priced.
+    authored = sorted(s.index for s in req.segments)
     plan = Plan("allocator-full", marker_indices, ttls, notes,
-                wire_order if applied else None)
+                wire_order if wire_order != authored else None)
     plan.allocation = alloc
     return plan
 
