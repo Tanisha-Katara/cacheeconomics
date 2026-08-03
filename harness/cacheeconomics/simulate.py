@@ -24,7 +24,9 @@ What it does not model, and therefore where it will be wrong:
   - server-side eviction under memory pressure
   - cross-region and cross-workspace isolation, which the trace schema does not
     yet carry
-  - the 20-block lookback window, which needs block counts rather than segments
+  - the 20-block lookback window is modelled at segment granularity, which is
+    coarser than the blocks the provider counts, so it is enforced only in the
+    pessimistic arm
   - provider-side routing that may not send two identical prefixes to the same
     machine
   - true response completion time; first_token_at is the tightest bound most
@@ -382,11 +384,43 @@ def simulate(reqs: list[Request], policy, volatility=None, cadence=None,
         routed_away = (assume.routing_miss_in_n
                        and idx % assume.routing_miss_in_n == assume.routing_miss_in_n - 1)
         if not routed_away:
-            for key, toks, _ in reversed(pres):
+            # Every live prefix of what is being sent, not only the ones this
+            # request happens to mark. The provider searches backward from each
+            # breakpoint for an earlier cached prefix, so an advancing trailing
+            # breakpoint reads the shorter entry a previous turn wrote even
+            # though nothing marks that position now.
+            #
+            # Matching only `pres` modelled a policy that moves its breakpoint
+            # as never hitting anything, which is the same defamatory shape
+            # `Plan.prefixes` was already fixed for one layer up -- and here it
+            # could reverse a bake-off verdict, telling a client to abandon a
+            # placement that is actually cheaper.
+            #
+            # This cannot fabricate a hit. The key is the tuple of segment ids,
+            # so `seq[:len(key)] == key` is the literal statement that the
+            # cached span is a prefix of what is being sent, which is the
+            # provider's own condition for a read.
+            seq, cum, at = [], [], []
+            running = 0
+            for sg in plan.emission(r.segments):
+                seq.append(sg.id)
+                running += sg.tokens
+                cum.append(running)
+                at.append(sg.index)
+            marks = [len(k) for k, _t, _ttl in pres]
+            window = registry_lookback(r.target_id) if assume.enforce_lookback else None
+            for length in range(len(seq), 0, -1):
+                key = tuple(seq[:length])
                 entry = live.get((scope, key))
-                if entry and entry[0] <= now < entry[1]:
-                    read = toks
-                    break
+                if not (entry and entry[0] <= now < entry[1]):
+                    continue
+                # Reachable from some breakpoint at or after it, within the
+                # window the provider searches back.
+                if window is not None and not any(
+                        0 <= m - length <= window for m in marks):
+                    continue
+                read = cum[length - 1]
+                break
         outermost = pres[-1][1]
 
         # Split the written span by breakpoint, not by the outermost marker's

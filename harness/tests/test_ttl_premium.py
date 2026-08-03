@@ -475,3 +475,94 @@ class TestTheOtherRulesStoppedGuessing(unittest.TestCase):
         self.assertIsNotNone(f)
         self.assertIn("five-second window", f.detail)
         self.assertIn("stand-in", f.detail)
+
+
+class TestTheSimulatorSearchesBackwardLikeTheProvider(unittest.TestCase):
+    """The read path matched only prefixes this request happens to mark.
+
+    Anthropic searches backward from each breakpoint for an earlier cached
+    prefix, so a breakpoint that advances with the conversation reads the
+    shorter entry a previous turn wrote even though nothing marks that position
+    now. Matching only the current request's own markers modelled that policy as
+    never hitting anything.
+
+    It is not an academic gap. On a three-turn conversation the bake-off
+    verdict reverses: a moving trailing breakpoint scored $0.3375 against a
+    static system marker's $0.2545 and lost, when it actually costs $0.1765 and
+    wins. The tool would have told a client to abandon the cheaper placement.
+
+    `Plan.prefixes` was fixed for this same shape one layer up, with a comment
+    calling it a defamatory way to model a baseline. The read path had it too.
+    """
+
+    LAYERS = [("system", 2000, "sys"), ("user", 8000, "u1"),
+              ("assistant", 8000, "a1"), ("assistant", 8000, "a2")]
+
+    def _reqs(self):
+        return [Request(
+            request_id=f"r{n}", sent_at=T0 + timedelta(seconds=60 * n),
+            model="claude-opus-5", agent="a", session="s",
+            target_id="anthropic/direct", usage={},
+            segments=[Segment(id=sid, role=role, tokens=tok, index=i)
+                      for i, (role, tok, sid) in enumerate(self.LAYERS[:n])])
+            for n in (2, 3, 4)]
+
+    @staticmethod
+    def _static(r, **kw):
+        from cacheeconomics.allocate import Plan
+        return Plan(policy="static", marker_indices=[0], ttls={0: "5m"})
+
+    @staticmethod
+    def _moving(r, **kw):
+        from cacheeconomics.allocate import Plan
+        i = len(r.segments) - 1
+        return Plan(policy="moving", marker_indices=[i], ttls={i: "5m"})
+
+    def _cost(self, policy, assume=None):
+        from cacheeconomics import simulate
+        res = simulate.simulate(self._reqs(), policy,
+                                assume=assume or simulate.NEUTRAL)
+        rd = sum(u.cache_read for u in res.usages)
+        w = sum(u.cache_write_5m + u.cache_write_1h for u in res.usages)
+        un = sum(u.uncached_input for u in res.usages)
+        return (rd * 0.1 + w * 1.25 + un) * 5 / 1e6, rd
+
+    def test_an_advancing_breakpoint_reads_what_an_earlier_turn_wrote(self):
+        _cost, reads = self._cost(self._moving)
+        self.assertGreater(reads, 0,
+                           "a moving breakpoint still reads nothing, so the "
+                           "backward search is not being modelled")
+
+    def test_and_that_reverses_the_bakeoff_verdict(self):
+        moving, _ = self._cost(self._moving)
+        static, _ = self._cost(self._static)
+        self.assertLess(moving, static,
+                        "the cheaper placement is still scored as the worse one")
+
+    def test_it_cannot_invent_a_hit_on_content_that_was_never_sent(self):
+        """The key is the tuple of segment ids, so a read requires the cached
+        span to be a literal prefix of this request. Change the first block and
+        nothing behind it may be read."""
+        # A distinct first block on *every* turn. An earlier version of this
+        # test changed it on all but the first, which broke one link in the
+        # chain and left the others intact -- the simulator then correctly read
+        # 18,000 tokens and the test read that as a fabrication.
+        reqs = self._reqs()
+        for n, r in enumerate(reqs):
+            r.segments[0] = Segment(id=f"different-{n}", role="system",
+                                    tokens=2000, index=0)
+        from cacheeconomics import simulate
+        res = simulate.simulate(reqs, self._moving, assume=simulate.NEUTRAL)
+        self.assertEqual(sum(u.cache_read for u in res.usages), 0,
+                         "read a prefix that was never sent")
+
+    def test_the_pessimistic_arm_still_bounds_the_search(self):
+        """The window is a real provider constraint and the pessimistic arm is
+        where this project chooses to enforce it. Removing the exact-match
+        requirement must not quietly remove that too."""
+        from cacheeconomics import simulate
+        self.assertTrue(simulate.PESSIMISTIC.enforce_lookback)
+        cost_p, _ = self._cost(self._moving, assume=simulate.PESSIMISTIC)
+        cost_n, _ = self._cost(self._moving, assume=simulate.NEUTRAL)
+        self.assertGreaterEqual(cost_p, cost_n,
+                                "the pessimistic arm came out cheaper than neutral")
