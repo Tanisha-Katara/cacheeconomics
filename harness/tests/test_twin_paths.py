@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cacheeconomics import (analyzer, checks, cost, monitor,  # noqa: E402
+from cacheeconomics import (analyzer, checks, cost, monitor, trace,  # noqa: E402
                             plugin, registry, segment, simulate, tiers)
 from cacheeconomics.allocate import (observed_change_rates_by_chain,  # noqa: E402
                                      reuse_chain_of)
@@ -93,6 +93,25 @@ class TestOneFactOneValue(unittest.TestCase):
         self.assertEqual(tiers.WRITE_LATENCY_SECONDS,
                          simulate.PESSIMISTIC.write_latency_s)
         self.assertEqual(monitor.FANOUT_SECONDS, tiers.WRITE_LATENCY_SECONDS)
+
+    def test_the_flat_latency_is_only_a_fallback(self):
+        """Pinning the three names equal locks the number, and a number is the
+        weaker half of this. The stronger half is that nothing uses it when the
+        trace says what actually happened: a request whose first token lands at
+        20s has a sibling at 8s that could not have read its entry, and a flat
+        five-second window calls them sequential."""
+        sent = T0
+        observed = Request(request_id="o", sent_at=sent,
+                           first_token_at=sent + timedelta(seconds=20),
+                           model="claude-opus-5", usage={}, segments=[])
+        assumed = Request(request_id="a", sent_at=sent,
+                          model="claude-opus-5", usage={}, segments=[])
+        at, was_observed = trace.write_visible_at(observed)
+        self.assertEqual(at, sent + timedelta(seconds=20))
+        self.assertTrue(was_observed)
+        at, was_observed = trace.write_visible_at(assumed)
+        self.assertEqual(at, sent + timedelta(seconds=monitor.FANOUT_SECONDS))
+        self.assertFalse(was_observed)
 
 
 class TestVolatilityIsMeasuredTheSameWay(unittest.TestCase):
@@ -404,8 +423,46 @@ class TestMixedLifetimesAreUnprovable(unittest.TestCase):
         self.assertIsNone(self._ttl_alert("1h", None, "1h", gap=4000))
 
     def test_a_uniform_lifetime_still_produces_advice(self):
-        """Abstaining must not become silence on the case the check is for."""
-        self.assertIsNotNone(self._ttl_alert("5m", "5m", "5m"))
+        """Abstaining must not become silence on the case the check is for.
+
+        One marked span, marked again each time. The turn is no longer marked:
+        with an advancing marker the cached span differs on every request, and
+        a longer lifetime cannot turn a write of *this* span into a read of
+        *that* one, which is why the analyzer refuses that shape too. The
+        companion test below pins that they refuse it together.
+        """
+        m, fired = monitor.Monitor(), []
+        for i in range(20):
+            fired += m.observe(Request(
+                request_id=f"r{i}", sent_at=T0 + timedelta(seconds=900 * i),
+                model="claude-opus-5", usage={"input_tokens": 10},
+                ttl_requested="5m", session="s",
+                segments=[Segment(id="sys", role="system", tokens=40_000,
+                                  index=0, cache_marked=True, ttl="5m"),
+                          Segment(id=f"t{i}", role="user", tokens=200, index=1)]))
+        self.assertIsNotNone(next((a for a in fired if a.code == "RT-TTL"), None))
+
+    def test_an_advancing_marker_is_refused_by_both(self):
+        """A rolling conversation marks a stable prefix *and* the turn, so the
+        span at the outermost marker is different every request.
+
+        RT-TTL used to fire here on the median request gap alone, while TTL-1
+        walked a per-prefix timeline, found no span written twice, and refused.
+        Same trace, opposite answers, and the one that spoke was the one with
+        no evidence. Neither may speak now.
+        """
+        reqs = [self._req(i, "5m", "5m", "5m") for i in range(20)]
+        for r in reqs:
+            r.usage.update({"input_tokens": 40_200,
+                            "cache_creation_input_tokens": 40_000})
+        m, fired = monitor.Monitor(), []
+        for r in reqs:
+            fired += m.observe(r)
+        runtime = [a for a in fired if a.code == "RT-TTL"]
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="twin")
+        batch = [f for f in analyze(ts).findings if f.code == "TTL-1"]
+        self.assertEqual(bool(runtime), bool(batch))
+        self.assertFalse(runtime)
 
     def test_and_the_analyzer_still_prices_it(self):
         self.assertEqual(analyzer._declared_ttl(self._req(0, "5m", "5m", "5m")), "5m")
@@ -1653,10 +1710,6 @@ class TestAKeyIsOnlyRequiredWhereSomethingIsHashed(unittest.TestCase):
             load_jsonl(self._write(True), None)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestStructuralMoneyNeedsCountedTokens(unittest.TestCase):
     """The tool held its own spend to 5% and costed recommendations from 19%.
 
@@ -2115,3 +2168,159 @@ class TestReconciliationDollarsGoThroughTheGate(unittest.TestCase):
         self.assertIsInstance(a.reconciliation["delta_pct"], float)
         self.assertGreater(a.reconciliation["delta_pct"], 100)
         self.assertEqual(a.reconciliation["invoice_usd"], 1.00)
+
+
+class TestTheRuntimeAndTheReportAgreePerFindingCode(unittest.TestCase):
+    """Three checks exist in both paths and each drifted, because nothing here
+    had ever compared them by code.
+
+    Every other test in this file takes one *quantity* and pins the two
+    implementations to the same answer. These take one *fixture* and pin the two
+    to the same verdict, which is the thing an operator actually experiences: a
+    dashboard that says fix this and a report that says there is nothing to fix
+    are not two opinions, they are a tool that cannot be trusted on either.
+
+    What each of them was doing before:
+
+      RT-MIN summed to the outermost marker, so an inner marker below the
+      threshold read as a 30k prefix and never surfaced, while MIN-1 walked
+      every marker and reported it.
+
+      RT-FANOUT used a flat five seconds, so on a target whose first token lands
+      at 14s an 8-second sibling was called sequential, while FAN-1 used the
+      observed boundary and called it concurrent.
+
+      RT-TTL fired on the scope's median request gap, so a workload marking a
+      fresh prefix every request was told to switch to a one-hour lifetime,
+      while TTL-1 walked a per-prefix timeline, found nothing written twice, and
+      refused. The runtime was the one with no evidence, and it was the one that
+      spoke.
+
+    Both directions are pinned. A rule that never fires agrees with a rule that
+    never fires, and that is not the property being asked for.
+    """
+
+    PAIRS = (("MIN-1", "RT-MIN"), ("FAN-1", "RT-FANOUT"), ("TTL-1", "RT-TTL"))
+
+    def _both(self, reqs, batch_code, runtime_code):
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="twin")
+        batch = [f for f in analyze(ts).findings if f.code == batch_code]
+        m, fired = monitor.Monitor(), []
+        for r in reqs:
+            fired += m.observe(r)
+        runtime = [a for a in fired if a.code == runtime_code]
+        return bool(batch), bool(runtime)
+
+    def _reqs(self, segs, n=12, gap=600, **kw):
+        base = dict(model="claude-opus-5", target_id="anthropic/direct",
+                    ttl_requested="5m", session="s",
+                    usage={"input_tokens": 30_200,
+                           "cache_creation_input_tokens": 30_000})
+        base.update(kw)
+        out = []
+        for i in range(n):
+            at = T0 + timedelta(seconds=gap * i)
+            out.append(Request(request_id=f"r{i}", sent_at=at,
+                               segments=segs(i), **{**base, "usage": dict(base["usage"])}))
+        return out
+
+    # -- an inner marker that cannot cache ---------------------------------
+
+    def _short_inner(self, i):
+        return [Segment(id="sys", role="system", tokens=200, index=0, cache_marked=True),
+                Segment(id="tools", role="tools", tokens=20_000, index=1),
+                Segment(id="policy", role="system", tokens=10_000, index=2),
+                Segment(id="ctx", role="system", tokens=1_000, index=3, cache_marked=True),
+                Segment(id=f"turn{i}", role="user", tokens=200, index=9)]
+
+    def test_a_short_inner_marker_is_seen_by_both(self):
+        batch, runtime = self._both(self._reqs(self._short_inner, n=6, gap=60),
+                                    "MIN-1", "RT-MIN")
+        self.assertTrue(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_a_prefix_over_the_minimum_is_seen_by_neither(self):
+        def segs(i):
+            return [Segment(id="tools", role="tools", tokens=30_000, index=0,
+                            cache_marked=True),
+                    Segment(id=f"turn{i}", role="user", tokens=200, index=1)]
+        batch, runtime = self._both(self._reqs(segs, n=6, gap=60), "MIN-1", "RT-MIN")
+        self.assertFalse(batch)
+        self.assertEqual(batch, runtime)
+
+    # -- concurrency measured against the observed boundary ----------------
+
+    def _fanned(self, spacing, latency):
+        segs = [Segment(id="tools", role="tools", tokens=30_000, index=0,
+                        cache_marked=True),
+                Segment(id="turn", role="user", tokens=200, index=1)]
+        out = []
+        for i in range(4):
+            for j in range(2):
+                at = T0 + timedelta(seconds=600 * i + spacing * j)
+                out.append(Request(
+                    request_id=f"r{i}-{j}", sent_at=at,
+                    first_token_at=(at + timedelta(seconds=latency)) if latency else None,
+                    model="claude-opus-5", target_id="anthropic/direct",
+                    ttl_requested="5m", session="s",
+                    usage={"input_tokens": 30_200,
+                           "cache_creation_input_tokens": 30_000},
+                    segments=list(segs)))
+        return out
+
+    def test_a_slow_first_token_makes_both_call_it_concurrent(self):
+        """Eight seconds apart, first token at fourteen. Outside the flat
+        window and inside the observed one."""
+        batch, runtime = self._both(self._fanned(8, 14), "FAN-1", "RT-FANOUT")
+        self.assertTrue(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_without_first_token_timing_both_fall_back_together(self):
+        batch, runtime = self._both(self._fanned(8, None), "FAN-1", "RT-FANOUT")
+        self.assertFalse(batch)
+        self.assertEqual(batch, runtime)
+
+    # -- lifetime advice needs a span written twice ------------------------
+
+    def test_a_stable_prefix_rewritten_in_band_is_seen_by_both(self):
+        def segs(i):
+            return [Segment(id="tools", role="tools", tokens=30_000, index=0,
+                            cache_marked=True),
+                    Segment(id=f"turn{i}", role="user", tokens=200, index=1)]
+        batch, runtime = self._both(self._reqs(segs), "TTL-1", "RT-TTL")
+        self.assertTrue(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_a_prefix_that_is_never_rewritten_is_refused_by_both(self):
+        """A different span every request. The cadence looks identical to the
+        case above and there is nothing a longer lifetime could recover."""
+        def segs(i):
+            return [Segment(id=f"tools{i}", role="tools", tokens=30_000, index=0,
+                            cache_marked=True),
+                    Segment(id=f"turn{i}", role="user", tokens=200, index=1)]
+        batch, runtime = self._both(self._reqs(segs), "TTL-1", "RT-TTL")
+        self.assertFalse(batch)
+        self.assertEqual(batch, runtime)
+
+    def test_every_pair_has_a_case_where_it_fires(self):
+        """Guards the guard. Each pair above needs at least one fixture on which
+        both sides fire, or `assertEqual(batch, runtime)` is satisfied by two
+        rules that have been switched off."""
+        fired = {
+            "MIN-1": self._both(self._reqs(self._short_inner, n=6, gap=60),
+                                "MIN-1", "RT-MIN"),
+            "FAN-1": self._both(self._fanned(8, 14), "FAN-1", "RT-FANOUT"),
+            "TTL-1": self._both(self._reqs(
+                lambda i: [Segment(id="tools", role="tools", tokens=30_000,
+                                   index=0, cache_marked=True),
+                           Segment(id=f"turn{i}", role="user", tokens=200, index=1)]),
+                "TTL-1", "RT-TTL"),
+        }
+        for code, (batch, runtime) in fired.items():
+            with self.subTest(code=code):
+                self.assertTrue(batch, f"{code} fires on no fixture here")
+                self.assertTrue(runtime, f"{code}'s runtime twin fires on no fixture")
+
+
+if __name__ == "__main__":
+    unittest.main()

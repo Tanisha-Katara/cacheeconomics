@@ -40,7 +40,8 @@ from datetime import datetime
 
 from . import cost, registry
 from .allocate import pool_of, reuse_chain_of
-from .trace import write_tokens
+from .trace import (WRITE_VISIBLE_FALLBACK_SECONDS, marked_prefixes,
+                    write_tokens, write_visible_at)
 
 # How much history a single scope keeps. Small enough that a thousand scopes
 # stay cheap, large enough that a rolling median over request gaps is not noise.
@@ -53,9 +54,10 @@ MAX_SCOPES = 1024
 # without limit on a workload that keeps inventing new prefixes to fan out.
 MAX_FIRING = 64
 
-# Concurrency window for fan-out: requests closer together than this could not
-# have seen each other's cache write.
-FANOUT_SECONDS = 5.0
+# Fallback concurrency window for fan-out, used only where the trace carries no
+# `first_token_at`. One definition, in trace.py, because FAN-1 needs the same
+# number and the two spellings drifted apart in what they meant.
+FANOUT_SECONDS = WRITE_VISIBLE_FALLBACK_SECONDS
 
 TTL_SECONDS = {"5m": 300, "1h": 3600}
 
@@ -121,6 +123,10 @@ class _ScopeState:
     last_sent: datetime | None = None
     recent_writes: deque = field(default_factory=lambda: deque(maxlen=WINDOW))
     concurrent_writers: int = 0
+    # Whether the fan-out boundary came from an observed `first_token_at` or
+    # fell back to the flat guess. The alert says which, rather than implying
+    # every trace was measured the same way.
+    fanout_observed: bool = False
     prefix_key: int = 0
     seen: int = 0
     # Per session key, not per scope. One timestamp for the whole pool meant
@@ -136,6 +142,15 @@ class _ScopeState:
     # session -> tokens the prefix had reached, so a rebuild can be told from an
     # extension. Bounded: a long-lived gateway sees unboundedly many sessions.
     established: OrderedDict = field(default_factory=OrderedDict)
+    # prefix_key -> when that span was last marked, and the gaps between two
+    # markings of the same span. TTL-1 walks a per-prefix timeline and credits
+    # only rewrites of a span that already existed; RT-TTL read the scope's
+    # median request gap alone, so a workload marking a different prefix every
+    # request -- where a longer lifetime recovers nothing, because there is no
+    # second write of anything to turn into a read -- got told to switch to one
+    # hour while the report refused to make that claim from the same trace.
+    last_marked_at: OrderedDict = field(default_factory=OrderedDict)
+    rewrite_gaps: deque = field(default_factory=lambda: deque(maxlen=WINDOW))
     rebuilds: deque = field(default_factory=lambda: deque(maxlen=WINDOW))
     firing: OrderedDict = field(default_factory=OrderedDict)
 
@@ -370,6 +385,22 @@ class Monitor:
             gap = (r.sent_at - st.last_sent).total_seconds()
             if gap >= 0:
                 st.gaps.append(gap)
+        # Gaps between two markings of the *same* span. Tracked here rather than
+        # with the writes because prefix identity is shape, and the shape and
+        # usage checks run against different scope states -- recording it beside
+        # `recent_writes` put the number in one state object and the check that
+        # reads it in another, so RT-TTL simply stopped firing.
+        pk = self._prefix_key(r)
+        if pk:
+            before = st.last_marked_at.get(pk)
+            if before is not None:
+                rewrite_gap = (r.sent_at - before).total_seconds()
+                if rewrite_gap >= 0:
+                    st.rewrite_gaps.append(rewrite_gap)
+            st.last_marked_at[pk] = r.sent_at
+            st.last_marked_at.move_to_end(pk)
+            while len(st.last_marked_at) > MAX_FIRING:
+                st.last_marked_at.popitem(last=False)
         # Only forward. A negative gap was already dropped, but `last_sent` moved
         # backwards anyway, so the *next* request measured from the regressed
         # clock and recorded a gap inflated by however far time had gone back --
@@ -395,11 +426,25 @@ class Monitor:
             # as being in the future and ignored it. Two genuinely simultaneous
             # requests then produced no alert at all, which is the case the
             # check exists for.
-            prior = sum(1 for t, k in st.recent_writes
+            #
+            # The boundary is `first_token_at` where the recorder captured it,
+            # which is what FAN-1 uses. A flat five seconds is a guess about
+            # provider latency, and on a target whose first token lands at 14s
+            # it called an 8-second sibling sequential while the batch rule
+            # called it concurrent -- the same trace, two answers.
+            #
+            # Concurrent means *neither* could see the other, so both halves
+            # have to hold. With `or`, the second half is true of essentially
+            # every earlier write -- an hour-old one is still before this
+            # request's own visibility time -- and every spaced write got
+            # reported as fan-out.
+            mine, observed = write_visible_at(r, FANOUT_SECONDS)
+            prior = sum(1 for t, vis, k in st.recent_writes
                         if k == st.prefix_key
-                        and abs((r.sent_at - t).total_seconds()) < FANOUT_SECONDS)
+                        and r.sent_at < vis and t < mine)
             st.concurrent_writers = prior + 1
-            st.recent_writes.append((r.sent_at, st.prefix_key))
+            st.fanout_observed = observed
+            st.recent_writes.append((r.sent_at, mine, st.prefix_key))
 
     @staticmethod
     def _prefix_key(r) -> int:
@@ -642,16 +687,21 @@ class Monitor:
 
     def _below_minimum(self, st: _ScopeState, r, scope):
         """A marker on a prefix too short to cache, which fails silently."""
-        marked = [s.index for s in r.segments if s.cache_marked]
-        if not marked:
+        # Every marker, through the same walk MIN-1 uses. This summed to the
+        # outermost marker only, so a 200-token marker under a 30k one read as
+        # 30k and the runtime stayed silent on exactly the case the batch rule
+        # reports -- two answers to one question, from the same trace.
+        prefixes = marked_prefixes(r.segments)
+        if not prefixes:
             return
-        tokens = sum(s.tokens for s in r.segments if s.index <= max(marked))
         try:
             minimum = registry.min_cacheable_tokens(r.target_id, r.model)
         except registry.RegistryError:
             return
-        if tokens >= minimum:
+        short = [p for p in prefixes if p < minimum]
+        if not short:
             return
+        tokens = min(short)
         yield Alert(
             "RT-MIN", "medium", scope,
             f"cache marker on a prefix below the {minimum:,}-token minimum",
@@ -680,7 +730,14 @@ class Monitor:
 
     def _cadence_vs_ttl(self, st: _ScopeState, r, scope):
         """Request spacing that the configured lifetime does not suit."""
-        if len(st.gaps) < self.min_samples:
+        # Gaps between rewrites of one prefix, not gaps between requests. TTL-1
+        # walks a per-prefix timeline for the same reason: a longer lifetime
+        # recovers a rewrite by turning it into a read, so where nothing is
+        # rewritten there is nothing to recover no matter how the requests are
+        # spaced. Reading the scope's median gap fired on a workload marking a
+        # fresh prefix every request, recommending a change worth nothing, while
+        # the report refused to make the same claim from the same trace.
+        if len(st.rewrite_gaps) < self.min_samples:
             return
         # The lifetime on the prefix this advice is about, not the row's.
         #
@@ -699,13 +756,14 @@ class Monitor:
         ttl = next(iter(lifetimes), None) or r.ttl_requested
         if ttl not in TTL_SECONDS:
             return
-        gaps = sorted(st.gaps)
+        gaps = sorted(st.rewrite_gaps)
         median = gaps[len(gaps) // 2]
         if ttl == "5m" and 300 < median < 3600:
             yield Alert(
                 "RT-TTL", "medium", scope,
                 "requests arrive after the five-minute cache has expired",
-                f"Median gap over the last {len(st.gaps)} requests is {median/60:.1f} "
+                f"Median gap between rewrites of this prefix, over the last "
+                f"{len(st.rewrite_gaps)}, is {median/60:.1f} "
                 f"minutes, inside the window where a one-hour lifetime reads instead of "
                 f"rewriting. Outside that window the five-minute default is cheaper, so "
                 f"this is not a blanket change.",
@@ -728,9 +786,13 @@ class Monitor:
         yield Alert(
             "RT-FANOUT", "medium", scope,
             f"{st.concurrent_writers} concurrent requests writing the same prefix",
-            f"They started within {FANOUT_SECONDS:.0f} seconds of each other, so none "
-            f"could see the others' cache entry. Every one of them paid the write "
-            f"premium for the same tokens.",
+            f"Each went out before the previous one's entry could be read, so none "
+            f"could see the others'. Every one of them paid the write premium for "
+            f"the same tokens. "
+            + ("The boundary is the observed first token on this traffic."
+               if st.fanout_observed else
+               f"No first-token timing was captured, so the boundary is an assumed "
+               f"{FANOUT_SECONDS:.0f} seconds rather than a measurement."),
             subject=str(st.prefix_key), at=r.sent_at,
             fix="Warm the prefix with one request before fanning out, or stagger the "
                 "dispatch enough for the first write to land.")

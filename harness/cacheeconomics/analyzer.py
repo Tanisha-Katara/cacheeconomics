@@ -18,7 +18,8 @@ from . import cost, money, registry
 from .allocate import reuse_chain_of
 from .trace import QUALIFIES_SPEND as _QUALIFIES_SPEND
 from .trace import note_blocks_spend as _note_blocks_spend
-from .trace import Request, Tier, TraceSet, _billed_input, write_tokens
+from .trace import (Request, Tier, TraceSet, _billed_input,  # noqa: E402
+                    marked_prefixes, write_tokens, write_visible_at)
 
 MEASURED = money.MEASURED
 MODELED = money.MODELED
@@ -543,11 +544,7 @@ def _f_below_minimum(reqs, ratios, window, rate_for) -> Finding | None:
         # minimum doing nothing with nothing to show it. That is the silent
         # failure this rule exists to catch, hiding inside a request where
         # caching otherwise worked.
-        prefixes, running = [], 0
-        for sg in sorted(r.segments, key=lambda x: x.index):
-            running += sg.tokens or 0
-            if sg.cache_marked:
-                prefixes.append(running)
+        prefixes = marked_prefixes(r.segments)
         if prefixes:
             if any(p < minimum for p in prefixes):
                 hits.append((r, minimum))
@@ -1041,14 +1038,9 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             # recorder captured it. The five seconds stays only as the fallback
             # for traces that carry no first-token timing, and the detail says
             # which one was used.
-            if a.first_token_at:
-                if b.sent_at >= a.first_token_at:
-                    continue
-                observed_boundary = True
-            else:
-                if (b.sent_at - a.sent_at).total_seconds() >= 5:
-                    continue
-                observed_boundary = False
+            visible, observed_boundary = write_visible_at(a)
+            if b.sent_at >= visible:
+                continue
             boundaries.add(observed_boundary)
             # Both must have written, and the later one's lifetime must be
             # provable, or the premium being reclaimed is a guess.

@@ -26,7 +26,7 @@ import hmac
 import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 
 
@@ -583,6 +583,49 @@ def _billed_input(usage: dict) -> int:
                            usage.get("cache_read_input_tokens", 0),
                            write_tokens(usage))
                if _is_token_count(v) and v > 0)
+
+
+def marked_prefixes(segments) -> list[int]:
+    """Token count of the prefix ending at each cache marker, in index order.
+
+    Every marker, not only the outermost. Summing to `max(marked)` answers a
+    different question -- how long the *cached span* is -- and using it to judge
+    the minimum hides an inner marker that can never cache: a 200-token marker
+    followed by a 30k one sums to 30k, so the check passes while the inner
+    marker sits below the threshold doing nothing, and the provider returns no
+    error to say so.
+
+    Lives here because the batch rule and the runtime alert both need it, and
+    when each walked its own segments they diverged on exactly this.
+    """
+    out, running = [], 0
+    for s in sorted(segments, key=lambda x: x.index):
+        running += s.tokens or 0
+        if s.cache_marked:
+            out.append(running)
+    return out
+
+
+# How long after a request is sent its cache entry is assumed readable, when
+# the trace carries no first-token timing to say. An assumption, and callers
+# that use it say so.
+WRITE_VISIBLE_FALLBACK_SECONDS = 5.0
+
+
+def write_visible_at(r, fallback_seconds: float = WRITE_VISIBLE_FALLBACK_SECONDS) -> tuple:
+    """When the entry this request writes becomes readable, and whether that
+    time was observed rather than assumed. Returns `(datetime, observed)`.
+
+    A flat delay is a guess about provider latency dressed as a measurement. A
+    request whose first token lands at t=20s has a sibling at t=8s that could
+    not possibly have read its entry, and a five-second window skips it because
+    8 >= 5. `first_token_at` is the observed boundary; the flat number stays
+    only for traces that carry no first-token timing, and callers report which
+    one they used.
+    """
+    if getattr(r, "first_token_at", None):
+        return r.first_token_at, True
+    return r.sent_at + timedelta(seconds=fallback_seconds), False
 
 
 def write_tokens(usage: dict) -> int:
