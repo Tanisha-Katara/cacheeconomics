@@ -35,7 +35,7 @@ What it does not model, and therefore where it will be wrong:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 
 from . import cost, money
 from .allocate import (POLICIES as _PLACEMENT_POLICIES, Plan, observed_cadence,
@@ -614,6 +614,46 @@ class BakeOff:
 GATE_THRESHOLD_PCT = 10.0
 
 
+def _unreached_billed(trace, reqs) -> dict:
+    """The trace's billed-but-unmodellable rows that this run did not receive.
+
+    `TraceSet.excluded_billed` answers "which billed rows are not in
+    `analysable`", which is the right question when the caller hands over
+    `ts.analysable` and the wrong one when it hands over `ts.requests`. Reading
+    it unconditionally made twenty requests that all reached the arms report as
+    "20 carrying no usage fields" and turned five green fixtures indeterminate.
+    What blocks a figure is a billed row the arms never saw, so that is what
+    this counts: the trace's rows minus the ones actually passed in.
+
+    Asked of a narrowed `TraceSet` rather than re-derived here. The rule for
+    what counts as billed-and-excluded lives on the dataclass, it has three
+    members and a per-member definition, and a second copy of it in this module
+    is the exact drift the rest of this file is written against. `skipped_rows`
+    survives the narrowing because it is a field: a line that never became a
+    `Request` cannot be in `reqs`, so it is always unreached.
+
+    Fail-closed on anything it cannot narrow -- a caller may pass a stand-in
+    rather than a real `TraceSet`, and "I could not check" counts every
+    exclusion rather than none.
+    """
+    declared = getattr(trace, "excluded_billed", None) or {}
+    if not declared:
+        return {}
+    rows = getattr(trace, "requests", None)
+    if rows is None:
+        return declared
+    present = {r.request_id for r in reqs}
+    unreached = [r for r in rows if r.request_id not in present]
+    if len(unreached) == len(rows):
+        # Nothing was handed over from this trace at all, or the ids do not
+        # line up. Either way narrowing proves nothing, so take the trace's word.
+        return declared
+    try:
+        return _dc_replace(trace, requests=unreached).excluded_billed or {}
+    except (TypeError, ValueError, AttributeError):
+        return declared
+
+
 def structural_evidence(trace) -> tuple[bool, str]:
     """May a dollar figure computed from this trace's segments be published.
 
@@ -642,10 +682,26 @@ def structural_evidence(trace) -> tuple[bool, str]:
     must not render the same way. That is the same reasoning `tokens_are_counted`
     already applies to a trace that does not say whether it counted.
 
-    Only the absolutes are gated, which is where the analyzer draws the line
-    too: it keeps an untrusted structural finding at low confidence and
-    withholds its money. The percentage is what Gate 1 reads and it still
-    prints. See the report note in the caller for what that leaves open.
+    What this does NOT close, measured rather than assumed. `trace=None` fails
+    closed; a directly constructed `TraceSet` fails *open*, because the
+    dataclass defaults answer every question here as satisfied --
+    `structural_coverage=1.0`, `tokens_counted=1.0`, `token_sums_publishable=
+    True`, `skipped_rows=0`. Three of those are backstopped by facts derived
+    from the requests, so a false declaration is caught anyway: a lied-about
+    `token_sums_publishable` is caught by `misscaled`, a lied-about
+    `structural_coverage` by `unstructured` reaching `omitted`, and
+    `structural_coverage_billed` is a property that cannot be declared at all.
+    Three are not, and two of those cannot be: nothing on a `Request` says
+    whether its sizes were counted or split by bytes, whether its segment ids
+    came from source or from a segmenter, or that a line failed to parse before
+    it ever became a `Request`.
+
+    That is a hole in the defaults, not in this gate -- `analyze` reads the same
+    fields with the same permissive fallbacks and releases on the same bare
+    `TraceSet`. Flipping the four defaults fail-closed was measured: 26 tests
+    fail, and 11 of them are analyzer tests that never call this module. It is
+    therefore a `trace.py` decision with a report-side blast radius, recorded
+    here rather than made here.
     """
     if trace is None:
         return False, (
@@ -902,7 +958,26 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # the same reason `omitted` blocks, arriving one layer earlier. `TraceSet`
     # derives this; a caller that hands over `ts.analysable` and nothing else is
     # exactly the path that published $0.27 over a missing 5M-token request.
-    excluded_billed = excluded_billed or {}
+    #
+    # Derived from the trace, not merely accepted beside it. Adding `trace=` and
+    # leaving this an independent argument produced the obvious new call --
+    # `bake_off(ts.analysable, trace=ts, invoice_usd=matching)` -- publishing arm
+    # spend while `analyze` over the same TraceSet withheld. Reproduced on all
+    # three members: twelve good requests plus one structured status-500 that
+    # billed 5,000,000 input tokens released $2.27 against an invoice `analyze`
+    # called "a subset that happens to agree rather than a reconciliation", and
+    # the same held for a row carrying no usage fields and for a line the loader
+    # could not read. The tests that were supposed to prove the parity passed
+    # `excluded_billed=ts.excluded_billed` *and* `trace=ts`, so they exercised
+    # the one call shape that could not fail.
+    #
+    # Merged rather than overridden, and by the larger count per reason, because
+    # neither source may lower the other: an argument cannot talk the trace's
+    # exclusions down, and a trace cannot hide exclusions a caller knows about
+    # from some other pass over the same export.
+    excluded_billed = dict(excluded_billed or {})
+    for _reason, _n in (_unreached_billed(trace, reqs) or {}).items():
+        excluded_billed[_reason] = max(excluded_billed.get(_reason, 0), int(_n))
     # And the rest of that class. `excluded_billed` was threaded through for the
     # one instance that was reported, which left every *other* fact the analyzer
     # gates on -- tier, alignment, structural coverage by rows and by billed
@@ -989,7 +1064,37 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # beats the automatic baseline by 20.0% (gate: >=10%)" over a trace missing
     # a 5,000,000-token billed request. Withholding the dollars and keeping the
     # claim they support is the worse half of both options.
-    if omitted or misscaled or excluded_billed:
+    #
+    # `unprovable` and the structural evidence are in this condition for that
+    # same sentence, and were left out of it once. Wiring them to `spend_ok`
+    # alone reproduced the identical defect one round later: every arm rendered
+    # `[withheld]` and the block still printed "allocator-lite beats the
+    # automatic baseline by 50.0% (gate: >=10%)" with a "+0.0% vs litellm-auto"
+    # column beside it. A reader takes a percentage headline more seriously than
+    # a dollar figure, not less.
+    #
+    # The percentage is scale-invariant, which is the argument for keeping it,
+    # and scale is not what these two conditions damage.
+    #
+    # An unprovable lifetime is a *guess* between 1.25x and 2.0x that the arms
+    # do not share equally: measured, the same twelve requests read 20.0% with a
+    # provable 5m lifetime and 50.0% when the row and the marker disagreed.
+    #
+    # Estimated sizes are a byte-share split, which moves the boundary between
+    # segments while preserving the billed total. Measured directly, holding the
+    # total at 30,300 tokens and moving only the split, the relocation headline
+    # ran 83.7% -> 82.4% -> 80.5% -> 78.0% -> 71.6% as the volatile head grew
+    # from 300 to 6,000 tokens: 12.1 points of Gate 1 verdict from nothing but
+    # where the boundary was drawn. The placement headline held at exactly 20.0%
+    # across that same range, so it is *not* true that every arm moves -- said
+    # plainly because the first draft of this comment claimed it did and the
+    # measurement only supports the relocation half. One of the two verdicts
+    # moving is enough: both are Gate 1 answers and they are blocked together.
+    #
+    # This is the correction to a judgement I recorded as deliberate and got
+    # wrong, on a defect the reviewer reproduced rather than one I found.
+    if (omitted or misscaled or excluded_billed or unprovable
+            or not structure_ok):
         # Per-reason counts are reported alongside, never summed: they overlap,
         # and a request omitted for two reasons is still one request.
         reasons = ", ".join(f"{len(ids)} {name}"
@@ -1013,11 +1118,18 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
                            delta_pct_relocation_optimistic=None)
-        if not omitted:
+        if misscaled and not omitted:
             # Sizes alone. Returned through the same path rather than an earlier
             # one, because a short-circuit made this check mask the omission
             # verdict on a trace where both were true -- one guard hiding
             # another is its own defect.
+            #
+            # `misscaled and` is load-bearing now that two more conditions reach
+            # this block. It used to read `if not omitted`, which was equivalent
+            # only while the outer condition guaranteed one of three things was
+            # true; with five, an unprovable lifetime on a well-sized trace would
+            # have fallen in here and rendered "indeterminate: ." -- an empty
+            # reason where the reason is the entire point.
             only_sizes = f"indeterminate: {size_note}."
             # Carries the same counters as the path below even though reaching
             # here means every one of them is zero: that holds only because all
@@ -1033,17 +1145,41 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
                            delta_pct_relocation_optimistic=None)
-        indeterminate = (
-            f"indeterminate: {omitted} of {len(reqs)} requests contributed nothing "
-            f"({reasons}; a request can count under more than one reason, so these "
-            f"overlap and do not sum), so this compares a subset and cannot answer "
-            f"the gate. Fix the ingest, or state the denominator and read it as a "
-            f"subset result."
-            + (f" Separately, {size_note}." if size_note else ""))
+        if omitted:
+            indeterminate = (
+                f"indeterminate: {omitted} of {len(reqs)} requests contributed nothing "
+                f"({reasons}; a request can count under more than one reason, so these "
+                f"overlap and do not sum), so this compares a subset and cannot answer "
+                f"the gate. Fix the ingest, or state the denominator and read it as a "
+                f"subset result."
+                + (f" Separately, {size_note}." if size_note else ""))
+            return BakeOff(group=group, n_requests=len(reqs), window_days=window,
+                           arms=pess, optimistic=opt, moves=moves, unstructured=skipped,
+                           untimed=untimed, unpriceable=unpriceable, unmodelled_ttl=unmodelled,
+                           unmodelled_target=unknown_target, verdict=indeterminate, verdict_relocation=indeterminate,
+                           delta_pct=None, delta_pct_relocation=None,
+                           delta_pct_optimistic=None, delta_pct_relocation_optimistic=None)
+        # Neither a subset nor an unknown scale. Every request reached every
+        # arm and the sizes agree with the bill -- what is missing is the
+        # evidence that the numbers those arms were built from mean anything.
+        # The arms' dollars are already withheld above; this is the claim they
+        # support, refused for the same reason and in the same breath.
+        unproven = (
+            "indeterminate: "
+            + (f"{len(unprovable)} of {len(reqs)} requests recorded cache writes "
+               f"whose lifetime the trace never established, so every arm priced "
+               f"them at a guess between 1.25x and 2.0x. The arms do not share "
+               f"that guess equally, so the comparison moves with it and cannot "
+               f"answer the gate"
+               if unprovable else
+               f"{structure_why}. Every arm above is computed from those "
+               f"boundaries, so the comparison between them inherits the doubt "
+               f"and cannot answer the gate"))
         return BakeOff(group=group, n_requests=len(reqs), window_days=window,
                        arms=pess, optimistic=opt, moves=moves, unstructured=skipped,
                        untimed=untimed, unpriceable=unpriceable, unmodelled_ttl=unmodelled,
-                       unmodelled_target=unknown_target, verdict=indeterminate, verdict_relocation=indeterminate,
+                       unmodelled_target=unknown_target, verdict=unproven,
+                       verdict_relocation=unproven,
                        delta_pct=None, delta_pct_relocation=None,
                        delta_pct_optimistic=None, delta_pct_relocation_optimistic=None)
 

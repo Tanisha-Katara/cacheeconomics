@@ -930,7 +930,7 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
     def test_a_clean_trace_still_reaches_a_verdict(self):
         ts = TraceSet(requests=self._base(), tier=Tier.INSTRUMENTED, source="x")
         b = simulate.bake_off(ts.analysable, group="g", allow_unreconciled=True,
-                              excluded_billed=ts.excluded_billed)
+                              excluded_billed=ts.excluded_billed, trace=ts)
         self.assertIsNotNone(b.delta_pct)
         self.assertNotIn("indeterminate", b.verdict)
 
@@ -996,6 +996,46 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
                 f"decide whether a figure priced from segment boundaries may be "
                 f"published cannot reach the spend gate")
 
+    # PENDING MERGE, same two lines. Kept separate from the structural check
+    # above because it fails for a different reason and would otherwise hide
+    # behind it: that one asserts the argument is passed, this one asserts the
+    # command still works once it is.
+    @unittest.expectedFailure
+    def test_the_cli_still_prints_dollars_when_the_evidence_is_there(self):
+        """The regression the argument-passing check cannot catch.
+
+        A fail-closed gate that nothing opens is indistinguishable from a broken
+        command, and `cmd_bakeoff` is currently on the no-trace path
+        permanently: the shipped `cacheeconomics bakeoff` cannot release a
+        dollar figure for any input at all, including a clean instrumented
+        capture with a reconciling invoice. Asserting only that `trace=` appears
+        in the source would go green on wiring that passed the wrong object.
+
+        This drives the real command over the real fixture and asserts the
+        positive direction -- $17.14 against a $17.45 invoice, which is what it
+        printed before this branch touched it.
+        """
+        import io
+        import os
+        from contextlib import redirect_stdout
+
+        from cacheeconomics import cli
+
+        fixture = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "fixtures", "demo-traces.jsonl")
+        args = cli.build_parser().parse_args(
+            ["bakeoff", fixture, "--invoice-usd", "17.45"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(args.func(args), 0)
+        text = out.getvalue()
+        self.assertIn("$17.1443", text,
+                      "the shipped bakeoff cannot print a dollar figure for a "
+                      "clean instrumented trace with a reconciling invoice")
+        self.assertNotIn("[withheld]", text)
+        self.assertNotIn("no trace was supplied", text)
+
 
 class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
     """One trace, two dollar-publishing paths, and the simulator may not be the
@@ -1031,10 +1071,27 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
     structural money. The conditions are enumerated because they are what exists
     today; the drift alarm at the bottom is what covers the next one.
 
-    Only the absolutes. The analyzer keeps an untrusted structural finding and
-    drops it to low confidence rather than deleting it, and `delta_pct` is the
-    bake-off's equivalent claim, so it still prints. What that leaves open is
-    recorded in the report rather than asserted here.
+    The comparison goes with the dollars, which is the correction to a call I
+    first made the other way and recorded as deliberate. Gating only the
+    absolutes reproduced the defect this file is named for one layer up: every
+    arm rendered `[withheld]` and the block still printed "allocator-lite beats
+    the automatic baseline by 50.0% (gate: >=10%)" with a "+0.0% vs
+    litellm-auto" column beside it. A reader takes a percentage headline more
+    seriously than a dollar figure, not less.
+
+    The measurements that settle it, since "scale-invariant" was the argument
+    for keeping the percentage:
+
+      an unprovable lifetime is a guess between 1.25x and 2.0x -- the same
+      twelve requests read 20.0% with a provable 5m lifetime and 50.0% when the
+      row and the marker disagreed;
+
+      an estimated size is a byte-share split that moves the boundary between
+      segments at a fixed billed total -- holding the total at 30,300 tokens and
+      moving only the split, the relocation headline ran 83.7% -> 71.6% as the
+      volatile head grew from 300 to 6,000 tokens, while the placement headline
+      held at exactly 20.0%. Not every arm moves; one Gate 1 verdict moving
+      12.1 points is enough, and both are blocked together.
     """
 
     # Volatile 300-token head in front of a 30,000-token marked body: enough to
@@ -1206,6 +1263,184 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("billed input tokens", why)
 
+    def test_no_gate_one_verdict_survives_withheld_evidence(self):
+        """The headline goes with the dollars when the *evidence* is what failed.
+
+        Stated precisely, because "any withheld arm means no percentage" is a
+        stronger claim than the code makes and than it should make. A run with
+        no invoice withholds every arm and keeps its percentage on purpose:
+        nothing about the trace is in doubt there, only the tie to money that
+        left an account, and the comparison is scale-invariant to that.
+        `test_dollars_and_percentages_are_gated_separately` in test_bakeoff.py
+        is that case and it must keep passing.
+
+        The rule is narrower: when what is missing is evidence the *comparison*
+        rests on -- a lifetime the arms had to guess, boundaries nobody scored,
+        sizes nobody counted, a denominator with holes in it -- the percentage
+        goes too. Every case below is run with `allow_unreconciled=True` so the
+        invoice cannot be the blocker and the condition under test is the only
+        one left.
+
+        The first version of this fix gated `spend_ok` alone and left
+        `delta_pct` and `_verdict(...)` on the normal return, so four
+        `[withheld]` arms sat under "beats the automatic baseline by 50.0%".
+        """
+        cases = dict(self._untrusted_traces())
+        cases["writes of unprovable lifetime"] = TraceSet(
+            requests=[replace(r, ttl_requested=None,
+                              segments=[replace(s, ttl=None) if s.cache_marked
+                                        else s for s in r.segments])
+                      for r in self._reqs()],
+            tier=Tier.INSTRUMENTED, source="x")
+        for label, ts in cases.items():
+            with self.subTest(label):
+                b = simulate.bake_off(ts.analysable, group="g",
+                                      allow_unreconciled=True, trace=ts)
+                held = [p for p, a in b.arms.items() if not a["spend"].released]
+                self.assertTrue(held, f"{label}: nothing was withheld, so this "
+                                      f"row asserts nothing")
+                self.assertIsNone(b.delta_pct, f"{label}: placement percentage")
+                self.assertIsNone(b.delta_pct_relocation,
+                                  f"{label}: relocation percentage")
+                self.assertIsNone(b.delta_pct_optimistic, f"{label}: optimistic")
+                self.assertIsNone(b.delta_pct_relocation_optimistic, label)
+                for v in (b.verdict, b.verdict_relocation):
+                    self.assertIn("indeterminate", v, f"{label}: {v[:60]}")
+                    self.assertNotIn("beats the automatic baseline", v, label)
+                text = str(b)
+                self.assertNotIn("vs litellm-auto", text,
+                                 f"{label}: the inline percentage column "
+                                 f"printed beside withheld arms")
+
+    def test_a_missing_invoice_is_the_deliberate_exception(self):
+        """The boundary of the rule above, pinned so it cannot drift into it.
+
+        No invoice withholds the dollars and keeps the comparison: the trace is
+        not in doubt, only the tie to money. If this ever starts refusing, the
+        gate above has grown past what its evidence supports and the percentage
+        Gate 1 reads has been withheld for a reason that does not touch it.
+        """
+        ts = self._clean()
+        b = simulate.bake_off(ts.analysable, group="g", trace=ts)
+        self.assertFalse(b.arms["as-shipped"]["spend"].released)
+        self.assertIn("no invoice was supplied",
+                      b.arms["as-shipped"]["spend"].withheld_because)
+        self.assertIsNotNone(b.delta_pct)
+        self.assertNotIn("indeterminate", b.verdict)
+
+    def test_the_verdict_still_names_the_specific_blocker(self):
+        """Refusing is not enough if the refusal sends the reader nowhere. Each
+        condition has to say which one it was, or "indeterminate" becomes the
+        tool shrugging."""
+        expect = {
+            "sizes estimated rather than counted": "estimated rather than counted",
+            "inferred structure, alignment never measured": "unmeasured",
+            "inferred structure, alignment below the floor": "72%",
+            "half the requests carry no structure": "50% of requests",
+            "segment sums do not agree with the bill": "do not sum to",
+        }
+        for label, ts in self._untrusted_traces().items():
+            if label not in expect:
+                continue
+            with self.subTest(label):
+                b = simulate.bake_off(ts.analysable, group="g",
+                                      allow_unreconciled=True, trace=ts)
+                self.assertIn(expect[label], b.verdict)
+
+    # --- the trace is the argument, not a hint beside it --------------------
+
+    def _only_trace(self, ts):
+        """The call a caller actually writes once `trace=` exists.
+
+        No `excluded_billed=`. That argument being independent of `trace` is
+        what made the first version of this parity claim false: every test that
+        was supposed to prove it passed both, so the one shape that could fail
+        was the one nobody exercised.
+        """
+        return simulate.bake_off(ts.analysable, group="g",
+                                 allow_unreconciled=True, trace=ts)
+
+    def test_a_failed_but_billed_row_reaches_the_gate_through_the_trace_alone(self):
+        reqs = self._reqs()
+        reqs.append(Request(
+            request_id="failed", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent="a", tenant="t", session="s",
+            target_id="anthropic/direct", ttl_requested="5m", status=500,
+            usage={"input_tokens": 5_000_000, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id="hdr", role="system", tokens=5_000_000,
+                              index=0)]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        self.assertEqual(ts.excluded_billed, {"failed but billed": 1})
+        b = self._only_trace(ts)
+        for end, p, fig in self._arms(b):
+            self.assertFalse(fig.released, f"{end}/{p}")
+        self.assertIn("failed but billed",
+                      b.arms["as-shipped"]["spend"].withheld_because)
+
+    def test_a_row_with_no_usage_reaches_the_gate_through_the_trace_alone(self):
+        reqs = self._reqs()
+        reqs.append(Request(
+            request_id="blind", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent="a", tenant="t", session="s",
+            target_id="anthropic/direct", ttl_requested="5m",
+            usage={}, segments=[]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        self.assertEqual(ts.excluded_billed, {"carrying no usage fields": 1})
+        for end, p, fig in self._arms(self._only_trace(ts)):
+            self.assertFalse(fig.released, f"{end}/{p}")
+
+    def test_a_skipped_row_reaches_the_gate_through_the_trace_alone(self):
+        ts = TraceSet(requests=self._reqs(), tier=Tier.INSTRUMENTED, source="x",
+                      skipped_rows=1)
+        self.assertEqual(ts.excluded_billed, {"unreadable in the export": 1})
+        for end, p, fig in self._arms(self._only_trace(ts)):
+            self.assertFalse(fig.released, f"{end}/{p}")
+
+    def test_an_invoice_that_reconciles_does_not_rescue_an_excluded_row(self):
+        """The shape the reviewer reproduced. `analyze` calls this "a subset
+        that happens to agree rather than a reconciliation"; the bake-off used
+        to call it $2.27."""
+        reqs = self._reqs()
+        reqs.append(Request(
+            request_id="failed", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent="a", tenant="t", session="s",
+            target_id="anthropic/direct", ttl_requested="5m", status=500,
+            usage={"input_tokens": 5_000_000, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id="hdr", role="system", tokens=5_000_000,
+                              index=0)]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        priced = simulate.bake_off(ts.analysable, trace=ts,
+                                   allow_unreconciled=True)
+        invoice = priced.arms["as-shipped"]["spend"].raw()
+        a = analyze(ts, invoice_usd=invoice)
+        b = simulate.bake_off(ts.analysable, group="g", trace=ts,
+                              invoice_usd=invoice)
+        self.assertFalse(a.spend["input_usd"].released)
+        self.assertFalse(b.arms["as-shipped"]["spend"].released,
+                         "the bake-off released against an invoice the report "
+                         "called a coincidence over a partial denominator")
+
+    def test_rows_the_caller_did_hand_over_are_not_counted_as_excluded(self):
+        """The other direction, and it cost five green fixtures to learn.
+
+        `TraceSet.excluded_billed` answers "not in `analysable`", which is the
+        wrong question when the caller passes `ts.requests`. Reading it
+        unconditionally reported twenty requests that all reached the arms as
+        "20 carrying no usage fields". What blocks a figure is a billed row the
+        arms never saw.
+        """
+        reqs = [replace(r, usage={}) for r in self._reqs()]
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        self.assertEqual(ts.excluded_billed, {"carrying no usage fields": 12},
+                         "the fixture no longer reproduces the condition")
+        # Every one of those rows is handed to the arms, so none of them is a
+        # row the comparison failed to see.
+        b = simulate.bake_off(reqs, group="g", allow_unreconciled=True, trace=ts)
+        self.assertNotIn("never reached the arms", b.verdict)
+        self.assertIsNotNone(b.delta_pct)
+
     def test_a_caller_that_says_nothing_gets_nothing(self):
         """Fail closed, which is the half a keyword argument cannot enforce on
         its own. The trace here is the clean one that releases above; the only
@@ -1318,13 +1553,22 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
 
     @classmethod
     def _simulator_gate_inputs(cls):
+        """Every `TraceSet` attribute the bake-off's gates actually read.
+
+        Both helpers, not just the structural one. `_unreached_billed` is where
+        the excluded-row half of the gate lives, and a walk that only looked at
+        `structural_evidence` would have reported `excluded_billed` as
+        unconsulted at the exact moment it started being consulted.
+        """
         import ast
         import inspect
         import textwrap
 
-        tree = ast.parse(textwrap.dedent(
-            inspect.getsource(simulate.structural_evidence)))
-        return cls._attrs_read_off(tree, "trace")
+        found = set()
+        for fn in (simulate.structural_evidence, simulate._unreached_billed):
+            tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+            found |= cls._attrs_read_off(tree, "trace")
+        return found
 
     def test_the_walker_finds_the_gate_it_is_pointed_at(self):
         """Guard the guard, again. A walker that returns the empty set makes the
@@ -1351,6 +1595,69 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
             f"`analyze` gates structural money on {missing} and "
             f"`simulate.structural_evidence` never reads it, so a trace the "
             f"report refuses to cost can still publish per-arm dollars")
+
+    # Every `TraceSet` member the simulator does NOT consult, with the reason it
+    # does not have to. The point of writing them down is that the list is
+    # checked against the dataclass at runtime: a field added to `TraceSet`
+    # later is neither consulted nor excused, so it fails here until somebody
+    # decides which it is. `excluded_billed` was exactly this defect -- a member
+    # that reached the analyzer's gate and the simulator's optional side-channel
+    # argument, and nothing said the two had to agree.
+    NOT_A_GATE = {
+        "analysable": "the arms' input -- choosing the subset is the caller's job",
+        "source": "provenance for the reader, not a condition on a figure",
+        "notes": "prose the report renders; the simulator has no note surface",
+        "blocking_notes": "same, and already classified by the analyzer",
+        "coverage": "reaches the gate through `excluded_billed`, which is read",
+        "skipped_rows": "reaches the gate through `excluded_billed`, which is read",
+        "tokens_counted": (
+            "the raw share; `tokens_are_counted` is the threshold over it and is "
+            "read. Consulting both would be two thresholds for one question"),
+        "token_sums_reconciled": (
+            "the coarse factor-of-two check. `token_sums_publishable` is the "
+            "strict one and is what guards money -- reading the coarse flag here "
+            "was the original defect, one module along"),
+    }
+
+    def test_every_traceset_member_is_either_consulted_or_excused(self):
+        """Discovery over the dataclass, not over a sentence about it."""
+        import dataclasses
+
+        members = {f.name for f in dataclasses.fields(TraceSet)}
+        members |= {n for n in dir(TraceSet)
+                    if not n.startswith("_")
+                    and isinstance(getattr(TraceSet, n, None), property)}
+        self.assertGreaterEqual(len(members), 12,
+                                f"only found {sorted(members)} -- the member "
+                                f"walk is broken and this checks nothing")
+        consulted = self._simulator_gate_inputs()
+        unclassified = sorted(members - consulted - set(self.NOT_A_GATE))
+        self.assertEqual(
+            unclassified, [],
+            f"`TraceSet` carries {unclassified}, which the bake-off neither "
+            f"reads nor excuses. Either it gates a figure and belongs in the "
+            f"simulator's gates, or it does not and belongs in NOT_A_GATE with "
+            f"the reason -- an unclassified member is how `excluded_billed` "
+            f"stayed an optional side-channel while the analyzer gated on it")
+
+    def test_the_excuse_list_does_not_rot(self):
+        """A name in NOT_A_GATE that `TraceSet` no longer has is an excuse for
+        a member that stopped existing, which quietly shrinks the check."""
+        import dataclasses
+
+        members = {f.name for f in dataclasses.fields(TraceSet)} | {
+            n for n in dir(TraceSet) if not n.startswith("_")}
+        stale = sorted(set(self.NOT_A_GATE) - members)
+        self.assertEqual(stale, [],
+                         f"NOT_A_GATE excuses {stale}, which `TraceSet` no "
+                         f"longer carries")
+        # An excuse for something the gate does read is worse than stale: it
+        # would keep the member classified if the read were ever removed, which
+        # is the silent-partial-closure shape this file exists to catch.
+        both = sorted(set(self.NOT_A_GATE) & self._simulator_gate_inputs())
+        self.assertEqual(both, [],
+                         f"NOT_A_GATE excuses {both}, which the gate actually "
+                         f"reads -- drop the excuse or the read")
 
     def test_the_floor_is_one_number_and_not_two(self):
         """The threshold is imported from the analyzer rather than restated.

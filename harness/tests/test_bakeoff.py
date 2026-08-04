@@ -46,6 +46,20 @@ def req(n, segments, gap=60, model="claude-opus-5", usage=None):
                    agent="a", target_id="anthropic/direct")
 
 
+def instrumented(reqs, **kw):
+    """The trace a list of hand-built requests came from, stated.
+
+    `bake_off` will not answer the gate over segment boundaries whose
+    provenance nobody has claimed -- alignment, coverage and whether the sizes
+    were counted live on the `TraceSet` and on nothing a `Request` carries, so
+    a bare list means "not stated" and not "fine". Tests that assert a verdict
+    say what they are asserting it over; tests that assert an *indeterminate*
+    verdict do not need this, because the condition they are testing blocks
+    first either way.
+    """
+    return TraceSet(requests=list(reqs), tier=Tier.INSTRUMENTED, **kw)
+
+
 def volatile_head(n=6, model="claude-opus-5"):
     """A volatile 90-token system header above 20k of stable system content.
 
@@ -238,7 +252,8 @@ class TestRelocationLite(unittest.TestCase):
 class TestBakeOff(unittest.TestCase):
 
     def test_relocation_beats_placement_when_the_prefix_is_blocked(self):
-        b = simulate.bake_off(volatile_head(n=20))
+        reqs = volatile_head(n=20)
+        b = simulate.bake_off(reqs, trace=instrumented(reqs))
         self.assertGreater(b.delta_pct_relocation, b.delta_pct)
 
     def test_verdict_says_linter_below_the_gate(self):
@@ -591,7 +606,8 @@ class TestNoFabricatedReads(unittest.TestCase):
             self.assertLessEqual(p.reads, n.reads)
 
     def test_the_headline_is_the_pessimistic_end_of_the_range(self):
-        b = simulate.bake_off(volatile_head(n=30))
+        reqs = volatile_head(n=30)
+        b = simulate.bake_off(reqs, trace=instrumented(reqs))
         self.assertLessEqual(b.delta_pct, b.delta_pct_optimistic,
                              "the reported verdict must not be the flattering end")
         # A tie states itself in words rather than as "0.0%". That case became
@@ -2514,7 +2530,8 @@ class TestPartialBakeOffsAreIndeterminate(unittest.TestCase):
                       seg(1, "user", 100, f"t{i}")]) for i in range(n)]
 
     def test_a_clean_trace_still_produces_a_verdict(self):
-        b = simulate.bake_off(self._clean())
+        reqs = self._clean()
+        b = simulate.bake_off(reqs, trace=instrumented(reqs))
         self.assertIsNotNone(b.delta_pct)
         self.assertNotIn("indeterminate", b.verdict)
 
@@ -2831,7 +2848,8 @@ class TestUnknownMinimumsAreNotAssumedCacheable(unittest.TestCase):
         self.assertEqual(res.unmodelled_ttl, 6)
 
     def test_a_registered_model_still_produces_a_verdict(self):
-        b = simulate.bake_off(self._reqs("claude-opus-5"))
+        reqs = self._reqs("claude-opus-5")
+        b = simulate.bake_off(reqs, trace=instrumented(reqs))
         self.assertIsNotNone(b.delta_pct)
 
 
@@ -3158,6 +3176,12 @@ class TestTheBakeOffRefusesUnvalidatedSizes(unittest.TestCase):
                  # used to get from the loader defaulting an unnamed row
                  # to first-party.
                  "target_id": "anthropic/direct",
+                 # Stated alongside the surface, and for the same reason: these
+                 # tests are about size *agreement*, so counted sizes are a
+                 # precondition rather than the thing under test. A row that does
+                 # not say counts as estimated, and an estimated split now blocks
+                 # the comparison as well as the dollars.
+                 "tokens_counted": True,
                  "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
                            "cache_creation_input_tokens": 1_000,
                            "cache_creation": {"ephemeral_5m_input_tokens": 1_000,
@@ -3175,22 +3199,26 @@ class TestTheBakeOffRefusesUnvalidatedSizes(unittest.TestCase):
         try:
             with open(path, "w") as f:
                 f.write("\n".join(json.dumps(r) for r in rows))
-            return load_jsonl(path).analysable
+            return load_jsonl(path)
         finally:
             os.unlink(path)
 
+    def _bake(self, seg_tokens, n=20):
+        ts = self._trace(seg_tokens, n=n)
+        return simulate.bake_off(ts.analysable, trace=ts)
+
     def test_agreeing_sizes_produce_a_verdict(self):
         """The control. Refusing everything would also pass a bad test."""
-        b = simulate.bake_off(self._trace(500))
+        b = self._bake(500)
         self.assertIsNotNone(b.delta_pct)
 
     def test_mis_scaled_sizes_produce_no_percentage(self):
-        b = simulate.bake_off(self._trace(500_000))
+        b = self._bake(500_000)
         self.assertIsNone(b.delta_pct)
         self.assertTrue(b.verdict.startswith("indeterminate"))
 
     def test_the_verdict_says_the_percentage_survives_but_the_absolutes_do_not(self):
-        b = simulate.bake_off(self._trace(500_000))
+        b = self._bake(500_000)
         self.assertIn("differ from", b.verdict)
         self.assertIn("does not cancel out of the absolutes", b.verdict)
         # The observed magnitude, not just that something was wrong. An operator

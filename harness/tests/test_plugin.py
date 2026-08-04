@@ -1253,7 +1253,14 @@ class TestTheBakeOffFailsClosedOnAnUnknownSurface(unittest.TestCase):
 
     def test_a_clean_workload_still_reaches_a_verdict(self):
         from cacheeconomics.simulate import bake_off
-        b = bake_off(self._reqs(unknown=0))
+        from cacheeconomics.trace import Tier, TraceSet
+        reqs = self._reqs(unknown=0)
+        # The trace these requests came from, stated. `bake_off` will not answer
+        # the gate over segment boundaries whose provenance nobody has claimed,
+        # and the test above needs no trace because an unregistered surface
+        # blocks first either way.
+        b = bake_off(reqs, trace=TraceSet(requests=list(reqs),
+                                          tier=Tier.INSTRUMENTED))
         self.assertNotIn("indeterminate", b.verdict)
 
 

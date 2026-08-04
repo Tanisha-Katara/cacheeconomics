@@ -203,12 +203,59 @@ class TestRecordingRoundTrip(unittest.TestCase):
         os.unlink(path)
 
     def test_a_recorded_trace_can_run_a_bake_off(self):
-        """The whole point: real structure, so a counterfactual is derivable."""
+        """The whole point: real structure, so a counterfactual is derivable.
+
+        The structure is what this asserts. The *verdict* is a separate claim
+        and the recorder does not yet earn it: `Recorder` runs
+        `_scale_to_measured` over every capture and never writes
+        `tokens_counted`, so its own output loads with `tokens_are_counted`
+        False and the bake-off will not answer Gate 1 over a byte-share split.
+        That is not a regression this test should paper over -- `analyze` over
+        the identical capture already withholds FAN-1's money for the same
+        reason and drops it to confidence "low". The two agreeing is the point.
+
+        The counted half is asserted below, so this is a statement about the
+        recorder rather than an off switch.
+        """
         path, _ = self._record(n=8)
-        b = bake_off(load_jsonl(path).analysable, group="coder")
+        ts = load_jsonl(path)
+        b = bake_off(ts.analysable, group="coder", trace=ts)
         self.assertEqual(b.n_requests, 8)
         self.assertEqual(b.unstructured, 0)
+        self.assertFalse(ts.tokens_are_counted,
+                         "the recorder has started counting segment sizes -- "
+                         "delete this and assert the verdict directly")
+        self.assertIn("estimated rather than counted", b.verdict)
+        os.unlink(path)
+
+    def test_the_same_capture_with_counted_sizes_reaches_a_verdict(self):
+        """And the gate is not an off switch.
+
+        The same eight rows, with the one fact the recorder does not record
+        added: that the segment sizes were counted rather than divided up by
+        byte share. Nothing else changes -- same ids, same sizes, same
+        timestamps -- and the bake-off answers.
+
+        Both flags, because the recorder stamps `tokens_are_estimated: True` on
+        every row it writes and an explicit denial beats an explicit
+        affirmation. Asserting that the recorder still stamps it, rather than
+        just deleting it, keeps this test honest about what it is overriding:
+        the capture says its sizes are estimates and it is right.
+        """
+        path, _ = self._record(n=8)
+        rows = [json.loads(line) for line in open(path) if line.strip()]
+        self.assertTrue(all(r.get("tokens_are_estimated") is True for r in rows),
+                        "the recorder stopped declaring its sizes estimated")
+        for row in rows:
+            row["tokens_are_estimated"] = False
+            row["tokens_counted"] = True
+        with open(path, "w") as f:
+            f.write("\n".join(json.dumps(r) for r in rows))
+        ts = load_jsonl(path)
+        self.assertTrue(ts.tokens_are_counted)
+        b = bake_off(ts.analysable, group="coder", trace=ts)
         self.assertIsNotNone(b.delta_pct)
+        self.assertNotIn("indeterminate", b.verdict)
         os.unlink(path)
 
 
