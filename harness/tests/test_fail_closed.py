@@ -266,6 +266,29 @@ class TestARateFreeRuleIsSafeOnATraceNothingCanPrice(unittest.TestCase):
                 for i in range(12)]
         return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
 
+    def _ttl2_trace(self):
+        """A trace TTL-2 prices: one-hour writes, ten-plus gaps, band rare."""
+        def req(rid, when, write_1h, read):
+            usage = {"input_tokens": 100, "cache_read_input_tokens": read,
+                     "cache_creation_input_tokens": write_1h}
+            if write_1h:
+                usage["cache_creation"] = {"ephemeral_5m_input_tokens": 0,
+                                           "ephemeral_1h_input_tokens": write_1h}
+            return Request(request_id=rid, sent_at=when, model="claude-opus-5",
+                           target_id="anthropic/direct", tenant="t",
+                           session="s", agent="a", ttl_requested="1h",
+                           usage=usage, segments=[])
+
+        reqs = [req(f"a{i}", T0 + timedelta(seconds=60 * i), 50_000, 0)
+                for i in range(8)]
+        base = T0 + timedelta(days=1, hours=12)
+        for i in range(6):
+            offset = 60 * i + (540 if i >= 4 else 0)
+            write, read = 50_000, (200_000 if i == 4 else 0)
+            reqs.append(req(f"b{i}", base + timedelta(seconds=offset),
+                            write, read))
+        return TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x")
+
     def _rate_free_rules(self):
         from cacheeconomics.analyzer import RULES
         return [r for r in RULES if getattr(r, "rate_free", False)]
@@ -333,6 +356,157 @@ class TestARateFreeRuleIsSafeOnATraceNothingCanPrice(unittest.TestCase):
                             fig is not None and fig.raw(),
                             f"{f.code} priced a lifetime change on a surface "
                             f"that does not sell two lifetimes")
+
+    def test_every_surface_gets_the_decision_we_intend(self):
+        """Per-surface expected outcome, not merely "nothing exploded".
+
+        The sweep above asserts `analyze()` does not raise, and that is a weaker
+        claim than it looks: a wrong price does not raise. It is the same gap
+        that let TTL-1 crash on `openai/direct` while two hand-picked fixtures
+        passed, one level up -- crash-freedom is not correctness.
+
+        So each shipped surface is named with the decision it should get.
+        `deepseek/direct` is not in the registry's multiplier table at all;
+        `openai/direct` is, and describes a different product with no two
+        lifetimes to compare. Both must abstain. The four Anthropic-shaped
+        surfaces must validate. A surface added to the registry without being
+        added here fails on the count, which is the point: a new surface is a
+        new shape until somebody says otherwise.
+        """
+        from cacheeconomics import registry
+        from cacheeconomics.analyzer import _lifetime_multipliers
+        expected = {
+            "anthropic/direct": True,
+            "anthropic/claude-platform-on-aws": True,
+            "amazon-bedrock/converse": True,
+            "google-cloud/vertex": True,
+            # Prompt caching without a lifetime choice: no 5m/1h keys, null read.
+            "openai/direct": False,
+            # Not in the multiplier table at all.
+            "deepseek/direct": False,
+        }
+        self.assertEqual(
+            sorted(expected), sorted(registry.target_ids()),
+            "the registry's surfaces changed; state the intended "
+            "validate-or-abstain decision for each new one")
+        for target, should_validate in expected.items():
+            with self.subTest(target=target):
+                try:
+                    m = registry.multipliers(target)
+                except registry.RegistryError:
+                    self.assertFalse(should_validate,
+                                     "expected a multiplier map, got none")
+                    continue
+                got = _lifetime_multipliers(m) is not None
+                self.assertEqual(should_validate, got,
+                                 f"{target} validates={got}, intended "
+                                 f"{should_validate}")
+
+    def test_no_rule_prices_from_a_multiplier_map_it_did_not_validate(self):
+        """Enumerated by poisoning the registry, not by reading the source.
+
+        The previous audit was a sentence -- "REB-1, REB-0, SPL-1 and MIN-1
+        never touch a multiplier map, VOL-1 and FAN-1 now use the validator" --
+        and it was wrong: it never checked TTL-2, which read `.get()` and tested
+        truthiness, so a `write_5m` of `True` priced at 1.0x. Reading the source
+        has now been wrong in both directions in this file, so the enumeration
+        moves into the test.
+
+        `registry.multipliers` is replaced with one returning `write_5m=True`
+        beside real numbers. `True` is truthy, so a `.get()`-plus-truthiness
+        guard waves it through, and `bool` subclasses `int`, so the arithmetic
+        prices the five-minute write at 1.0x instead of 1.25x -- quietly, and in
+        the flattering direction. Any rule that reaches for a multiplier without
+        validating shows up as a nonzero dollar amount here.
+
+        The first poison map set every value to `True`, and it caught nothing:
+        `w1h <= w5` is then `1 <= 1`, so TTL-2 skipped the scope for an
+        unrelated reason and looked innocent. Verified by reverting the fix and
+        watching this pass. A poison that every rule declines for the wrong
+        reason tests nothing, so one value stays real and the ordering holds.
+        """
+        from cacheeconomics import analyzer, registry
+        from cacheeconomics.analyzer import RULES, analyze
+
+        poisoned = {"write_5m": True, "write_1h": 2.0, "read": 0.1}
+
+        class OnlyMultipliersPoisoned:
+            """The analyzer's view of the registry, and nothing else's.
+
+            Setting `registry.multipliers` on the module poisons `cost.price`
+            too, because both modules hold the same object -- and then EFF-1
+            lights up for delegating its pricing to `cost.price`, which is
+            correct delegation rather than an unvalidated read. The scope of
+            this audit is rules in `analyzer.py` that reach for a multiplier map
+            themselves, so the substitution is scoped the same way.
+
+            (`cost.price` does index a multiplier map without validating it.
+            `cost.py` is not this track's file; reported rather than patched.)
+            """
+
+            def __getattr__(self, name):
+                return getattr(registry, name)
+
+            def multipliers(self, target_id):
+                return dict(poisoned)
+
+        real_registry = analyzer.registry
+
+        def rate_for(model, when=None, target_id=None):
+            return 5.0
+
+        def figures(ts, ratios):
+            out = {}
+            for rule in RULES:
+                f = rule(ts.analysable, ratios, 3.0, rate_for)
+                if f is None:
+                    continue
+                for name in ("avoidable_usd_month", "avoidable_usd_window"):
+                    fig = getattr(f, name)
+                    if fig is not None and fig.raw():
+                        out[f"{rule.__name__}.{name}"] = fig.raw()
+            return out
+
+        fixtures = [("segments", self._trace("anthropic/direct", segments=True)),
+                    ("one-hour writes", self._ttl2_trace())]
+        clean, poisoned_out = {}, {}
+        for label, ts in fixtures:
+            ratios = analyze(ts, allow_unreconciled=True).ratios
+            clean[label] = figures(ts, ratios)
+            analyzer.registry = OnlyMultipliersPoisoned()
+            try:
+                poisoned_out[label] = figures(ts, ratios)
+            finally:
+                analyzer.registry = real_registry
+
+        # Vacuity guard, and it is the one that matters: if no rule prices at
+        # all on these fixtures, "nothing priced under poison" is true and
+        # meaningless. Naming TTL-2 because it is the rule this test was written
+        # for, and the reason the first version passed was that it never fired.
+        priced_clean = {k for d in clean.values() for k in d}
+        self.assertTrue(priced_clean, "no rule priced with a real registry")
+        self.assertTrue(
+            any(k.startswith("_f_ttl_premium_unearned") for k in priced_clean),
+            f"TTL-2 does not price on these fixtures, so poisoning the "
+            f"registry cannot reveal how it reads one: {sorted(priced_clean)}")
+
+        # Changed, not merely present. A rule that validates abstains and its
+        # figure disappears; a rule that never reads a multiplier map -- EFF-1
+        # delegates its pricing to `cost.price`, which keeps the real registry
+        # here -- produces exactly the number it produced before. Only a rule
+        # that consumed the poisoned map comes back with a *different* one.
+        # Flagging every figure instead made this fail on EFF-1 for pricing
+        # correctly, which is a test that cannot tell delegation from a defect.
+        leaked = sorted(
+            f"{label}: {k} {clean[label].get(k)!r} -> {v!r}"
+            for label, d in poisoned_out.items()
+            for k, v in d.items()
+            if k in clean[label] and v != clean[label][k])
+        self.assertEqual(
+            [], leaked,
+            "these priced from a multiplier map they never validated, so a "
+            "boolean in the registry becomes a 1.0x rate:\n    "
+            + "\n    ".join(leaked))
 
     def test_the_validator_refuses_every_shape_it_cannot_price(self):
         """The helper itself, over the shapes that reach it.
@@ -2577,6 +2751,61 @@ class TestEveryProjectionSampleIsMadeOfRequestsThatMoveTheFigure(unittest.TestCa
                         f"{movers[f.code]} of them move its figure: the "
                         f"remainder pad the sample and clear a floor they "
                         f"contributed nothing to")
+
+    def _identical_but_for_ids(self, ids):
+        reqs = [Request(request_id=rid, sent_at=T0 + timedelta(hours=6 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", session="s", agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 100_000},
+                        segments=[])
+                for i, rid in enumerate(ids)]
+        return TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x")
+
+    def test_the_sample_does_not_depend_on_request_ids_being_usable(self):
+        """The under-count direction, which the probe above cannot see.
+
+        That probe asserts the sample is no *larger* than the requests that move
+        the figure, so it catches padding and is blind to the opposite. The
+        dedup introduced to stop TTL-2 counting terms as requests keyed on
+        `request_id` -- and `request_id` is not a key. Nothing in the schema
+        requires it to be unique or present, and the Claude Code loader writes
+        `""` whenever a record carries neither `requestId` nor `uuid`. Measured
+        on that shape: twelve distinct contributing requests collapsed to a
+        sample of 1 with a zero-hour span, and a monthly figure the trace fully
+        supported was withheld.
+
+        It fails toward withholding, which is why it needed a test rather than a
+        bug report: nobody complains about a figure they never saw, so it would
+        have outlived the defect it was introduced to fix.
+
+        Asserted as an equality across three id shapes rather than as a number,
+        so this stays true if the fixture's arithmetic ever changes.
+        """
+        shapes = {"distinct": [f"r{i}" for i in range(12)],
+                  "all blank": [""] * 12,
+                  "all identical": ["dup"] * 12}
+        samples = {}
+        for label, ids in shapes.items():
+            a = analyze(self._identical_but_for_ids(ids), allow_unreconciled=True)
+            eff = next(f for f in a.findings if f.code == "EFF-1")
+            samples[label] = eff.projection_sample
+        self.assertEqual(12, samples["distinct"],
+                         "the control no longer counts every contributor")
+        self.assertEqual(
+            {12}, set(samples.values()),
+            f"the projection sample changes with the shape of the request ids, "
+            f"which are not a key: {samples}")
+
+    def test_and_the_monthly_figure_survives_a_trace_with_no_ids(self):
+        """The consequence, at the figure rather than at the counter."""
+        ts = self._identical_but_for_ids([""] * 12)
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        a = analyze(ts, invoice_usd=invoice)
+        eff = next(f for f in a.findings if f.code == "EFF-1")
+        self.assertTrue(eff.avoidable_usd_month.released,
+                        "a supportable projection was withheld because the "
+                        "export carried no request ids")
 
     def test_fan_out_counts_one_request_per_pair(self):
         """The member that was reported, named explicitly so the measurement

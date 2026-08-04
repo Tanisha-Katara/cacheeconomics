@@ -464,8 +464,8 @@ def _avoidable(amount: float | None, window_days: float | None,
     counterfactual -- what the workload would not have spent under a different
     configuration -- and no counterfactual was run.
 
-    `contributions` is `(request_id, sent_at)` for every term that moved
-    `amount`, and it is required rather than optional. The floor used to be
+    `contributions` is the Request behind every term that moved `amount` -- the
+    object, not its id -- and it is required rather than optional. The floor used to be
     evaluated once, from the whole trace, and applied to every finding -- so a
     finding costed from two requests one second apart published a month because
     eight unrelated requests elsewhere in the file made the *global* window and
@@ -476,18 +476,35 @@ def _avoidable(amount: float | None, window_days: float | None,
     Required, with no default, because a default is how the next rule silently
     gets the old behaviour back.
 
-    Pairs rather than bare timestamps, and *deduplicated by request id*, because
-    `PROJECTION_MIN_REQUESTS` counts requests and this counted terms. TTL-2
-    contributes twice for one request -- once for its one-hour write and again
-    when that same request sits after an in-band gap carrying a priced read --
-    so nine distinct dollar-moving requests reported a sample of ten and
-    released the monthly figure. That is the third form of one defect: FAN-1
-    padded the sample with requests it never charged, and this pads it with the
-    same request charged twice. Identity is what both need, so identity is what
-    the floor is given.
+    Deduplicated per request, because `PROJECTION_MIN_REQUESTS` counts requests
+    and this counted terms. TTL-2 contributes twice for one request -- once for
+    its one-hour write and again when that same request sits after an in-band
+    gap carrying a priced read -- so nine distinct dollar-moving requests
+    reported a sample of ten and released the monthly figure. That is the third
+    form of one defect: FAN-1 padded the sample with requests it never charged,
+    and this pads it with the same request charged twice.
 
     The span is taken over the deduplicated timestamps for the same reason: a
     request counted twice does not widen the window it was observed in.
+
+    Keyed on the row object rather than on `request_id`, and the first version
+    keyed on the id. `request_id` is not a key: nothing in the schema requires
+    it to be unique or present, and the Claude Code loader writes `""` whenever
+    a transcript record carries neither `requestId` nor `uuid`. Measured on that
+    shape -- twelve distinct contributing requests, every id blank -- the sample
+    collapsed to 1 with a zero-hour span and the monthly figure was withheld
+    from a trace that fully supported it.
+
+    That failure points the safe way, which is exactly why it needed finding:
+    withholding a figure a client was entitled to draws no complaint, so it
+    would have outlived the defect it was introduced to fix. Fixing
+    over-counting by under-counting is not a fix.
+
+    What this cannot separate, stated because the alternative is implying
+    otherwise: several references to one Request object, as `[r] * 5` builds.
+    Those are one row by this measure. No loader produces that -- they construct
+    a row per record -- and `request_id` keying collapsed them identically, so
+    nothing regresses; it is simply not a distinction object identity can draw.
 
     The subset check subsumes the global one for findings and is not merely
     added to it: a finding's sample is drawn from the trace, so its window and
@@ -498,10 +515,12 @@ def _avoidable(amount: float | None, window_days: float | None,
     if amount is None:
         return {"avoidable_usd_window": None, "avoidable_usd_month": None,
                 "projection_why": "", "projection_sample": 0}
-    # A dict, so a request contributing several terms is one observation and
-    # keeps one timestamp. `dict` also preserves insertion order, which keeps
-    # the span deterministic when two requests share an instant.
-    sample = {rid: when for rid, when in contributions}
+    # A dict keyed on object identity, so a request contributing several terms
+    # is one observation and keeps one timestamp, while two rows that happen to
+    # share an id -- or carry none -- stay two. `dict` also preserves insertion
+    # order, which keeps the span deterministic when two requests share an
+    # instant.
+    sample = {id(r): r.sent_at for r in contributions}
     supported, why = _projection_supported(_span_days(sample.values()),
                                            len(sample), sample="finding")
     return {
@@ -656,7 +675,7 @@ def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
             continue
         term = spend.usd - spend.hypothetical_uncached_usd
         if term:
-            contributed.append((r.request_id, r.sent_at))
+            contributed.append(r)
         excess += term
     wasted = excess
     if wasted <= 0:
@@ -825,7 +844,7 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
             mult = _lifetime_multipliers(m)
             if mult is None:
                 continue
-            contributed.append((r.request_id, sent_at))
+            contributed.append(r)
             delta = (mult[0] if ttl == "5m" else mult[1]) - mult[2]
             wasted += tokens * (rate_for(r.model, _when(r), r.target_id) / 1e6) * delta
     # A later blocker can leave nothing recoverable by moving this one alone.
@@ -1063,9 +1082,13 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             by_scope[(r.tenant, r.target_id, r.model, r.session)].append(
                 (r.sent_at, u.cache_write_5m, rate_for(r.model, _when(r), r.target_id),
                  spans, (r.usage.get("cache_read_input_tokens") or 0),
-                 # Last, so `writes.sort()` still orders on time first and only
-                 # reaches the id when everything before it ties.
-                 r.request_id))
+                 # The row itself, so the projection floor can tell two
+                 # contributions from one request apart from two requests
+                 # sharing -- or missing -- an id. Last in the tuple, and the
+                 # sort below is keyed to stop before it: a Request is not
+                 # orderable, so a full tie on everything ahead of it would
+                 # otherwise raise rather than fall back to insertion order.
+                 r))
 
         # Only a rewrite in the 5m-to-1h band is evidence that the five-minute
         # lifetime is what caused the miss. A rewrite 60 seconds after the last
@@ -1082,7 +1105,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
         contributed: list = []
         non_ttl_misses, in_band_rewrites = 0, 0
         for scope, writes in by_scope.items():
-            writes.sort()
+            writes.sort(key=lambda w: w[:5])
             # The scope's own surface. This read `r.target_id` -- `r` left over
             # from the loop that *built* by_scope, so on a mixed-surface agent
             # every scope was priced with whichever request happened to be last.
@@ -1132,7 +1155,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             # stops at the first match, which is the longest still-relevant one
             # because writes are in time order.
             earlier: list = []
-            for sent_at, tokens, rate, spans, read, rid in writes:
+            for sent_at, tokens, rate, spans, read, row in writes:
                 per_token = rate / 1e6
                 # The size of the cache ENTRY this request leaves behind, which
                 # is not the size of the write that touched it.
@@ -1231,10 +1254,10 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                     # write again.
                     recovered = min(match[1], tokens)
                     recoverable += recovered * per_token * (_w5 - _read)
-                    contributed.append((rid, sent_at))
+                    contributed.append(row)
                 else:
                     recoverable -= tokens * per_token * (_w1h - _w5)    # cold write costs more
-                    contributed.append((rid, sent_at))
+                    contributed.append(row)
 
         # A longer lifetime only helps if the prefix is actually reused, and
         # there are two ways to prove reuse. Observed reads are one. The other
@@ -1418,11 +1441,30 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
             m = registry.multipliers(target_id)
         except registry.RegistryError:
             continue
-        w5, w1h, read = m.get("write_5m"), m.get("write_1h"), m.get("read")
+        # The same validator as TTL-1, VOL-1 and FAN-1. This read `.get()` and
+        # tested truthiness, which accepts anything that is not falsy: a
+        # `write_5m` of `True` passed and priced at 1.0x, because `bool`
+        # subclasses `int` -- precisely the case `_lifetime_multipliers` exists
+        # to refuse, in the one rule that was not routed through it.
+        #
+        # The every-surface sweep could not have caught this. It asserts that
+        # `analyze()` does not raise, and a wrong price does not raise. That is
+        # the same gap that let TTL-1 crash on `openai/direct` while two
+        # hand-picked fixtures passed: crash-freedom is not correctness.
+        mult = _lifetime_multipliers(m)
+        if mult is None:
+            continue
+        w5, w1h, read = mult
         # An implicit-prefix surface has no lifetimes to choose between, so
         # there is no premium to have overpaid. Skipping is the honest answer;
         # pricing it against Anthropic's multipliers is how a Bedrock trace once
         # produced a total no bill would match.
+        #
+        # The truthiness test stays alongside the validator rather than being
+        # replaced by it. They reject different things: the validator refuses a
+        # value that is not a number, this refuses a number that is zero.
+        # Dropping it would have let a `read` of 0.0 through, which is a
+        # behaviour change smuggled in under a type fix.
         if not (w5 and w1h and read) or w1h <= w5:
             continue
         surfaces.add(target_id)
@@ -1433,7 +1475,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
             if u.cache_write_1h:
                 written_1h += u.cache_write_1h
                 saving += u.cache_write_1h * per_token * (w1h - w5)
-                contributed.append((r.request_id, sent_at))
+                contributed.append(r)
             if prev is not None:
                 gap = (sent_at - prev[0]).total_seconds()
                 if gap < 300:
@@ -1453,7 +1495,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
                         # one-hour write above. Two terms, one observation --
                         # `_avoidable` deduplicates by this id, which is the
                         # whole reason it takes one.
-                        contributed.append((r.request_id, sent_at))
+                        contributed.append(r)
             prev = (sent_at, r, u)
 
     if not written_1h:
@@ -1652,7 +1694,7 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             #
             # Keyed by request id because three requests fanning out form two
             # adjacent pairs, so the middle one is charged once and seen twice.
-            contributed[b.request_id] = b.sent_at
+            contributed[id(b)] = b
             waste += ub.cache_write_5m * per_token * (mult[0] - mult[2])
             waste += ub.cache_write_1h * per_token * (mult[1] - mult[2])
     # One pair is the whole phenomenon. Two concurrent requests writing the
@@ -1682,7 +1724,7 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
         # Unique requests, not pairs times two. Three requests fanning out form
         # two adjacent pairs and would have been reported as four requests.
         affected_requests=len(affected),
-        **_avoidable(waste, window, contributed.items()),
+        **_avoidable(waste, window, contributed.values()),
         confidence="medium", quality_risk="low",
         fix="Send one request, wait for its first token, then release the rest of the batch.")
 
