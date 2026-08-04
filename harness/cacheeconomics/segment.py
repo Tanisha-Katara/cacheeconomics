@@ -393,6 +393,23 @@ def _mark(body: dict, path: tuple, ttl: str) -> None:
                 f"refusing to place a cache marker on {bi!r} at messages[{mi}]: "
                 f"tool history is visible to the segmenter so drift is caught, "
                 f"and is deliberately not a marker location")
+        # And the content of a message that carries tool history. The check
+        # above only catches the named fields, because there `bi` is a string;
+        # on the message's own content `bi` is None or an int and the path looks
+        # ordinary. That is how a marker reached a `role: tool` result and this
+        # function rewrote a bare string into Anthropic block form on an
+        # OpenAI-shaped request.
+        #
+        # Here rather than only in the caller's position set: this is the last
+        # thing between a decision and a mutated body, so it should refuse on
+        # the rule itself rather than trust whoever computed the positions.
+        msg = body["messages"][mi]
+        if isinstance(msg, dict) and (msg.get("tool_calls") is not None
+                                      or msg.get("tool_call_id") is not None):
+            raise ValueError(
+                f"refusing to place a cache marker on the content of "
+                f"messages[{mi}]: it carries tool history, so the whole message "
+                f"belongs to a protocol this package does not model")
         msg = body["messages"][mi]
         if bi is None:
             msg["content"] = [blockify(msg["content"])]

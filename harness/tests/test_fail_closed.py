@@ -1566,3 +1566,85 @@ class TestUnattributedIsNotASurfaceYouCanConfigure(unittest.TestCase):
         p = CachePlugin(key=b"k" * 32, warmup=0)
         self.assertTrue(litellm_handler(p, mutate=True,
                                         target_id="anthropic/direct"))
+
+
+class TestTheDirectPathObeysTheSameMarkingRule(unittest.TestCase):
+    """`markable_positions` stands a whole message down when it carries tool
+    history — the fields *and* the content — because marking a bare-string
+    `tool` message rewrites it into Anthropic block form on an OpenAI-shaped
+    request. `_filter_near_minimum` reimplemented only the narrow half beside
+    it, so `on_request` with the default `markable=None` placed a marker on a
+    tool result's content that `markable_positions` would have excluded.
+
+    Measured before the fix: barred [1, 2], markable [0, 4], and the direct
+    path placed at 3. Same rule, two scopes — the shape the narrow half was
+    added to close.
+
+    The fixture makes the system block large enough to clear the near-minimum
+    floor, so "placed nothing" cannot be mistaken for "excluded correctly".
+    """
+
+    @staticmethod
+    def _body(i, tool_history=True):
+        msgs = [{"role": "system", "content": "policy " * 9000}]
+        if tool_history:
+            msgs += [{"role": "assistant", "content": None,
+                      "tool_calls": [{"id": "call_x", "type": "function",
+                                      "function": {"name": "f",
+                                                   "arguments": "{}"}}]},
+                     {"role": "tool", "tool_call_id": "call_x",
+                      "content": "RESULT " * 9000}]
+        msgs.append({"role": "user", "content": f"turn {i}"})
+        return {"model": "claude-opus-5", "messages": msgs}
+
+    def _drive(self, tool_history=True, apply=True):
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=4)
+        last = None
+        for i in range(20):
+            _, last = p.on_request(self._body(i, tool_history),
+                                   model="claude-opus-5",
+                                   target_id="anthropic/direct",
+                                   at=T0 + timedelta(seconds=90 * i), apply=apply)
+        return last
+
+    def test_the_direct_path_agrees_with_markable_positions(self):
+        """The invariant the drift broke: whatever `markable_positions` would
+        exclude, the default path does not place."""
+        for apply in (False, True):
+            with self.subTest(apply=apply):
+                last = self._drive(apply=apply)
+                barred = plugin._tool_history_positions(self._body(0))
+                self.assertFalse(set(last.placements) & barred)
+
+    def test_the_tool_results_content_is_barred_not_just_its_fields(self):
+        b = self._body(0)
+        barred = plugin._tool_history_positions(b)
+        mk = plugin.markable_positions(b)
+        self.assertTrue(barred - {1, 2},
+                        "only the named fields are barred; content is not")
+        self.assertFalse(barred & mk, "the two rules disagree")
+
+    def test_it_still_places_where_it_may(self):
+        """Excluding the tool message must not become placing nothing — which
+        the near-minimum floor alone would also produce."""
+        last = self._drive()
+        self.assertTrue(last.applied)
+        self.assertTrue(last.placements)
+
+    def test_a_body_without_tool_history_bars_nothing(self):
+        b = self._body(0, tool_history=False)
+        self.assertEqual(plugin._tool_history_positions(b), frozenset())
+        last = self._drive(tool_history=False)
+        self.assertTrue(last.placements)
+
+    def test_the_writer_refuses_it_even_if_a_caller_asks(self):
+        """The last line of defence. `_mark` caught the named fields, where the
+        path element is a string; on the message's own content the path looks
+        ordinary and it did not."""
+        from cacheeconomics.segment import apply_markers, walk
+        b = self._body(0)
+        content_pos = next(i for i, (_r, _l, _b, path) in enumerate(walk(b))
+                           if path[0] == "messages" and path[1] == 2
+                           and not isinstance(path[2], str))
+        with self.assertRaises(ValueError):
+            apply_markers(b, {content_pos: "5m"})

@@ -87,6 +87,32 @@ def _wire_ttl(body: dict) -> str | None:
     return next(iter(ttls)) if len(ttls) == 1 else None
 
 
+def _tool_history_positions(body: dict) -> frozenset:
+    """Wire positions no caller may mark, whatever transport it has.
+
+    Two kinds. The `tool_calls` / `tool_call_id` fields themselves, which are on
+    the wire and therefore segmented -- so a rotating call id shows up as the
+    drift it is -- but are not content and have no place for a `cache_control`.
+    And the *content* of any message carrying either, because marking a
+    bare-string `tool` message rewrites "18C" into Anthropic block form on an
+    OpenAI-shaped request: a body neither provider documents, produced by a tool
+    whose whole claim is that it does not guess.
+
+    One definition because there were two. `markable_positions` had the broad
+    rule and `_filter_near_minimum` reimplemented the narrow half beside it, so
+    the direct path -- `on_request` with the default `markable=None` -- placed a
+    marker on a tool result's content that `markable_positions` would have
+    excluded. Same rule, two scopes, which is the shape the narrow half was
+    added to close.
+    """
+    carries = {path[1] for _r, _l, _b, path in walk(body)
+               if len(path) > 2 and isinstance(path[2], str)}
+    return frozenset(
+        i for i, (_r, _l, _b, path) in enumerate(walk(body))
+        if (len(path) > 2 and isinstance(path[2], str))
+        or (path[0] == "messages" and len(path) > 1 and path[1] in carries))
+
+
 def markable_positions(body: dict, containers=MESSAGE_CONTAINERS) -> frozenset:
     """Wire positions living in a container this caller can patch.
 
@@ -107,15 +133,9 @@ def markable_positions(body: dict, containers=MESSAGE_CONTAINERS) -> frozenset:
     OpenAI-shaped request -- a body neither provider documents, produced by a
     tool whose entire claim is that it does not guess.
     """
-    stood_down = set()
-    for i, (_, _, _, path) in enumerate(walk(body)):
-        if len(path) > 2 and isinstance(path[2], str):
-            stood_down.add(path[1])
-    return frozenset(
-        i for i, (_, _, _, path) in enumerate(walk(body))
-        if path[0] in containers
-        and not (len(path) > 2 and isinstance(path[2], str))
-        and not (path[0] == "messages" and path[1] in stood_down))
+    barred = _tool_history_positions(body)
+    return frozenset(i for i, (_, _, _, path) in enumerate(walk(body))
+                     if path[0] in containers and i not in barred)
 
 # Alerts a plugin keeps for a human to read. The monitor caps its own state and
 # this did not: a long-running proxy accumulated one list entry per alert for
@@ -606,8 +626,7 @@ class CachePlugin:
         # Unconditional, and deliberately not folded into `markable`: that
         # parameter answers "what can this integration patch", which varies by
         # caller. This answers "what is a marker location at all", which does not.
-        unmarkable = {i for i, (_r, _l, _b, path) in enumerate(walk(body or {}))
-                      if len(path) > 2 and isinstance(path[2], str)}
+        unmarkable = _tool_history_positions(body or {})
         keep, notes = {}, []
         for t in alloc.tiers:
             seg = by_pos.get(t.marker_position)
