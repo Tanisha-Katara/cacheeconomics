@@ -283,13 +283,79 @@ class TestARateFreeRuleIsSafeOnATraceNothingCanPrice(unittest.TestCase):
     def test_none_of_them_raises_on_an_unpriceable_trace(self):
         """The crash direction. Running *every* rule over unpriceable rows broke
         sixteen tests -- `cost.price` refuses the 0.0 that `rate_for` returns --
-        which is why the marking exists at all rather than widening the lot."""
+        which is why the marking exists at all rather than widening the lot.
+
+        Over every surface the registry knows, not the two I happened to pick.
+        The first version of this checked Bedrock and anthropic/direct, which
+        both carry Anthropic's multiplier shape, so it could not see the defect
+        that widening TTL-1's input actually caused.
+        """
+        from cacheeconomics import registry
         from cacheeconomics.analyzer import analyze
+        targets = list(registry.target_ids())
+        self.assertGreater(len(targets), 2, "too few surfaces to be a sweep")
         for segments in (True, False):
-            for target in (self.BEDROCK, "anthropic/direct"):
+            for target in targets:
                 with self.subTest(segments=segments, target=target):
                     analyze(self._trace(target, segments),
                             allow_unreconciled=True)
+
+    def test_a_surface_with_no_two_lifetimes_abstains_rather_than_raising(self):
+        """The member the sweep above was widened to catch.
+
+        `openai/direct` is in the registry and answers
+        `{'write_pre_5_6': 1.0, 'write_5_6_plus': 1.25, 'read': None}` -- no
+        five-minute or one-hour lifetime at all, and a null read. TTL-1 became
+        `rate_free` and so began receiving those rows; it caught `RegistryError`
+        from `registry.multipliers` and then indexed `write_5m` on what came
+        back, taking the whole analysis down with `KeyError: 'write_5m'`.
+
+        Catching the error covers a surface the registry has never heard of. It
+        says nothing about one the registry knows and describes differently,
+        which is the case that broke -- and is exactly the hazard that made
+        run-wide-with-fences the riskier option: widening the input set widens
+        the *shapes* reaching the code, not only the volume.
+        """
+        from cacheeconomics import registry
+        from cacheeconomics.analyzer import analyze
+        m = registry.multipliers("openai/direct")
+        self.assertNotIn("write_5m", m,
+                         "openai/direct now has Anthropic's shape; this test "
+                         "no longer exercises a differently-shaped map")
+        for segments in (True, False):
+            with self.subTest(segments=segments):
+                a = analyze(self._trace("openai/direct", segments),
+                            allow_unreconciled=True)
+                for f in a.findings:
+                    for name in ("avoidable_usd_month", "avoidable_usd_window"):
+                        fig = getattr(f, name)
+                        self.assertFalse(
+                            fig is not None and fig.raw(),
+                            f"{f.code} priced a lifetime change on a surface "
+                            f"that does not sell two lifetimes")
+
+    def test_the_validator_refuses_every_shape_it_cannot_price(self):
+        """The helper itself, over the shapes that reach it.
+
+        `read: None` is the one worth naming: it passes a `"read" in m` test and
+        then fails in arithmetic with a TypeError, one layer further from the
+        cause than a refusal here. `True` is refused because `bool` subclasses
+        `int`, so a hand-edited registry entry would otherwise price at 1.0x.
+        """
+        from cacheeconomics.analyzer import _lifetime_multipliers
+        good = {"write_5m": 1.25, "write_1h": 2.0, "read": 0.1}
+        self.assertEqual((1.25, 2.0, 0.1), _lifetime_multipliers(good))
+        for label, bad in (
+                ("missing write_5m", {"write_1h": 2.0, "read": 0.1}),
+                ("missing read", {"write_5m": 1.25, "write_1h": 2.0}),
+                ("null read", {**good, "read": None}),
+                ("boolean", {**good, "read": True}),
+                ("string", {**good, "write_1h": "2.0"}),
+                ("openai shape", {"write_pre_5_6": 1.0,
+                                  "write_5_6_plus": 1.25, "read": None}),
+                ("not a mapping", None)):
+            with self.subTest(shape=label):
+                self.assertIsNone(_lifetime_multipliers(bad))
 
     def test_none_of_them_comes_back_carrying_money(self):
         """The money direction, at the rule's own output rather than at the
@@ -482,6 +548,10 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
         the bake-off, the tier-b scripts, anyone importing the package -- and it
         is where the provenance has to be read. This calls it directly, with no
         CLI anywhere in the stack.
+
+        Synthetic `assumed_inputs`, so it tests the analyzer half in isolation.
+        `TestARealAssumedSurfaceTraceIsNotInvoiceChecked` is the one that proves
+        the two halves are actually joined up, and it is the one that matters.
         """
         from cacheeconomics import money
         ts = self._trace(assumed=("surface",))
@@ -549,6 +619,83 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
         banner = next(n for n in a.notes if n.startswith("DRAFT"))
         self.assertIn("effective rate", banner)
         self.assertNotIn("surface", banner)
+
+
+class TestARealAssumedSurfaceTraceIsNotInvoiceChecked(unittest.TestCase):
+    """End to end, through the loader that actually assumes a surface.
+
+    Every other test of this rule attaches `assumed_inputs` to a TraceSet it
+    built itself, which tests the analyzer half and nothing else. `assumed_inputs`
+    does not exist on `TraceSet` and no adapter sets it, so the whole mechanism
+    is currently wired to nothing: `load_sessions` records the assumption in
+    `blocking_notes` only, and a real Claude Code trace with a matching invoice
+    is still released as `reconciled`.
+
+    That gap fell between two tracks -- the analyzer reads a field the loader
+    never writes -- and it stayed invisible because both sides had passing tests
+    for their own half. So this one goes through the real loader, with a real
+    invoice, and asserts the thing a client actually gets. It is the only test
+    here that would have caught the seam being unconnected.
+
+    `trace.py` and `adapters/claude_code.py` are Track B's, so the loader half
+    is theirs to land. Marked expected-failure rather than left red so CI stays
+    meaningful for the other tracks; the moment the field is added and populated
+    this reports "Unexpected success" and forces the marker to be deleted. The
+    analyzer half it depends on is already in place and separately tested.
+    """
+
+    RECORD = {"type": "assistant", "sessionId": "s1",
+              "timestamp": "2026-07-29T09:00:00Z",
+              "message": {"model": "claude-opus-5",
+                          "usage": {"input_tokens": 1_000_000,
+                                    "cache_read_input_tokens": 0,
+                                    "cache_creation_input_tokens": 0}}}
+
+    def _root(self):
+        import json as _json
+        import tempfile
+        root = tempfile.mkdtemp()
+        proj = os.path.join(root, "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "a.jsonl"), "w") as f:
+            for i in range(12):
+                rec = _json.loads(_json.dumps(self.RECORD))
+                rec["timestamp"] = f"2026-07-29T{9 + i:02d}:00:00Z"
+                f.write(_json.dumps(rec) + "\n")
+        return root
+
+    def _loaded(self):
+        from cacheeconomics.adapters.claude_code import load_sessions
+        return load_sessions(root=self._root())
+
+    def test_the_loader_really_does_assume_the_surface(self):
+        """Guard the guard. If the transcript named a provider there would be no
+        assumption to carry and this class would prove nothing."""
+        ts = self._loaded()
+        self.assertTrue(ts.requests, "no requests were loaded")
+        self.assertTrue(any("assumed to be anthropic/direct" in n
+                            for n in ts.blocking_notes),
+                        "the loader no longer records the assumption")
+
+    def test_the_invoice_reconciles_so_provenance_is_the_only_question(self):
+        ts = self._loaded()
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        a = analyze(ts, invoice_usd=invoice)
+        self.assertTrue(a.reconciliation["within_ship_gate"])
+        self.assertTrue(a.spend["input_usd"].released)
+
+    # KNOWN-FAILING pending Track B: `TraceSet.assumed_inputs` does not exist
+    # and `load_sessions` does not populate it. Delete this marker when it does.
+    @unittest.expectedFailure
+    def test_the_figures_are_not_marked_invoice_checked(self):
+        from cacheeconomics import money
+        ts = self._loaded()
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        a = analyze(ts, invoice_usd=invoice)
+        self.assertEqual(
+            money.DRAFT, a.spend["input_usd"].released_as,
+            "a trace whose surface the loader assumed was published with the "
+            "provenance of an invoice check")
 
 
 class TestABlockingNoteAloneDoesNotRelabelACorrectReport(unittest.TestCase):
@@ -2240,6 +2387,13 @@ class TestEveryProjectionSampleIsMadeOfRequestsThatMoveTheFigure(unittest.TestCa
     whether or not anybody thought to look at it -- which is the difference
     between fixing the member that was reported and closing the class.
 
+    That has now been paid off once. TTL-2 turned out to pad the same floor a
+    different way -- one request contributing two terms, for its one-hour write
+    and again for a priced in-band read, so nine dollar-moving requests reported
+    a sample of ten. The probe counts *distinct* requests, so it registers that
+    as a sample larger than its movers and fails, without knowing anything about
+    TTL-2. The identity notion the fix needed is the one the probe already had.
+
     The probe perturbs rather than deletes. Removing a request changes what the
     trace *is*: drop the leader of a fan-out pair and the pair stops existing,
     so a leave-one-out probe would call that leader load-bearing and agree with
@@ -2265,8 +2419,47 @@ class TestEveryProjectionSampleIsMadeOfRequestsThatMoveTheFigure(unittest.TestCa
     def _fixtures(self):
         """`(label, TraceSet)` for traces that between them price several rules."""
         return [("fan-out pairs over five days", self._fanout()),
+                ("one-hour writes with a priced band gap", self._ttl2()),
                 ("volatile prefix", self._volatile()),
                 ("demo capture", self._demo())]
+
+    def _ttl2(self):
+        """TTL-2 with one request contributing two terms.
+
+        It appends a timestamp for a one-hour write and again when that same
+        request sits after an in-band gap carrying a priced read. Two clusters a
+        day and a half apart so the span clears the day floor, with a single
+        ten-minute gap inside the second so exactly one band gap is priced --
+        and the request after it both writes at one hour and reads.
+
+        Nine distinct requests move the figure; before the fix the sample
+        reported ten and released the month. This class caught that without
+        being told to look for it, which is the property being claimed: the
+        probe counts distinct requests, so a request counted twice shows up as
+        a sample larger than the movers.
+        """
+        def req(rid, when, write_1h, read):
+            usage = {"input_tokens": 100, "cache_read_input_tokens": read,
+                     "cache_creation_input_tokens": write_1h}
+            if write_1h:
+                usage["cache_creation"] = {"ephemeral_5m_input_tokens": 0,
+                                           "ephemeral_1h_input_tokens": write_1h}
+            return Request(request_id=rid, sent_at=when, model="claude-opus-5",
+                           target_id="anthropic/direct", tenant="t",
+                           session="s", agent="a", ttl_requested="1h",
+                           usage=usage, segments=[])
+
+        reqs = [req(f"a{i}", T0 + timedelta(seconds=60 * i),
+                    50_000 if i < 4 else 0, 0) for i in range(6)]
+        base = T0 + timedelta(days=1, hours=12)
+        for i in range(6):
+            offset = 60 * i + (540 if i >= 4 else 0)
+            write, read = (50_000 if i < 4 else 0), 0
+            if i == 4:
+                write, read = 50_000, 200_000
+            reqs.append(req(f"b{i}", base + timedelta(seconds=offset),
+                            write, read))
+        return TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x")
 
     def _fanout(self):
         reqs = []

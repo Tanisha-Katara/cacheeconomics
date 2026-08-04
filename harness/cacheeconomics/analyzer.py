@@ -445,7 +445,7 @@ def _withhold_projection(fig, why: str):
 
 
 def _avoidable(amount: float | None, window_days: float | None,
-               sample_times) -> dict:
+               contributions) -> dict:
     """Both halves of a finding's dollar claim, built at one site.
 
     Returned as kwargs so a rule cannot supply one and forget the other. Every
@@ -464,19 +464,30 @@ def _avoidable(amount: float | None, window_days: float | None,
     counterfactual -- what the workload would not have spent under a different
     configuration -- and no counterfactual was run.
 
-    `sample_times` is the timestamp of every request that contributed a term to
+    `contributions` is `(request_id, sent_at)` for every term that moved
     `amount`, and it is required rather than optional. The floor used to be
     evaluated once, from the whole trace, and applied to every finding -- so a
     finding costed from two requests one second apart published a month because
     eight unrelated requests elsewhere in the file made the *global* window and
     count clear the floor. Measured on a ten-request, 2.3-day trace whose only
     two cache writers went out one second apart: EFF-1 published $6.43/mo and
-    FAN-1 $14.79/mo, both `reconciled`, on a two-request sample. The request
-    floor exists precisely so a small subset cannot drive a client-facing
-    projection, and evaluated globally it did not do that job.
+    FAN-1 $14.79/mo, both `reconciled`, on a two-request sample.
 
     Required, with no default, because a default is how the next rule silently
     gets the old behaviour back.
+
+    Pairs rather than bare timestamps, and *deduplicated by request id*, because
+    `PROJECTION_MIN_REQUESTS` counts requests and this counted terms. TTL-2
+    contributes twice for one request -- once for its one-hour write and again
+    when that same request sits after an in-band gap carrying a priced read --
+    so nine distinct dollar-moving requests reported a sample of ten and
+    released the monthly figure. That is the third form of one defect: FAN-1
+    padded the sample with requests it never charged, and this pads it with the
+    same request charged twice. Identity is what both need, so identity is what
+    the floor is given.
+
+    The span is taken over the deduplicated timestamps for the same reason: a
+    request counted twice does not widen the window it was observed in.
 
     The subset check subsumes the global one for findings and is not merely
     added to it: a finding's sample is drawn from the trace, so its window and
@@ -487,9 +498,12 @@ def _avoidable(amount: float | None, window_days: float | None,
     if amount is None:
         return {"avoidable_usd_window": None, "avoidable_usd_month": None,
                 "projection_why": "", "projection_sample": 0}
-    sample = list(sample_times)
-    supported, why = _projection_supported(_span_days(sample), len(sample),
-                                           sample="finding")
+    # A dict, so a request contributing several terms is one observation and
+    # keeps one timestamp. `dict` also preserves insertion order, which keeps
+    # the span deterministic when two requests share an instant.
+    sample = {rid: when for rid, when in contributions}
+    supported, why = _projection_supported(_span_days(sample.values()),
+                                           len(sample), sample="finding")
     return {
         "avoidable_usd_window": money.Figure(
             amount, money.MODELED, released=False,
@@ -506,6 +520,43 @@ def _avoidable(amount: float | None, window_days: float | None,
 
 
 # --- diagnosis rules -------------------------------------------------------
+
+def _lifetime_multipliers(mapping):
+    """`(write_5m, write_1h, read)` from a multiplier map, or None.
+
+    One validator, called from every rule that prices a five-minute against a
+    one-hour lifetime, because `registry.multipliers` returns whatever shape a
+    surface records and not every surface has Anthropic's three keys.
+    `openai/direct` is in the registry today and answers
+    `{'write_pre_5_6': 1.0, 'write_5_6_plus': 1.25, 'read': None}` -- no
+    lifetimes to compare at all, and a null read.
+
+    Indexing that map raises `KeyError`, which is a crash where the honest
+    answer is an abstention: a surface that does not sell two lifetimes has no
+    lifetime question to answer, and TTL-1 has nothing to say about it. Measured
+    once TTL-1 became `rate_free` and started receiving every analysable
+    request: a twelve-request `openai/direct` trace with segments took the whole
+    analysis down with `KeyError: 'write_5m'`.
+
+    That is exactly the hazard that made run-wide-with-fences the riskier of the
+    two options for TTL-1 -- widening the input set widens the *shapes* that
+    reach the code, not just the volume. The fence belongs here rather than at
+    each call site, because there are three of them and they would drift.
+
+    Types are checked, not just presence. `read: None` passes a `"read" in m`
+    test and then fails in arithmetic with a `TypeError`, one layer further from
+    the cause. `bool` is excluded deliberately: it is a subclass of `int`, so a
+    `True` in a hand-edited registry would otherwise price as 1.0x.
+    """
+    try:
+        values = (mapping["write_5m"], mapping["write_1h"], mapping["read"])
+    except (KeyError, TypeError):
+        return None
+    if any(isinstance(v, bool) or not isinstance(v, (int, float))
+           for v in values):
+        return None
+    return values
+
 
 def _rate_free(fn):
     """Marks a rule that is safe to run over rows nothing can price.
@@ -605,7 +656,7 @@ def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
             continue
         term = spend.usd - spend.hypothetical_uncached_usd
         if term:
-            contributed.append(r.sent_at)
+            contributed.append((r.request_id, r.sent_at))
         excess += term
     wasted = excess
     if wasted <= 0:
@@ -758,12 +809,24 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
             last = sent_at
             if not alive:
                 continue            # cold before the move and cold after it
-            contributed.append(sent_at)
             try:
                 m = registry.multipliers(r.target_id)
             except registry.RegistryError:
                 m = {"write_5m": 1.25, "write_1h": 2.0, "read": 0.10}
-            delta = m[f"write_{ttl}"] - m.get("read", 0.10)
+            # Same validator as TTL-1 and FAN-1. This rule only sees priced rows
+            # today, so a surface whose multiplier map has a different shape has
+            # not reached it -- but the guard is the same two lines and the
+            # alternative is trusting that the dispatcher never widens, which is
+            # precisely the assumption that broke TTL-1 one line of dispatch
+            # later. Abstaining on this entry rather than substituting Anthropic
+            # numbers: a surface that does not sell two lifetimes has no
+            # relocation saving to compute, and inventing one is what the
+            # `RegistryError` fallback above is already the arguable case of.
+            mult = _lifetime_multipliers(m)
+            if mult is None:
+                continue
+            contributed.append((r.request_id, sent_at))
+            delta = (mult[0] if ttl == "5m" else mult[1]) - mult[2]
             wasted += tokens * (rate_for(r.model, _when(r), r.target_id) / 1e6) * delta
     # A later blocker can leave nothing recoverable by moving this one alone.
     # Reporting nothing at all would be worse than the overstatement it
@@ -999,7 +1062,10 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 continue
             by_scope[(r.tenant, r.target_id, r.model, r.session)].append(
                 (r.sent_at, u.cache_write_5m, rate_for(r.model, _when(r), r.target_id),
-                 spans, (r.usage.get("cache_read_input_tokens") or 0)))
+                 spans, (r.usage.get("cache_read_input_tokens") or 0),
+                 # Last, so `writes.sort()` still orders on time first and only
+                 # reaches the id when everything before it ties.
+                 r.request_id))
 
         # Only a rewrite in the 5m-to-1h band is evidence that the five-minute
         # lifetime is what caused the miss. A rewrite 60 seconds after the last
@@ -1032,7 +1098,14 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 _m = registry.multipliers(scope[1])
             except registry.RegistryError:
                 continue
-            _w5, _w1h, _read = _m["write_5m"], _m["write_1h"], _m["read"]
+            # Shape, not just presence. Catching `RegistryError` covers a
+            # surface the registry has never heard of; it says nothing about a
+            # surface it knows and describes differently, which is the case that
+            # crashed here.
+            _mult = _lifetime_multipliers(_m)
+            if _mult is None:
+                continue        # no two lifetimes to compare on this surface
+            _w5, _w1h, _read = _mult
             # The provider searches back a bounded number of blocks from a
             # breakpoint, and this rule publishes a dollar figure, so the bound
             # is enforced. Without it a tool loop appending 25 messages per call
@@ -1059,7 +1132,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             # stops at the first match, which is the longest still-relevant one
             # because writes are in time order.
             earlier: list = []
-            for sent_at, tokens, rate, spans, read in writes:
+            for sent_at, tokens, rate, spans, read, rid in writes:
                 per_token = rate / 1e6
                 # The size of the cache ENTRY this request leaves behind, which
                 # is not the size of the write that touched it.
@@ -1158,10 +1231,10 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                     # write again.
                     recovered = min(match[1], tokens)
                     recoverable += recovered * per_token * (_w5 - _read)
-                    contributed.append(sent_at)
+                    contributed.append((rid, sent_at))
                 else:
                     recoverable -= tokens * per_token * (_w1h - _w5)    # cold write costs more
-                    contributed.append(sent_at)
+                    contributed.append((rid, sent_at))
 
         # A longer lifetime only helps if the prefix is actually reused, and
         # there are two ways to prove reuse. Observed reads are one. The other
@@ -1204,8 +1277,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
         # figure off the page is not a gate, it is a coincidence that holds
         # today. Naming the condition means a future rate of 0.001 on a surface
         # nobody priced cannot turn into a published saving.
-        priced = any(rate for _s, _t, rate, _sp, _rd in
-                     (row for rows in by_scope.values() for row in rows))
+        priced = any(row[2] for rows in by_scope.values() for row in rows)
         monetizable = unkeyed == 0 and recoverable > 0 and priced
         rank = recoverable if monetizable else 0.0
         candidates.append((rank, agent, median, in_band, len(ts),
@@ -1361,7 +1433,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
             if u.cache_write_1h:
                 written_1h += u.cache_write_1h
                 saving += u.cache_write_1h * per_token * (w1h - w5)
-                contributed.append(sent_at)
+                contributed.append((r.request_id, sent_at))
             if prev is not None:
                 gap = (sent_at - prev[0]).total_seconds()
                 if gap < 300:
@@ -1377,7 +1449,11 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
                         band_priced += 1
                         band_prefix += prefix
                         cost_of_switch += prefix * per_token * (w5 - read)
-                        contributed.append(sent_at)
+                        # The same request can already be in here for its
+                        # one-hour write above. Two terms, one observation --
+                        # `_avoidable` deduplicates by this id, which is the
+                        # whole reason it takes one.
+                        contributed.append((r.request_id, sent_at))
             prev = (sent_at, r, u)
 
     if not written_1h:
@@ -1546,7 +1622,14 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             try:
                 m = registry.multipliers(b.target_id)
             except registry.RegistryError:
-                m = {"write_5m": 1.25, "write_1h": 2.0}
+                m = {"write_5m": 1.25, "write_1h": 2.0, "read": 0.10}
+            # Third call site, same validator. The fallback above gained a
+            # `read` key it never had: the arithmetic below already assumed 0.10
+            # as a literal, so the map it fell back to was missing a value the
+            # very next lines depend on.
+            mult = _lifetime_multipliers(m)
+            if mult is None:
+                continue
             per_token = rate_for(b.model, _when(b), b.target_id) / 1e6
             groups += 1
             affected.update((a.request_id, b.request_id))
@@ -1570,8 +1653,8 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             # Keyed by request id because three requests fanning out form two
             # adjacent pairs, so the middle one is charged once and seen twice.
             contributed[b.request_id] = b.sent_at
-            waste += ub.cache_write_5m * per_token * (m["write_5m"] - 0.10)
-            waste += ub.cache_write_1h * per_token * (m["write_1h"] - 0.10)
+            waste += ub.cache_write_5m * per_token * (mult[0] - mult[2])
+            waste += ub.cache_write_1h * per_token * (mult[1] - mult[2])
     # One pair is the whole phenomenon. Two concurrent requests writing the
     # same prefix is the minimum case and also the commonest, and the runtime
     # monitor alerts on exactly two -- so requiring two pairs meant the report
@@ -1599,7 +1682,7 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
         # Unique requests, not pairs times two. Three requests fanning out form
         # two adjacent pairs and would have been reported as four requests.
         affected_requests=len(affected),
-        **_avoidable(waste, window, contributed.values()),
+        **_avoidable(waste, window, contributed.items()),
         confidence="medium", quality_risk="low",
         fix="Send one request, wait for its first token, then release the rest of the batch.")
 
