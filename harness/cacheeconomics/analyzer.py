@@ -293,13 +293,17 @@ def _projection_supported(window_days, n_requests) -> tuple[bool, str]:
             f"traffic and this trace covers {got}. Agent workloads have a daily "
             f"cycle, so a shorter sample cannot be scaled to a month -- an "
             f"invoice proves the measured subtotal, not that the window is "
-            f"typical. The measured spend above is unaffected.")
+            f"typical. This withholds the monthly spend total; measured spend "
+            f"is unaffected, and any per-finding monthly figure below rests on "
+            f"the same extrapolation and has not been gated by it.")
     if n_requests < PROJECTION_MIN_REQUESTS:
         return False, (
             f"monthly figures need at least {PROJECTION_MIN_REQUESTS} requests "
             f"and this trace has {n_requests}. Below that a single request moves "
-            f"the projected total more than the rest of the trace combined. The "
-            f"measured spend above is unaffected.")
+            f"the projected total more than the rest of the trace combined. "
+            f"This withholds the monthly spend total; measured spend is "
+            f"unaffected, and any per-finding monthly figure below rests on the "
+            f"same extrapolation and has not been gated by it.")
     return True, ""
 
 

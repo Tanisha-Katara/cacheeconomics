@@ -1456,6 +1456,26 @@ class TestAnInvoiceDoesNotUnderwriteAProjection(unittest.TestCase):
         self.assertIn("day of traffic", why)
         self.assertNotIn("reconcil", why.lower())
 
+    def test_the_reason_says_what_it_did_not_withhold(self):
+        """`_monthly` has seven callers and this gates one. The note said
+        "monthly figures need at least 1 day", which reads as all of them —
+        while six per-finding monthly figures are ungated and can print below
+        it. Overstating what was protected is worse than gating nothing,
+        because the reader stops looking."""
+        from cacheeconomics.analyzer import _projection_supported
+        for window, n in ((0.04, 12), (3.0, 2)):
+            with self.subTest(window=window, requests=n):
+                ok, why = _projection_supported(window, n)
+                self.assertFalse(ok)
+                self.assertIn("monthly spend total", why)
+                self.assertIn("has not been gated by it", why)
+
+    def test_a_supported_window_carries_no_reason_at_all(self):
+        from cacheeconomics.analyzer import _projection_supported
+        ok, why = _projection_supported(2.0, 40)
+        self.assertTrue(ok)
+        self.assertEqual(why, "")
+
     def test_the_demo_fixture_clears_the_floor(self):
         """Calibration. The floor is meant to catch a nine-minute capture, not
         a real workload -- if the shipped demo cannot clear it, it is wrong."""
