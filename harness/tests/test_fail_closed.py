@@ -220,85 +220,129 @@ class TestAnUnpriceableSurfaceStillGetsItsMeasurements(unittest.TestCase):
         self.assertFalse(a.spend["input_usd"].released)
 
 
-class TestTheRateFreeMarkingIsAccurate(unittest.TestCase):
-    """`@_rate_free` decides which rules see rows that failed pricing, so a
-    wrong marking is a rule reading a row it cannot price.
+class TestARateFreeRuleIsSafeOnATraceNothingCanPrice(unittest.TestCase):
+    """`@_rate_free` decides which rules see rows that failed pricing, so what
+    the marker has to guarantee is that those rows cannot hurt.
 
-    Checked by watching what each rule actually reaches for, not by reading the
-    decorators: a marker is a claim, and a claim verified by rereading the claim
-    is what this suite exists to stop trusting. Measured the hard way first --
-    running every rule over the wide set crashed sixteen tests, because
-    `rate_for` answers 0.0 for a surface it cannot price and `cost.price`
-    refuses a zero rate with a `ValueError` that EFF-1 does not catch.
+    It used to be checked as "never asks for a price", by spying on `rate_for`
+    and `cost.price`. That stopped being the right question when TTL-1 was
+    marked. TTL-1 is two claims in one function: a cadence observation that
+    needs no rate, and a saving that does -- so it *asks*, gets 0.0 for a
+    surface nobody priced, and declines to monetize. Under the old test it was a
+    mis-marking; under the property that actually matters it is correct.
+
+    That test also passed while TTL-1 was already marked, which is the more
+    useful discovery: its fixture ran every gap 60 seconds apart, so TTL-1 hit
+    `if not in_band: continue` and returned before reaching a rate at all. The
+    check had gone vacuous for the one rule it needed to judge -- a fixture
+    dependency its own docstring had warned about, in the direction the docstring
+    did not consider.
+
+    So this asks the two things the marker is for, against the hazard itself
+    rather than against a proxy for it. Run over a trace the registry cannot
+    price at all: a rate-free rule must not raise, and must not come back
+    carrying money. Rewriting rather than relaxing -- the old check would now
+    pass by accident, and one that passes by accident is worse than one that
+    fails honestly.
     """
 
-    def _touches_pricing(self, rule, reqs, ratios):
-        """Run one rule and report whether it asked for a price."""
-        from cacheeconomics import analyzer
-        asked = []
-        real_price = analyzer.cost.price
+    BEDROCK = "amazon-bedrock/converse"
 
-        def spy_price(*a, **kw):
-            asked.append("price")
-            return real_price(*a, **kw)
-
-        def spy_rate(model, when=None, target_id=None):
-            asked.append("rate")
-            from cacheeconomics import registry
-            return registry.base_rate(model, when or "2026-07-29", target_id)
-
-        analyzer.cost.price = spy_price
-        try:
-            rule(reqs, ratios, 3.0, spy_rate)
-        except Exception:                                      # noqa: BLE001
-            pass          # a rule that raises still reveals what it touched
-        finally:
-            analyzer.cost.price = real_price
-        return bool(asked)
-
-    def _fixture(self):
-        from cacheeconomics import cost as _cost
+    def _trace(self, target, segments=True):
+        def segs(i):
+            if not segments:
+                return []
+            return [Segment(id="sys", role="system", tokens=50_000, index=0,
+                            cache_marked=True, ttl="5m"),
+                    Segment(id=f"t{i}", role="user", tokens=200, index=1)]
         reqs = [Request(request_id=f"r{i}",
-                        sent_at=T0 + timedelta(seconds=60 * i),
-                        model="claude-opus-5", target_id="anthropic/direct",
-                        tenant="t", session="s", agent="a", ttl_requested="5m",
+                        sent_at=T0 + timedelta(seconds=900 * i),
+                        model="claude-opus-5", target_id=target, tenant="t",
+                        session="s", agent="a", ttl_requested="5m",
                         usage={"input_tokens": 200,
                                "cache_read_input_tokens": 5_000,
-                               "cache_creation_input_tokens": 50_000},
-                        segments=[Segment(id="sys", role="system",
-                                          tokens=50_000, index=0,
-                                          cache_marked=True, ttl="5m"),
-                                  Segment(id=f"t{i}", role="user", tokens=200,
-                                          index=1)])
-                for i in range(40)]
-        usages = [_cost.Usage.from_anthropic(r.usage, ttl="5m") for r in reqs]
-        return reqs, _cost.ratios(usages)
+                               "cache_creation_input_tokens": 500_000},
+                        segments=segs(i))
+                for i in range(12)]
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
 
-    def test_the_spy_sees_something(self):
-        """Vacuity guard: if nothing touches pricing on this fixture, the check
-        below passes by never observing anything."""
+    def _rate_free_rules(self):
         from cacheeconomics.analyzer import RULES
-        reqs, ratios = self._fixture()
-        self.assertTrue(
-            [r for r in RULES if self._touches_pricing(r, reqs, ratios)],
-            "no rule asked for a price; the spy is not wired up")
+        return [r for r in RULES if getattr(r, "rate_free", False)]
 
-    def test_no_rate_free_rule_asks_for_a_price(self):
-        """The direction that matters. A rule marked rate-free runs over rows
-        that failed pricing, so if it reaches for a rate it is reading a row
-        whose rate is either missing or zero.
+    def test_there_are_rate_free_rules_to_check(self):
+        self.assertTrue(self._rate_free_rules(), "nothing is marked rate-free")
 
-        The converse is deliberately not asserted: a pricing rule can return
-        early on a given fixture without touching a rate, and failing on that
-        would make this test a statement about the fixture.
+    def test_the_surface_really_cannot_be_priced(self):
+        """Guard the guard. Against a priceable surface every rule behaves and
+        this class proves nothing."""
+        from cacheeconomics import registry
+        with self.assertRaises(registry.RegistryError):
+            registry.base_rate("claude-opus-5", "2026-01-01", self.BEDROCK)
+
+    def test_none_of_them_raises_on_an_unpriceable_trace(self):
+        """The crash direction. Running *every* rule over unpriceable rows broke
+        sixteen tests -- `cost.price` refuses the 0.0 that `rate_for` returns --
+        which is why the marking exists at all rather than widening the lot."""
+        from cacheeconomics.analyzer import analyze
+        for segments in (True, False):
+            for target in (self.BEDROCK, "anthropic/direct"):
+                with self.subTest(segments=segments, target=target):
+                    analyze(self._trace(target, segments),
+                            allow_unreconciled=True)
+
+    def test_none_of_them_comes_back_carrying_money(self):
+        """The money direction, at the rule's own output rather than at the
+        publication gate. The gate does withhold everything on a trace with
+        unpriceable rows, so a figure here would not reach a client today --
+        but that is a second mechanism agreeing, and a rule that computes a
+        dollar amount from a rate nobody has is wrong before anything downstream
+        decides whether to print it.
         """
-        from cacheeconomics.analyzer import RULES
-        reqs, ratios = self._fixture()
-        wrong = [r.__name__ for r in RULES
-                 if getattr(r, "rate_free", False)
-                 and self._touches_pricing(r, reqs, ratios)]
-        self.assertEqual([], wrong,
-                         "marked rate-free but asks for a price: " + ", ".join(wrong))
+        from cacheeconomics.analyzer import RULES, analyze
+
+        def rate_for(model, when=None, target_id=None):
+            from cacheeconomics import registry
+            try:
+                return registry.base_rate(model, when or "2026-01-01", target_id)
+            except registry.RegistryError:
+                return 0.0
+
+        checked = 0
+        for segments in (True, False):
+            ts = self._trace(self.BEDROCK, segments)
+            a = analyze(ts, allow_unreconciled=True)
+            for rule in self._rate_free_rules():
+                with self.subTest(rule=rule.__name__, segments=segments):
+                    f = rule(ts.analysable, a.ratios, 3.0, rate_for)
+                    if f is None:
+                        continue
+                    checked += 1
+                    for name in ("avoidable_usd_month", "avoidable_usd_window"):
+                        fig = getattr(f, name)
+                        self.assertFalse(
+                            fig is not None and fig.raw(),
+                            f"{rule.__name__} put a dollar amount on a trace "
+                            f"whose rate nobody knows")
+        self.assertTrue(checked, "no rate-free rule fired; nothing was checked")
+
+    def test_the_observation_survives_where_the_figure_cannot(self):
+        """The reason TTL-1 is marked at all. Its cadence claim comes from
+        timestamps and its saving comes from a rate, and only the second one
+        needs a price -- so a Bedrock reader whose own counters show the pattern
+        should still be told about it. Before the marking it vanished, while the
+        same counters produced it the moment an effective rate was supplied.
+        """
+        from cacheeconomics.analyzer import analyze
+        ts = self._trace(self.BEDROCK, segments=False)
+        bare = analyze(ts, allow_unreconciled=True)
+        priced = analyze(ts, allow_unreconciled=True, effective_rate=5.0)
+        self.assertIn("TTL-1", [f.code for f in bare.findings],
+                      "the cadence observation needs no rate and vanished anyway")
+        self.assertIn("TTL-1", [f.code for f in priced.findings])
+        bare_ttl = next(f for f in bare.findings if f.code == "TTL-1")
+        self.assertIsNone(bare_ttl.avoidable_usd_month,
+                          "no rate, so no saving may be attached")
 
 
 class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
@@ -444,6 +488,57 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
         invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
         a = analyze(ts, invoice_usd=invoice)
         self.assertEqual(money.DRAFT, a.spend["input_usd"].released_as)
+
+    def test_every_figure_in_the_analysis_agrees_on_its_provenance(self):
+        """Walked, not enumerated.
+
+        `_figures` above lists the places I thought to look. The reconciliation
+        dollars are built roughly 150 lines before the provenance is decided, so
+        they defaulted to RECONCILED and stayed there -- a `spend` map entirely
+        marked draft sitting beside `reconciliation.computed_usd` and
+        `delta_usd` still marked reconciled, in one document, about the same
+        dollars. Naming fields is how that survived; this walks the analysis and
+        requires one answer from everything it finds.
+        """
+        import dataclasses
+        from cacheeconomics.money import Figure
+
+        def walk(obj, path="root", depth=0):
+            if depth > 5:
+                return
+            if isinstance(obj, Figure):
+                yield path, obj
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    yield from walk(v, f"{path}[{k!r}]", depth + 1)
+                return
+            if isinstance(obj, (list, tuple)):
+                for i, v in enumerate(obj):
+                    yield from walk(v, f"{path}[{i}]", depth + 1)
+                return
+            if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+                for f in dataclasses.fields(obj):
+                    yield from walk(getattr(obj, f.name), f"{path}.{f.name}",
+                                    depth + 1)
+            for name, attr in vars(type(obj)).items():
+                if isinstance(attr, property):
+                    try:
+                        yield from walk(getattr(obj, name), f"{path}.{name}",
+                                        depth + 1)
+                    except Exception:                          # noqa: BLE001
+                        continue
+
+        a = self._analysis()
+        found = [(p, f) for p, f in walk(a) if f.released]
+        self.assertTrue(found, "nothing released; this would pass vacuously")
+        from cacheeconomics import money
+        wrong = [f"{p} = {f.released_as}" for p, f in found
+                 if f.released_as != money.DRAFT]
+        self.assertEqual(
+            [], wrong,
+            "these published invoice-checked provenance on a trace whose "
+            "surface was assumed:\n    " + "\n    ".join(wrong))
 
     def test_which_input_was_assumed_survives_into_the_banner(self):
         """Per-input, not per-report. An assumed surface and an assumed rate are

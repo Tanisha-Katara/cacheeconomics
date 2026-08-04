@@ -260,6 +260,47 @@ class TestEveryDollarFieldInTheJsonCarriesItsReleaseState(unittest.TestCase):
                       {self._state_for(checked, p)
                        for p in self._money_paths(checked)})
 
+    def test_the_caveats_come_before_every_dollar_bearing_section(self):
+        """The ordering the other two renderers already keep.
+
+        Text and HTML both print the caveats above the first figure they
+        qualify. This one put every figure ahead of all of them and carried the
+        caveats nowhere at all -- `blocking_notes` was absent from the payload,
+        so a consumer had to recover them by matching prose in `notes`, which is
+        the thing a machine-readable surface exists to avoid.
+
+        Asserted on key order rather than presence. JSON objects preserve
+        insertion order through `json.dumps`, and order is the whole claim: a
+        caveat a consumer reaches after the figure is doing the same amount of
+        work as one printed below it.
+        """
+        payload = self._payload("--allow-unreconciled")
+        keys = list(payload)
+        self.assertIn("caveats", keys, "the payload carries no caveats field")
+        money_sections = [k for k in ("spend", "reconciliation", "findings")
+                          if k in keys]
+        self.assertTrue(money_sections)
+        for section in money_sections:
+            with self.subTest(section=section):
+                self.assertLess(keys.index("caveats"), keys.index(section),
+                                f"{section} is serialised before the caveats "
+                                f"that qualify it")
+
+    def test_the_caveats_are_the_ones_the_analysis_recorded(self):
+        """Presence in the right place is not enough; it has to be the same
+        list the other two renderers print, or this is a third opinion."""
+        from cacheeconomics.analyzer import analyze, spend_caveats
+        from cacheeconomics.trace import load_jsonl
+        a = analyze(load_jsonl(FIXTURE), allow_unreconciled=True)
+        payload = self._payload("--allow-unreconciled")
+        self.assertEqual(list(spend_caveats(a)), payload["caveats"])
+
+    def test_forwardability_is_one_boolean_rather_than_a_scan(self):
+        draft = self._payload("--allow-unreconciled")
+        checked = self._payload("--invoice-usd", "17.45")
+        self.assertTrue(draft["draft"])
+        self.assertFalse(checked["draft"])
+
     def test_a_withheld_figure_says_so_rather_than_claiming_a_release(self):
         """The run with no invoice releases nothing, so no field may report a
         provenance. A state that survived the gate would be worse than none."""

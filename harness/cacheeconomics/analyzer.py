@@ -508,17 +508,29 @@ def _avoidable(amount: float | None, window_days: float | None,
 # --- diagnosis rules -------------------------------------------------------
 
 def _rate_free(fn):
-    """Marks a rule whose evidence is counters and identity, never a price.
+    """Marks a rule that is safe to run over rows nothing can price.
 
     Those rules run over every analysable request; the rest run over the priced
     subset, because a dollar figure must not be derived from a row that spend
-    excluded. Marking the *rate-free* ones rather than the pricing ones makes
-    the unmarked default the narrow, older behaviour, so a rule added later
-    cannot widen its own input by omission.
+    excluded. Marking the *safe* ones rather than the pricing ones makes the
+    unmarked default the narrow, older behaviour, so a rule added later cannot
+    widen its own input by omission.
 
-    A marker is a claim, and this file's whole subject is claims nothing can
-    contradict, so `TestTheRateFreeMarkingIsAccurate` checks it by watching
-    which rules actually reach for `rate_for` and `cost.price`.
+    "Safe" and not "never asks for a price", and the difference is TTL-1. Most
+    marked rules -- REB-1, REB-0, SPL-1, MIN-1 -- genuinely never reach for a
+    rate. TTL-1 is two claims in one function: a cadence observation that comes
+    from timestamps, and a saving that comes from a rate. It asks, gets 0.0 for
+    a surface nobody priced, and declines to monetize. Withholding the whole
+    finding because half of it needs a rate meant a Bedrock reader was told
+    nothing about a pattern their own counters show, while the same trace with
+    `--effective-rate` produced it.
+
+    So the obligations are: do not raise on a row the registry cannot answer
+    for, and do not come back carrying money computed from a rate nobody has.
+    `TestARateFreeRuleIsSafeOnATraceNothingCanPrice` checks both against an
+    unpriceable trace rather than against a proxy -- the previous version spied
+    on `rate_for` and had gone vacuous for the one rule it needed to judge,
+    because its fixture made TTL-1 return before it ever asked.
     """
     fn.rate_free = True
     return fn
@@ -866,6 +878,7 @@ def _prefix_key(r: Request) -> tuple | None:
                  if s.index <= top)
 
 
+@_rate_free
 def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
     """Is the chosen lifetime matched to how often requests actually arrive?"""
     per_agent = defaultdict(list)
@@ -1010,7 +1023,15 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             # Hoisted out of the innermost loop too: it never varied within a
             # scope, and re-reading the registry per write only made the wrong
             # value harder to see.
-            _m = registry.multipliers(scope[1])
+            # Guarded, because this rule now runs over rows the registry may not
+            # be able to answer for at all. It was unguarded while the
+            # dispatcher only ever handed it the priced subset, which is the
+            # kind of assumption that stops being true one line of dispatch
+            # away.
+            try:
+                _m = registry.multipliers(scope[1])
+            except registry.RegistryError:
+                continue
             _w5, _w1h, _read = _m["write_5m"], _m["write_1h"], _m["read"]
             # The provider searches back a bounded number of blocks from a
             # breakpoint, and this rule publishes a dollar figure, so the bound
@@ -1174,7 +1195,18 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
         # Money only when the reuse is proven. Otherwise the cadence
         # observation still stands and is worth reporting, but as a hypothesis
         # rather than a figure.
-        monetizable = unkeyed == 0 and recoverable > 0
+        #
+        # `priced` is an explicit fence rather than a consequence. This rule now
+        # runs over rows the registry cannot price, where `rate_for` answers 0.0
+        # and every term multiplies out to exactly zero -- so `recoverable > 0`
+        # already happens to be False and the arithmetic already happens to
+        # protect us. Depending on a float landing on zero to keep a dollar
+        # figure off the page is not a gate, it is a coincidence that holds
+        # today. Naming the condition means a future rate of 0.001 on a surface
+        # nobody priced cannot turn into a published saving.
+        priced = any(rate for _s, _t, rate, _sp, _rd in
+                     (row for rows in by_scope.values() for row in rows))
+        monetizable = unkeyed == 0 and recoverable > 0 and priced
         rank = recoverable if monetizable else 0.0
         candidates.append((rank, agent, median, in_band, len(ts),
                            already_1h, unprovable, non_ttl_misses, monetizable,
@@ -2430,6 +2462,27 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     if draft_reasons:
         notes.insert(0, "DRAFT — " + " ".join(draft_reasons)
                      + " Not for external use.")
+
+    # The two reconciliation dollars are built roughly 150 lines above this,
+    # where the reconciliation dict is assembled and the final provenance is not
+    # known yet -- so they defaulted to RECONCILED and stayed there while every
+    # other figure was relabelled. Measured on an assumed-surface trace: a
+    # `spend` map entirely marked `draft` sitting beside
+    # `reconciliation.computed_usd` and `delta_usd` still marked `reconciled`,
+    # in one document, describing the same dollars.
+    #
+    # Re-released rather than moved. Building them down here would work and
+    # would separate the two reconciliation figures from the dict that explains
+    # them, which is where a reader and a maintainer both look for them.
+    #
+    # Only figures that are already released are touched: a withheld one carries
+    # the reason the gate refused, and `release` would overwrite it -- the same
+    # rule `_withhold_projection` follows a few lines down, for the same reason.
+    if recon is not None:
+        for _k in ("computed_usd", "delta_usd"):
+            _fig = recon.get(_k)
+            if isinstance(_fig, money.Figure) and _fig.released:
+                recon[_k] = _fig.release(True, as_=released_as)
 
     # Structural claims carry a second gate. The first asks whether the money
     # ties to an invoice; this one asks whether the segmentation the claim rests

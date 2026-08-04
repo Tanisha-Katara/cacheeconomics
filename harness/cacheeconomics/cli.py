@@ -214,6 +214,29 @@ def analysis_json(a, tier_name: str = "", coverage=None) -> str:
 
     An invariant that cannot reach the real code path will be given a
     convincing substitute. The fix is not a better mirror, it is a seam.
+
+    Shape: money stays a string beside a `release_state` map, rather than
+    becoming `{value, release_state, caveats}` per figure. Three reasons, and
+    the middle one is the one that decided it.
+
+    Per-figure caveats would claim precision this package does not have. A
+    caveat here is a fact about the whole ingest -- the surface was assumed, a
+    class of rows was excluded -- and it qualifies every figure in the document
+    equally. Attaching the same list to each figure would either duplicate it
+    everywhere or imply the analyzer worked out which caveat bears on which
+    number, which it does not. A report-scoped fact belongs at report scope, and
+    inventing per-figure attribution to make a serialisation tidier is how a
+    number comes to look better-evidenced than it is.
+
+    The value type is also published surface. `spend` maps names to strings
+    today and a consumer can rely on that; changing it to objects in the same
+    round as four other fixes buys a uniformity that nothing has asked for.
+
+    What the alternative was actually meant to close -- a consumer picking up a
+    dollar value without its state -- is closed already and tested from the
+    outside: `TestEveryDollarFieldInTheJsonCarriesItsReleaseState` scans the
+    decoded payload for anything money-shaped and requires state for every one,
+    so a section added later is covered without editing that test.
     """
     # Figures are rendered through `str`, so a withheld one serialises as
     # "[withheld: ...]" rather than a number somebody's script would treat
@@ -222,6 +245,22 @@ def analysis_json(a, tier_name: str = "", coverage=None) -> str:
         "tier": tier_name,
         "coverage": coverage,
         "window_days": a.window_days,
+        # Before `spend`, and before every other dollar-bearing section.
+        #
+        # The text and HTML reports both print these above the first figure they
+        # qualify, and this renderer put every figure ahead of all of them while
+        # carrying the caveats nowhere at all -- `blocking_notes` was absent from
+        # the payload, so a consumer had to fish the sentences out of `notes` by
+        # matching prose. That is the same defect the ordering fix closed in the
+        # other two renderers, and worse in this one: the caveat was not late,
+        # it was missing.
+        #
+        # `draft` is derived here rather than left for the consumer to infer, so
+        # the machine-readable answer to "is this forwardable" is one boolean
+        # rather than a scan of every release state.
+        "caveats": list(a.blocking_notes),
+        "draft": any(getattr(v, "released_as", "") == "draft"
+                     for v in a.spend.values()),
         "spend": {k: str(v) for k, v in a.spend.items()},
         # A script reading this saw only strings and could not tell a
         # draft figure from an invoice-checked one. The state is the
