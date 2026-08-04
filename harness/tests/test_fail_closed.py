@@ -2299,28 +2299,155 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
         self.assertEqual((), tuple(getattr(old, "assumed_inputs", ()) or ()))
         self.assertEqual((), tuple(old.assumed_inputs))
 
-    def test_the_loaders_that_read_their_surface_assume_nothing(self):
-        """The survey, so "only this adapter assumes" is checked rather than
-        claimed. `litellm` reads `custom_llm_provider` off each row and
-        otherwise takes the operator's stated `--target-id`; `bodies` keeps an
-        absent surface absent as UNATTRIBUTED. Every path there is read or
-        stated, so neither may claim an assumption -- and if one starts
-        assuming, this fails until it says so.
+    # Every loader in the package, each given the same providerless row and
+    # told no surface. Named here so a loader added later is a one-line entry
+    # rather than a survey somebody has to remember to widen.
+    #
+    # `claude_code` is absent deliberately and is covered by the tests above:
+    # its transcripts *structurally* cannot carry a provider field, which is why
+    # it is the one loader that may assume -- and it says so.
+    def _every_loader(self, tmp):
+        """`{name: (TraceSet, may_assume)}` over a providerless fixture."""
+        from cacheeconomics.adapters.bodies import load_bodies
+        from cacheeconomics.adapters.litellm import load_litellm
+        from cacheeconomics.trace import load_jsonl
+        usage = {"input_tokens": 10, "output_tokens": 2,
+                 "cache_read_input_tokens": 0,
+                 "cache_creation_input_tokens": 0}
+
+        def write(name, row):
+            path = os.path.join(tmp, name)
+            with open(path, "w") as f:
+                f.write(json.dumps(row) + "\n")
+            return path
+
+        litellm_row = {"model": "claude-opus-5", "usage": dict(usage)}
+        jsonl_row = {"request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
+                     "model": "claude-opus-5", "usage": dict(usage),
+                     "segments": []}
+        bodies_row = {"request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
+                      "body": {"model": "claude-opus-5",
+                               "messages": [{"role": "user",
+                                             "content": "hello"}]},
+                      "usage": dict(usage)}
+        return {
+            "load_litellm": load_litellm(write("l.jsonl", litellm_row)),
+            "load_jsonl": load_jsonl(write("j.jsonl", jsonl_row)),
+            "load_bodies": load_bodies(write("b.jsonl", bodies_row),
+                                       key=b"k" * 32),
+        }
+
+    def test_every_loader_leaves_a_providerless_row_unattributed(self):
+        """The property, not its symptom.
+
+        The previous version of this test asserted only that `assumed_inputs`
+        came back empty -- which a loader that silently defaulted a providerless
+        row to `anthropic/direct` would also satisfy, because it would not set
+        the field either. It asserted the absence of a *confession* rather than
+        the absence of the *thing confessed to*. Its docstring also claimed
+        `bodies` was covered while the body ran `load_litellm` alone, and it
+        never touched `load_jsonl` at all: three loaders named, one exercised --
+        the same walk-versus-fixture gap as the marker above.
         """
-        from cacheeconomics.trace import Tier, TraceSet
-        blank = TraceSet(requests=[], tier=Tier.USAGE_ONLY)
-        self.assertEqual((), tuple(blank.assumed_inputs),
-                         "the default must be 'assumed nothing'")
+        from cacheeconomics.trace import UNATTRIBUTED
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "rows.jsonl")
+            loaders = self._every_loader(tmp)
+        self.assertEqual(3, len(loaders), "a loader dropped out of the survey")
+        for name, ts in loaders.items():
+            with self.subTest(loader=name):
+                self.assertTrue(ts.requests,
+                                f"{name} produced no requests; the check is vacuous")
+                surfaces = {r.target_id for r in ts.requests}
+                self.assertEqual(
+                    {UNATTRIBUTED}, surfaces,
+                    f"{name} supplied a surface nobody read or stated: {surfaces}")
+
+    def test_and_therefore_publishes_no_dollars_for_it(self):
+        """The consequence that matters. An unattributed surface is registered
+        unpriceable, so the figures stay withheld rather than being priced
+        against a table nobody chose."""
+        with tempfile.TemporaryDirectory() as tmp:
+            loaders = self._every_loader(tmp)
+        for name, ts in loaders.items():
+            with self.subTest(loader=name):
+                a = analyze(ts, allow_unreconciled=True)
+                released = [k for k, v in a.spend.items()
+                            if getattr(v, "released", False)]
+                self.assertEqual(
+                    [], released,
+                    f"{name} published dollars over an unattributed surface: "
+                    + ", ".join(released))
+
+    def test_a_loader_that_supplies_a_surface_has_to_admit_it(self):
+        """The rule stated positively, over the same fixture.
+
+        A loader may end up with a surface in one of three ways: read from the
+        row, passed by the caller, or supplied by itself. Only the third is an
+        assumption, and only the third has to appear in `assumed_inputs`. So:
+        given a providerless row and no caller-supplied surface, any loader
+        whose requests come back with a real surface must have assumed it, and
+        must say so.
+
+        This is what makes the survey bite. If `load_jsonl` starts defaulting
+        `default_target` to `anthropic/direct` again -- the defect this package
+        has already shipped twice -- this fails whether or not it sets the field.
+        """
+        from cacheeconomics.trace import UNATTRIBUTED
+        with tempfile.TemporaryDirectory() as tmp:
+            loaders = self._every_loader(tmp)
+        for name, ts in loaders.items():
+            with self.subTest(loader=name):
+                supplied = {r.target_id for r in ts.requests} - {UNATTRIBUTED}
+                if supplied:
+                    self.assertTrue(
+                        tuple(getattr(ts, "assumed_inputs", ()) or ()),
+                        f"{name} supplied {sorted(supplied)} for a row that "
+                        f"named no provider, and did not record it as assumed")
+
+    def test_a_caller_supplied_surface_is_not_an_assumption(self):
+        """The other direction, so the rule above cannot be satisfied by making
+        every loader claim to assume. A surface the caller states is stated."""
+        from cacheeconomics.trace import load_jsonl
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "j.jsonl")
             with open(path, "w") as f:
                 f.write(json.dumps({
-                    "model": "claude-opus-5",
-                    "usage": {"input_tokens": 10,
+                    "request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
+                    "model": "claude-opus-5", "segments": [],
+                    "usage": {"input_tokens": 10, "output_tokens": 2,
                               "cache_read_input_tokens": 0,
                               "cache_creation_input_tokens": 0}}) + "\n")
-            from cacheeconomics.adapters.litellm import load_litellm
-            ts = load_litellm(path)
-        self.assertEqual((), tuple(getattr(ts, "assumed_inputs", ())),
-                         "this loader reads or is told its surface; it assumes "
-                         "nothing and must not say it did")
+            ts = load_jsonl(path, default_target="anthropic/direct")
+        self.assertEqual({"anthropic/direct"},
+                         {r.target_id for r in ts.requests})
+        self.assertEqual((), tuple(getattr(ts, "assumed_inputs", ()) or ()),
+                         "a surface the caller stated is not an assumption")
+
+    def test_the_default_survives_a_field_written_with_a_factory(self):
+        """Why `assumed_inputs` is a plain default and not `default_factory`.
+
+        Track A reads it with `getattr(ts, "assumed_inputs", ())`, and a
+        TraceSet built before the field existed has no such key in its
+        `__dict__`. A plain default leaves the value on the *class*, so every
+        such object reads `()` through ordinary attribute access -- checked
+        across pickle round-trips, a stripped legacy pickle, `copy`, `deepcopy`,
+        `dataclasses.replace` and a re-pickle of a stripped one.
+
+        `field(default_factory=tuple)` would look equivalent and is not: it
+        leaves no class attribute, so a legacy object raises AttributeError on
+        plain access. Pinned because the two spellings are interchangeable
+        everywhere except here.
+        """
+        import dataclasses as dc
+
+        from cacheeconomics.trace import Tier, TraceSet
+        f = next(x for x in dc.fields(TraceSet) if x.name == "assumed_inputs")
+        self.assertIs(dc.MISSING, f.default_factory,
+                      "a default_factory leaves no class attribute, so a "
+                      "TraceSet predating this field would raise on access")
+        self.assertEqual((), getattr(TraceSet, "assumed_inputs"))
+        legacy = TraceSet(requests=[], tier=Tier.USAGE_ONLY,
+                          blocking_notes=["Provider surface assumed to be x"])
+        legacy.__dict__.pop("assumed_inputs")
+        self.assertEqual((), legacy.assumed_inputs)
+        self.assertEqual((), dc.replace(legacy, source="x").assumed_inputs)
