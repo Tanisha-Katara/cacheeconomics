@@ -107,6 +107,16 @@ class Finding:
     # It is a string rather than a bool so the reason carries the finding's own
     # numbers -- "2 requests", not the trace's ten.
     projection_why: str = ""
+    # How many contributing requests that verdict counted.
+    #
+    # Recorded because the verdict is only as good as the set handed to it, and
+    # "these are the requests that contributed" is exactly the kind of claim
+    # this package keeps getting wrong: FAN-1 passed both sides of every
+    # concurrent pair while charging one of them, so the sample read double and
+    # cleared a floor that exists to stop a small sample driving a projection.
+    # A count on the finding lets a test compare the sample against the requests
+    # that actually move the figure instead of taking the rule's word for it.
+    projection_sample: int = 0
 
     def describe(self) -> str:
         """The structural finding always renders; the dollar claim may not.
@@ -475,7 +485,8 @@ def _avoidable(amount: float | None, window_days: float | None,
     trace's.
     """
     if amount is None:
-        return {"avoidable_usd_window": None, "avoidable_usd_month": None}
+        return {"avoidable_usd_window": None, "avoidable_usd_month": None,
+                "projection_why": "", "projection_sample": 0}
     sample = list(sample_times)
     supported, why = _projection_supported(_span_days(sample), len(sample),
                                            sample="finding")
@@ -490,6 +501,7 @@ def _avoidable(amount: float | None, window_days: float | None,
         # later. `analyze` re-applies this after release, which is the same
         # order the trace-wide floor already used for `monthly_input_usd`.
         "projection_why": "" if supported else why,
+        "projection_sample": len(sample),
     }
 
 
@@ -1506,10 +1518,25 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             per_token = rate_for(b.model, _when(b), b.target_id) / 1e6
             groups += 1
             affected.update((a.request_id, b.request_id))
-            # Keyed by request id, because three requests fanning out form two
-            # adjacent pairs and `b` is counted in both -- the same reason
-            # `affected` is a set rather than a running total.
-            contributed[a.request_id] = a.sent_at
+            # `affected` keeps both sides; the projection sample keeps only `b`.
+            #
+            # They answer different questions and the difference is the whole
+            # defect. "How many requests does this affect" is honestly two per
+            # pair -- both went out, both are part of the phenomenon. "How many
+            # independent observations is the monthly figure averaging over" is
+            # one per pair, because `waste` below charges `ub` and nothing else:
+            # the leader's write is the one that had to happen, and it moves the
+            # figure by exactly zero.
+            #
+            # Recording both padded the sample to twice its real size, which is
+            # precisely how the request floor gets cleared by requests that
+            # contributed nothing. Measured on five pairs spread over five days:
+            # ten timestamps, five charged, floor cleared, and FAN-1 published
+            # $43.12/mo marked `reconciled` with `total_avoidable_month` at
+            # $61.87.
+            #
+            # Keyed by request id because three requests fanning out form two
+            # adjacent pairs, so the middle one is charged once and seen twice.
             contributed[b.request_id] = b.sent_at
             waste += ub.cache_write_5m * per_token * (m["write_5m"] - 0.10)
             waste += ub.cache_write_1h * per_token * (m["write_1h"] - 0.10)

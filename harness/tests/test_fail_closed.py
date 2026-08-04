@@ -2006,6 +2006,191 @@ class TestTheProjectionFloorJudgesEachFindingsOwnSample(unittest.TestCase):
         self.assertTrue(a.total_avoidable_month.released)
 
 
+class TestEveryProjectionSampleIsMadeOfRequestsThatMoveTheFigure(unittest.TestCase):
+    """The floor is only as good as the set handed to it.
+
+    Judging each finding on its own sample closed the case where unrelated
+    traffic carried the floor. It left the case one level in: a rule can hand
+    over a *wider* set than the one it charged, and the padding clears the floor
+    just as effectively. FAN-1 did exactly that -- it charges only the later
+    writer of each concurrent pair (`waste += ub...`) and recorded both sides.
+    Measured on five pairs spread over five days: ten timestamps, five charged,
+    floor cleared, FAN-1 published $43.12/mo marked `reconciled` and
+    `total_avoidable_month` $61.87.
+
+    So this does not check FAN-1. It finds, for each finding a fixture produces,
+    which requests actually move that finding's figure, and requires the sample
+    the floor counted to be no larger. A rule that pads its sample fails here
+    whether or not anybody thought to look at it -- which is the difference
+    between fixing the member that was reported and closing the class.
+
+    The probe perturbs rather than deletes. Removing a request changes what the
+    trace *is*: drop the leader of a fan-out pair and the pair stops existing,
+    so a leave-one-out probe would call that leader load-bearing and agree with
+    the defect. Scaling its billed tokens and its segment sizes leaves every
+    structural relationship intact -- same pairs, same spans, same cadence --
+    and moves only magnitude, which is the thing a projection scales.
+
+    It scales in both directions, and that is not belt-and-braces. Scaling only
+    up reported 14 movers against TTL-1's 126 on the demo capture, which reads
+    exactly like the FAN-1 defect and is not one: TTL-1 recovers
+    `min(previous entry, this write)`, so on a trace where every request writes
+    about the same amount, tripling one of them leaves the minimum where it was
+    and the total unmoved. The requests were contributing; the probe could not
+    see it. Verified by instrumenting the rule directly -- 126 sample entries,
+    126 distinct timestamps, every one carrying a nonzero term. A probe whose
+    blind spot looks identical to the defect it hunts is worse than no probe,
+    so it shrinks as well as grows and counts a request that moves the figure
+    either way.
+    """
+
+    SCALE = 3
+
+    def _fixtures(self):
+        """`(label, TraceSet)` for traces that between them price several rules."""
+        return [("fan-out pairs over five days", self._fanout()),
+                ("volatile prefix", self._volatile()),
+                ("demo capture", self._demo())]
+
+    def _fanout(self):
+        reqs = []
+        for p in range(5):
+            base = T0 + timedelta(days=p)
+            for k, rid in ((0, f"lead{p}"), (1, f"dup{p}")):
+                reqs.append(Request(
+                    request_id=rid, sent_at=base + timedelta(seconds=k),
+                    model="claude-opus-5", target_id="anthropic/direct",
+                    tenant="t", agent="a", session="s", ttl_requested="5m",
+                    usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                           "cache_creation_input_tokens": 200_000},
+                    segments=[Segment(id="sys", role="system", tokens=200_000,
+                                      index=0, cache_marked=True, ttl="5m")]))
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+
+    def _volatile(self):
+        reqs = [Request(
+            request_id=f"r{i}", sent_at=T0 + timedelta(hours=3 * i),
+            model="claude-opus-5", target_id="anthropic/direct", tenant="t",
+            agent="a", session="s", ttl_requested="1h",
+            usage={"input_tokens": 100, "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 40_000},
+            segments=[Segment(id=f"hdr{i}", role="system", tokens=300, index=0,
+                              label="hdr"),
+                      Segment(id="body", role="system", tokens=30_000, index=1,
+                              label="sys", cache_marked=True, ttl="1h")])
+            for i in range(14)]
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+
+    def _demo(self):
+        from cacheeconomics.trace import load_jsonl
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "fixtures", "demo-traces.jsonl")
+        return load_jsonl(os.path.normpath(path))
+
+    def _scaled(self, ts, index, up):
+        """The same trace with one request's magnitude scaled, nothing else."""
+        import dataclasses
+
+        def s(v):
+            if not v:
+                return v
+            return v * self.SCALE if up else max(1, v // self.SCALE)
+
+        out = []
+        for i, r in enumerate(ts.requests):
+            if i != index:
+                out.append(r)
+                continue
+            usage = dict(r.usage)
+            for k in ("cache_creation_input_tokens", "cache_read_input_tokens",
+                      "input_tokens"):
+                if usage.get(k):
+                    usage[k] = s(usage[k])
+            if isinstance(usage.get("cache_creation"), dict):
+                usage["cache_creation"] = {k: s(v)
+                                           for k, v in usage["cache_creation"].items()}
+            segs = [dataclasses.replace(seg, tokens=s(seg.tokens or 0))
+                    for seg in r.segments]
+            out.append(dataclasses.replace(r, usage=usage, segments=segs))
+        return dataclasses.replace(ts, requests=out)
+
+    def _figures(self, ts):
+        """`{code: window amount}` for every priced finding, or {} on refusal."""
+        a = analyze(ts, allow_unreconciled=True)
+        return {f.code: f.avoidable_usd_window.raw()
+                for f in a.findings if f.avoidable_usd_window is not None}
+
+    def _movers(self, ts):
+        """`{code: how many requests move that finding's figure}`."""
+        base = self._figures(ts)
+        counts = {code: 0 for code in base}
+        for i in range(len(ts.requests)):
+            moved = set()
+            for up in (True, False):
+                after = self._figures(self._scaled(ts, i, up))
+                for code, amount in base.items():
+                    if code not in after or abs(after[code] - amount) > 1e-12:
+                        moved.add(code)
+            for code in moved:
+                counts[code] += 1
+        return counts
+
+    def test_the_probe_finds_movers_at_all(self):
+        """Vacuity guard. A probe that never registers a change would make
+        every sample look oversized and the check below would fail loudly
+        rather than silently -- but a probe that registers a change for
+        *everything* would make every sample look fine, which is the direction
+        that hides a defect."""
+        for label, ts in self._fixtures():
+            with self.subTest(fixture=label):
+                movers = self._movers(ts)
+                self.assertTrue(movers, "no priced findings to check")
+                for code, n in movers.items():
+                    self.assertGreater(
+                        n, 0, f"{code}: perturbing any request changed nothing, "
+                              f"so the probe is not measuring magnitude")
+                    self.assertLess(
+                        n, len(ts.requests) + 1,
+                        f"{code}: more movers than requests")
+
+    def test_no_finding_counts_more_requests_than_move_its_figure(self):
+        for label, ts in self._fixtures():
+            a = analyze(ts, allow_unreconciled=True)
+            movers = self._movers(ts)
+            for f in a.findings:
+                if f.avoidable_usd_window is None:
+                    continue
+                with self.subTest(fixture=label, finding=f.code):
+                    self.assertLessEqual(
+                        f.projection_sample, movers[f.code],
+                        f"{f.code} counted {f.projection_sample} requests "
+                        f"toward the projection floor, but only "
+                        f"{movers[f.code]} of them move its figure: the "
+                        f"remainder pad the sample and clear a floor they "
+                        f"contributed nothing to")
+
+    def test_fan_out_counts_one_request_per_pair(self):
+        """The member that was reported, named explicitly so the measurement
+        survives as a number rather than only as a property."""
+        ts = self._fanout()
+        a = analyze(ts, allow_unreconciled=True)
+        fan = next(f for f in a.findings if f.code == "FAN-1")
+        self.assertEqual(5, fan.projection_sample,
+                         "five pairs charge five requests")
+        self.assertEqual(10, fan.affected_requests,
+                         "but both sides of a pair are genuinely affected")
+
+    def test_and_therefore_publishes_no_month(self):
+        ts = self._fanout()
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        a = analyze(ts, invoice_usd=invoice)
+        fan = next(f for f in a.findings if f.code == "FAN-1")
+        self.assertFalse(fan.avoidable_usd_month.released)
+        self.assertTrue(fan.avoidable_usd_window.released,
+                        "the measured window amount is unaffected")
+        self.assertFalse(a.total_avoidable_month.released)
+
+
 class TestSilenceUnderAnUnnamedSurfaceIsSpokenAloud(unittest.TestCase):
     """Three runtime checks read the registry for the request's surface and
     `return` when it does not know it.
