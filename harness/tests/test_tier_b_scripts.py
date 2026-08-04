@@ -28,6 +28,7 @@ import time
 import subprocess
 import sys
 import tempfile
+import types
 import threading
 import unittest
 import urllib.error
@@ -1359,6 +1360,50 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                                  f"{extra} made another tokenizer answer for a "
                                  f"row that named claude-opus-5")
 
+    def test_a_blank_model_puts_nothing_on_the_wire(self):
+        """The egress half of the blank-model finding, driven through the real
+        command. Measured before the fix: 3 calls, model `'   '`, and the
+        system prompt text in the request bodies."""
+        p = os.path.join(self.dir, "blank.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "   ",
+                "system": [{"type": "text", "text": "SECRET-POLICY"}],
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        r = self._run(p, "--allow-partial")
+        self.assertEqual(_ModelStub.seen, [],
+                         "a prompt body was sent under a blank model id")
+        self.assertIn("no model id", r.stderr)
+
+    def test_a_surface_prefixed_id_puts_nothing_on_the_wire(self):
+        """The same, for the routing prefix. Without a --target-id there is no
+        way to tell routing from model id, and the call could not have returned
+        a usable count."""
+        p = os.path.join(self.dir, "bedrock.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "anthropic.claude-opus-5",
+                "system": [{"type": "text", "text": "SECRET-POLICY"}],
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        r = self._run(p, "--allow-partial")
+        self.assertEqual(_ModelStub.seen, [],
+                         "a prompt body was sent under a surface routing prefix")
+        self.assertIn("--target-id", r.stderr)
+
+    def test_naming_the_surface_makes_that_row_countable(self):
+        """The other direction: the refusal must be about the missing surface,
+        not a blanket refusal of prefixed ids."""
+        p = os.path.join(self.dir, "bedrock2.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "anthropic.claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        r = self._run(p, "--target-id", "amazon-bedrock/converse")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"},
+                         "the prefix was not stripped before the tokenizer was "
+                         "asked")
+
     def test_a_row_with_no_resolvable_model_is_not_counted_at_all(self):
         """The consequence of having no fallback, stated as behaviour.
 
@@ -1436,24 +1481,41 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
             checked += 1
         self.assertEqual(checked, len(self.VALUES) ** 2)
 
-    def test_the_tokenizer_model_is_the_raw_logged_id(self):
-        """The other half, and the round-4 finding.
+    def test_the_tokenizer_model_is_the_logged_id_minus_routing(self):
+        """The other half, and the round-4 and round-5 findings together.
 
-        `request_from_row` returns the *normalised* id — the snapshot date
-        stripped, the surface prefix stripped — which is right for pricing and
-        wrong for the tokenizer. A request logged as claude-opus-5-20260101 was
-        being counted as bare claude-opus-5, so if that alias has moved the
-        counts came from a tokenizer the log never named and were marked exact.
+        `request_from_row` returns the normalised id — snapshot date stripped
+        AND surface prefix stripped — which conflates two decisions. The date
+        matters to a tokenizer (if the bare alias has moved, only the dated id
+        still means what the log meant) and the routing prefix does not (nothing
+        answers to `anthropic.claude-opus-5`).
 
-        The tokenizer id is the raw resolved value: the same `or` chain the
-        loader walks, stopping before `_normalised`.
+        So the tokenizer id is the raw resolved value with routing removed and
+        nothing else: whatever it is, it must be a *suffix* of the raw id, since
+        only a leading prefix may be dropped.
         """
         from cacheeconomics.trace import _first, _text
         m = load("count_tokens")
         for _rv, _bv, row, body in self._cases():
             raw = _text((body or {}).get("model") or _first(row, "model"))
+            raw = raw.strip() if isinstance(raw, str) else raw
+            got = m.row_models(row, body).tokenizer
             with self.subTest(row=row.get("model"), body=body.get("model")):
-                self.assertEqual(m.row_models(row, body).tokenizer, raw)
+                if got is None:
+                    continue                 # unnamed, or routing we cannot resolve
+                self.assertTrue(
+                    raw.endswith(got),
+                    f"{got!r} is not {raw!r} with only a leading prefix removed")
+
+    def test_the_date_survives_and_the_prefix_does_not(self):
+        """The two strippings, separated. `_normalised` does both; only one of
+        them is right for a tokenizer."""
+        m = load("count_tokens")
+        dated = m.row_models({}, {"model": "claude-opus-5-20260101"}).tokenizer
+        self.assertEqual(dated, "claude-opus-5-20260101")
+        prefixed = m.row_models({}, {"model": "anthropic.claude-opus-5"},
+                                "amazon-bedrock/converse").tokenizer
+        self.assertEqual(prefixed, "claude-opus-5")
 
     def test_a_dated_model_is_counted_dated_and_analysed_bare(self):
         """The two answers, side by side, on the shape that produced the
@@ -1563,16 +1625,68 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
                             "the surface made no difference, so this test no "
                             "longer covers the axis it was written for")
 
-    def test_the_surface_prefix_is_not_stripped_from_the_tokenizer_id(self):
-        """The same split as the dated case. A gateway fronting Bedrock is
-        addressed with the id its own logs carry; stripping the prefix before
-        asking it is the round-4 defect wearing a different prefix."""
+    def test_the_surface_prefix_is_stripped_from_the_tokenizer_id(self):
+        """There are three model-shaped things, not two.
+
+        Round 4 stopped before `_normalised` to keep the snapshot date, which
+        was right, and thereby also kept the surface's *routing* prefix, which
+        was wrong: `anthropic.` is how Bedrock addresses a model, not an id any
+        tokenizer answers to. With --target-id amazon-bedrock/converse the whole
+        prompt body was going to api.anthropic.com under
+        `anthropic.claude-opus-5` — a call that cannot come back with a usable
+        count, so egress for nothing.
+
+        Date kept, prefix dropped, and the prefix recorded rather than lost.
+        """
         m = load("count_tokens")
-        body = {"model": "anthropic.claude-opus-5",
-                "messages": [{"role": "user", "content": "hi"}]}
-        got = m.row_models({}, body, "amazon-bedrock/converse")
-        self.assertEqual(got.tokenizer, "anthropic.claude-opus-5")
-        self.assertEqual(got.analysis, "claude-opus-5")
+        for raw, target, tok, prefix in (
+                ("anthropic.claude-opus-5", "amazon-bedrock/converse",
+                 "claude-opus-5", "anthropic."),
+                ("anthropic.claude-opus-5-20260101", "amazon-bedrock/converse",
+                 "claude-opus-5-20260101", "anthropic."),
+                ("bedrock/anthropic.claude-haiku-4-5", "amazon-bedrock/converse",
+                 "claude-haiku-4-5", "bedrock/anthropic."),
+                ("anthropic/claude-opus-5", None, "claude-opus-5", "anthropic/"),
+                ("claude-opus-5-20260101", None, "claude-opus-5-20260101", None),
+                ("claude-opus-5", None, "claude-opus-5", None)):
+            with self.subTest(raw=raw, target=target):
+                got = m.row_models({}, {"model": raw, "messages": []}, target)
+                self.assertEqual(got.tokenizer, tok)
+                self.assertEqual(got.prefix, prefix)
+
+    def test_a_surface_prefixed_id_is_not_sent_when_no_surface_is_named(self):
+        """`normalize_model` needs the target to know what the prefix is, so
+        without one this cannot tell routing from model id — and guessing costs
+        a prompt body on the wire. It refuses instead, and names the prefix so
+        the message can say what to pass."""
+        m = load("count_tokens")
+        got = m.row_models({}, {"model": "anthropic.claude-opus-5",
+                                "messages": []})
+        self.assertIsNone(got.tokenizer)
+        self.assertEqual(got.prefix, "anthropic.")
+
+    def test_the_known_prefixes_come_from_the_registry(self):
+        """Listing them here would go stale the first time a surface is added."""
+        m = load("count_tokens")
+        self.assertIn("anthropic.", m._known_routing_prefixes())
+
+    def test_a_blank_model_is_unnamed_rather_than_a_model_named_blank(self):
+        """`_text` returns strings unchanged, so `"   "` passed the truthiness
+        test and a full prompt body went to the endpoint under a model name of
+        three spaces. Trimming to decide whether a model exists is not the
+        coercion round 2 rejected — `5` still resolves to "5"."""
+        m = load("count_tokens")
+        for blank in ("   ", "\t", " \n ", ""):
+            with self.subTest(value=blank):
+                self.assertIsNone(
+                    m.row_models({}, {"model": blank, "messages": []}).tokenizer)
+        self.assertEqual(
+            m.row_models({}, {"model": 5, "messages": []}).tokenizer, "5",
+            "a numeric model was coerced away; round 2 established it must not "
+            "be")
+        self.assertEqual(
+            m.row_models({}, {"model": "  claude-opus-5 ",
+                              "messages": []}).tokenizer, "claude-opus-5")
 
 
 class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
@@ -1972,10 +2086,34 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
     def test_a_matching_counted_file_is_reused(self):
         """The other direction. A rule that never reuses has traded a wrong
         answer for egress on every run, which is its own kind of wrong."""
-        self._write_counted()
-        got, attempts = self._counted_never_shelling_out()
+        self._write_counted(tokenizer_id="stub-1")
+        got, attempts = self._counted_never_shelling_out(tokenizer_id="stub-1")
         self.assertEqual(got, self.out)
         self.assertEqual(attempts, [])
+
+    def test_a_counted_file_with_no_tokenizer_identity_is_not_reused(self):
+        """A counted export IS a cache — of whole rows rather than prefixes —
+        and it was the one of the two reuse paths the identity rule had not been
+        applied to. `count_tokens.py` refuses to resume its prefix cache without
+        `--tokenizer-id`; reusing a counted export written without one is the
+        same claim with nothing behind it, and `None == None` passed.
+        """
+        self._write_counted()                       # written with no identity
+        got, attempts = self._counted_never_shelling_out()   # and none asked
+        self.assertEqual(got, self.src,
+                         "a counted export that names no tokenizer deployment "
+                         "was reused as exact")
+        self.assertEqual(attempts, [], "it recounted instead of refusing")
+
+    def test_a_stored_identity_with_none_requested_is_not_reused(self):
+        self._write_counted(tokenizer_id="stub-1")
+        got, _ = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src)
+
+    def test_a_requested_identity_with_none_stored_is_not_reused(self):
+        self._write_counted()
+        got, _ = self._counted_never_shelling_out(tokenizer_id="stub-1")
+        self.assertEqual(got, self.src)
 
     def test_a_changed_capture_is_not_reused(self):
         self._write_counted()
@@ -2023,11 +2161,12 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
         self.assertEqual(got, self.src)
 
     def test_a_refusal_says_what_it_found_and_what_to_do(self):
-        self._write_counted(endpoint="https://someone-elses-gateway/count")
+        self._write_counted(tokenizer_id="stub-1",
+                            endpoint="https://someone-elses-gateway/count")
         buf = io.StringIO()
         real, sys.stderr = sys.stderr, buf
         try:
-            self.m.counted(self.src)
+            self.m.counted(self.src, tokenizer_id="stub-1")
         finally:
             sys.stderr = real
         said = buf.getvalue()
@@ -2092,9 +2231,10 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
         the stored row carries a field that contradicts the capture; after reuse
         it must be gone, because the row came from the capture.
         """
-        self._write_counted(extra_row={"usage": {"input_tokens": 123456},
+        self._write_counted(tokenizer_id="stub-1",
+                            extra_row={"usage": {"input_tokens": 123456},
                                        "agent": "from-the-stale-file"})
-        got, _ = self._counted_never_shelling_out()
+        got, _ = self._counted_never_shelling_out(tokenizer_id="stub-1")
         self.assertEqual(got, self.out)
         row = json.loads(open(self.out).read().strip())
         self.assertEqual(row["segment_tokens"], [7], "the counts were not kept")
@@ -2134,68 +2274,105 @@ class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
         self.cap = cap
 
     def _run_main(self, *argv):
-        """`main()` with both callees recorded and neither able to shell out."""
-        seen = {}
+        """`main()` with the real `counted()`, and `subprocess.run` recorded.
 
-        def fake_counted(path, *a, **k):
-            seen["counted"] = (path, a, k)
-            return path
+        The first version of this replaced `counted()` with a fake, so it proved
+        only that `main` passed parsed values to an in-process function. Deleting
+        the flag appends *inside* `counted()` -- the code that builds the
+        `count_tokens.py` command line that actually sends prompt content -- left
+        all of it green, measured at 18 passed. So the boundary recorded here is
+        the subprocess, which is where the values have to arrive.
+
+        `analyse` is still replaced: it shells out to the analyzer, which is a
+        different subprocess with its own command line, captured separately.
+        """
+        seen = {"cmds": [], "analyse": None}
 
         def fake_analyse(path, *a, **k):
             seen["analyse"] = (path, a, k)
             return {"ttl1_raised": False, "recoverable_share": None,
                     "measured_usd": 0.0, "window_days": 1}
 
-        real = (self.m.counted, self.m.analyse, sys.argv)
-        self.m.counted, self.m.analyse = fake_counted, fake_analyse
+        class _Rec:
+            @staticmethod
+            def run(cmd, *a, **k):
+                seen["cmds"].append(list(cmd))
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        real = (self.m.analyse, self.m.subprocess, sys.argv)
+        self.m.analyse, self.m.subprocess = fake_analyse, _Rec
         sys.argv = ["sweep_report.py", "--dir", self.dir, *argv]
         try:
             rc = self.m.main()
         finally:
-            self.m.counted, self.m.analyse, sys.argv = real
+            self.m.analyse, self.m.subprocess, sys.argv = real
         return rc, seen
 
-    def _positional_and_kw(self, call):
-        """The values a callee received, however `main` chose to pass them."""
-        _path, args, kwargs = call
+    def _count_cmd(self, seen):
+        """The `count_tokens.py` command line, which is what sends prompts."""
+        for cmd in seen["cmds"]:
+            if any(str(c).endswith("count_tokens.py") for c in cmd):
+                return cmd
+        self.fail(f"counting never shelled out; commands were {seen['cmds']}")
+
+    def _analyse_values(self, seen):
+        _path, args, kwargs = seen["analyse"]
         return list(args) + list(kwargs.values())
 
-    def test_the_surface_reaches_both_counting_and_analysis(self):
+    def test_the_surface_reaches_the_counting_subprocess_and_analysis(self):
         rc, seen = self._run_main("--target-id", "amazon-bedrock/converse")
         self.assertEqual(rc, 0)
-        self.assertIn("amazon-bedrock/converse",
-                      self._positional_and_kw(seen["counted"]),
-                      "--target-id never reached counting, so the surface "
-                      "prefix cannot be stripped before the tokenizer is asked")
-        self.assertIn("amazon-bedrock/converse",
-                      self._positional_and_kw(seen["analyse"]),
+        cmd = self._count_cmd(seen)
+        self.assertIn("--target-id", cmd,
+                      "--target-id never reached the counting subprocess, so "
+                      "the surface prefix is not stripped before the tokenizer "
+                      "is asked")
+        self.assertEqual(cmd[cmd.index("--target-id") + 1],
+                         "amazon-bedrock/converse")
+        self.assertIn("amazon-bedrock/converse", self._analyse_values(seen),
                       "--target-id never reached analysis")
 
-    def test_the_endpoint_reaches_counting(self):
+    def test_the_endpoint_reaches_the_counting_subprocess(self):
         rc, seen = self._run_main("--endpoint", "https://gateway.internal/count")
         self.assertEqual(rc, 0)
-        self.assertIn("https://gateway.internal/count",
-                      self._positional_and_kw(seen["counted"]),
-                      "--endpoint never reached counting, so the calls go to "
-                      "the default host whatever the operator asked for")
+        cmd = self._count_cmd(seen)
+        self.assertIn("--endpoint", cmd,
+                      "--endpoint never reached the counting subprocess, so the "
+                      "calls go to the default host whatever was asked for")
+        self.assertEqual(cmd[cmd.index("--endpoint") + 1],
+                         "https://gateway.internal/count")
 
-    def test_the_tokenizer_id_reaches_counting(self):
+    def test_the_tokenizer_id_reaches_the_counting_subprocess(self):
         rc, seen = self._run_main("--tokenizer-id", "gateway-build-7")
         self.assertEqual(rc, 0)
-        self.assertIn("gateway-build-7",
-                      self._positional_and_kw(seen["counted"]))
+        cmd = self._count_cmd(seen)
+        self.assertIn("--tokenizer-id", cmd)
+        self.assertEqual(cmd[cmd.index("--tokenizer-id") + 1], "gateway-build-7")
+
+    def test_all_three_arrive_together(self):
+        """Each flag has its own append, and one missing is the whole defect."""
+        rc, seen = self._run_main("--target-id", "amazon-bedrock/converse",
+                                  "--endpoint", "https://gateway.internal/count",
+                                  "--tokenizer-id", "gateway-build-7")
+        self.assertEqual(rc, 0)
+        cmd = self._count_cmd(seen)
+        for flag, value in (("--target-id", "amazon-bedrock/converse"),
+                            ("--endpoint", "https://gateway.internal/count"),
+                            ("--tokenizer-id", "gateway-build-7")):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, cmd)
+                self.assertEqual(cmd[cmd.index(flag) + 1], value)
 
     def test_counting_and_analysis_are_given_the_same_surface(self):
         """The failure mode is not only that a value is missing, but that the
         two halves disagree: a file counted under one surface and analysed under
         another resolves two different models from one row."""
         _rc, seen = self._run_main("--target-id", "amazon-bedrock/converse")
-        counted_vals = self._positional_and_kw(seen["counted"])
-        analyse_vals = self._positional_and_kw(seen["analyse"])
-        surfaces = [v for v in counted_vals if v == "amazon-bedrock/converse"]
-        self.assertTrue(surfaces and
-                        "amazon-bedrock/converse" in analyse_vals,
-                        "counting and analysis were not given the same surface")
+        cmd = self._count_cmd(seen)
+        self.assertEqual(cmd[cmd.index("--target-id") + 1],
+                         "amazon-bedrock/converse")
+        self.assertIn("amazon-bedrock/converse", self._analyse_values(seen),
+                      "counting and analysis were not given the same surface")
 
     def test_the_artifact_records_the_settings_it_was_run_with(self):
         """They change what the points mean — the surface decides which rate

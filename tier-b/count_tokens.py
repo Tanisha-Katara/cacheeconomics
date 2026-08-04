@@ -61,6 +61,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
 from cacheeconomics.tokenizer import count_segments              # noqa: E402
+from cacheeconomics.registry import normalize_model, providers   # noqa: E402
 from cacheeconomics.trace import (_first, _text,                 # noqa: E402
                                   request_from_row)
 
@@ -81,29 +82,37 @@ PROVENANCE_KEY = "segment_tokens_provenance"
 
 
 class RowModels(typing.NamedTuple):
-    """The two models a row has, which are two different questions.
+    """A row has three model-shaped things, not two, and they are three
+    different questions.
 
-    Answering both with one value is the mistake this type exists to make
-    impossible, and it was made twice in opposite directions: first by sending
-    the raw id and recording it as the analysed model, then by normalising and
-    sending *that* to the tokenizer.
+    Answering them with fewer values is the mistake this type exists to make
+    impossible, and it has now been made three times: the raw id recorded as the
+    analysed model, then the normalised id sent to the tokenizer, then the raw
+    id sent with a *surface routing prefix* still attached.
 
-    `tokenizer` is the id the count endpoint is asked for. It is the raw logged
-    value, because the tokenizer that billed this request is the one that
-    answers to the id the request carried. `claude-opus-5-20260101` is asked for
-    as `claude-opus-5-20260101`; if the bare alias has since moved, the dated id
-    is the only one that still means what the log meant.
+    `analysis` is what the report names and prices. Normalised through
+    `request_from_row`: date stripped, surface prefix stripped. The registry is
+    keyed on it.
 
-    `analysis` is what the report will name and price, normalised through
-    `request_from_row` -- the date stripped, the surface prefix stripped -- and
-    it is what the registry is keyed on.
+    `tokenizer` is the id the count endpoint is asked for. The logged id with
+    the surface's routing prefix removed but its snapshot date kept, because
+    those two strippings answer different questions and `_normalised` does both:
+    the date matters (if the bare alias has moved, only the dated id still means
+    what the log meant) and the prefix does not (`anthropic.` is how Bedrock
+    addresses a model, not a model id any tokenizer answers to).
+
+    `prefix` is the routing prefix that was removed, or None. It belongs to
+    neither of the others and is kept so the record can say what was dropped.
 
     `tokenizer` is None when the row names nothing a tokenizer could be asked
-    for. Such a row is not counted at all.
+    for, or names something no endpoint could serve. Such a row is not counted
+    and nothing is sent for it -- the point being that a call that cannot return
+    a usable count is prompt content leaving the machine for nothing.
     """
 
     tokenizer: "str | None"
     analysis: str
+    prefix: "str | None" = None
 
 
 def counted_path(path: str) -> str:
@@ -126,6 +135,47 @@ def counted_path(path: str) -> str:
     return os.path.join(head, f"{root}-counted{ext or '.jsonl'}")
 
 
+def _known_routing_prefixes() -> set:
+    """Every surface id-prefix the registry knows about.
+
+    Read from the registry rather than listed here, so a surface added to
+    providers.json is covered without this file being edited.
+    """
+    return {t.get("model_id_prefix") for t in providers()["targets"]
+            if t.get("model_id_prefix")}
+
+
+def _without_routing_prefix(raw: str, target_id: str | None):
+    """`(id to ask a tokenizer for, routing prefix removed)`.
+
+    Returns `(None, prefix)` when the id carries routing decoration that cannot
+    be resolved without knowing the surface. Refusing is the point: sending
+    `anthropic.claude-opus-5` to api.anthropic.com is prompt content leaving the
+    machine in a call that cannot come back with a usable count.
+
+    The registry decides everything. `normalize_model` strips the prefix *and*
+    the date; the date is re-attached from the second return value, and the
+    result is required to be a suffix of the original -- if it is not, something
+    other than a leading prefix was rewritten and this refuses rather than
+    guessing what to send.
+    """
+    base, stamp = normalize_model(raw, target_id)
+    dated = f"{base}-{stamp}" if stamp else base
+    if dated != raw:
+        if not raw.endswith(dated):
+            return None, None        # not a leading-prefix difference
+        raw, prefix = dated, raw[:len(raw) - len(dated)]
+    else:
+        prefix = None
+    # A surface prefix survives when no --target-id was given, because
+    # `normalize_model` needs the target to know what the prefix is. We cannot
+    # tell routing from model id here, so nothing is sent.
+    for known in _known_routing_prefixes():
+        if raw.startswith(known):
+            return None, known
+    return raw, prefix
+
+
 def row_models(row: dict, body: dict,
                target_id: str | None = None) -> RowModels:
     """The tokenizer to ask, and the model the report will name.
@@ -144,12 +194,21 @@ def row_models(row: dict, body: dict,
                was counted as bare claude-opus-5: if that alias has moved, the
                counts came from a tokenizer the log never named, and are marked
                exact.
+      round 5  stopping before `_normalised` kept the date (right) and also kept
+               the surface's routing prefix (wrong). With
+               --target-id amazon-bedrock/converse, a body model of
+               anthropic.claude-opus-5 was sent verbatim to
+               api.anthropic.com -- prompt content leaving the machine in a call
+               that could not return a usable count. Egress for nothing, which
+               is worse than a wrong count.
 
-    So there is no single answer and this returns both. The analysis side calls
-    `request_from_row`, because that function *is* the definition of
-    `Request.model` and matching its behaviour is what failed twice. The
-    tokenizer side stops one step earlier, at the raw resolved value, because
-    that is the id the request actually carried.
+    So the analysis side calls `request_from_row`, because that function *is* the
+    definition of `Request.model` and matching its behaviour is what failed
+    twice. The tokenizer side takes the raw resolved value and removes only the
+    routing prefix, and it asks the registry both what the prefix is and whether
+    it applies -- `normalize_model(raw, target)` differing from
+    `normalize_model(raw, None)` is the registry's own answer to the second
+    question, so no copy of its guard lives here.
 
     The one line still transcribed from the caller is `model_override`, which is
     `bodies.load_bodies`'s argument rather than the resolver's own logic;
@@ -169,7 +228,16 @@ def row_models(row: dict, body: dict,
     # The same expression the loader resolves, stopping before `_normalised`.
     # `_text` still applies: a list or a dict is not an id anyone can send, and
     # the loader discards those too.
-    return RowModels(_text(override or _first(row, "model")), analysis)
+    raw = _text(override or _first(row, "model"))
+    # Trimmed before deciding whether a model exists at all. Not a coercion --
+    # `5` still resolves to "5", which round 2 established -- but whitespace is
+    # not part of any id, and `"   "` was passing this test and putting a whole
+    # prompt body on the wire under a model name of three spaces.
+    raw = raw.strip() if isinstance(raw, str) else raw
+    if not raw:
+        return RowModels(None, analysis)
+    tokenizer, prefix = _without_routing_prefix(raw, target_id)
+    return RowModels(tokenizer, analysis, prefix)
 
 
 def body_sha256(body) -> str:
@@ -294,11 +362,16 @@ def main() -> int:
     # whole tool is sold on.
     p.add_argument("--target-id",
                    help="the provider surface this traffic went to, if the rows "
-                        "do not say. It resolves the model the same way "
-                        "`analyze --target-id` does -- a surface's id prefix is "
-                        "stripped before the tokenizer is asked -- so pass the "
-                        "same value to both or the counted model and the "
-                        "analysed model can differ")
+                        "do not say. Two effects: it resolves the analysed model "
+                        "the way `analyze --target-id` does, so pass the same "
+                        "value to both; and it names the surface's routing "
+                        "prefix, which is stripped before a tokenizer is asked "
+                        "(`anthropic.claude-opus-5` is how Bedrock addresses a "
+                        "model, not an id any tokenizer answers to). Without it, "
+                        "rows whose model carries such a prefix are NOT counted "
+                        "and nothing is sent for them -- a call that cannot come "
+                        "back with a usable count is prompt content leaving the "
+                        "machine for nothing")
     p.add_argument("--tokenizer-id",
                    help="an identifier for the tokenizer deployment behind "
                         "--endpoint, asserted by you (a gateway build, a date, "
@@ -452,8 +525,13 @@ def main() -> int:
                         # endpoint refuse it, which is a request whose only
                         # possible answer is an error.
                         raise ValueError(
-                            "no model id on this row or its body, so there is no "
-                            "tokenizer to ask; the analyzer will estimate it")
+                            f"its model id {models.prefix!r} names a provider "
+                            f"surface rather than a model, and no --target-id "
+                            f"says which; pass one so the prefix can be "
+                            f"stripped before a tokenizer is asked"
+                            if models.prefix else
+                            "no model id on this row or its body, so there is "
+                            "no tokenizer to ask; the analyzer will estimate it")
                     cid, count = counter_for(models)
                     row["segment_tokens"] = count_segments(body, count, cache,
                                                       cid)

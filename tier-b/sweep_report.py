@@ -96,6 +96,19 @@ def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
         if not body:
             return None, (f"row {i} carries counts but the capture no longer "
                           f"has a recognisable body there")
+        # The same rule the prefix cache gets, because a counted export IS a
+        # cache -- of whole rows rather than of prefixes -- and it was the one
+        # of the two reuse paths the rule had not been applied to.
+        # `count_tokens.py` refuses to resume without an asserted identity;
+        # reusing a counted export written without one was the same claim
+        # ("nothing has changed since") made with nothing behind it, and
+        # `tokenizer_id=None` on both sides compared equal and passed.
+        if not tokenizer_id or not p.get("tokenizer_id"):
+            return None, (
+                f"row {i} names no tokenizer deployment "
+                f"(stored {p.get('tokenizer_id')!r}, this run "
+                f"{tokenizer_id!r}), so nothing shows the tokenizer that "
+                f"produced these counts is the one answering now")
         models = row_models(s, body, target_id)
         want = {"version": COUNTER_VERSION,
                 "row_sha256": row_sha256(s), "body_sha256": body_sha256(body),
