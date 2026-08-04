@@ -41,10 +41,10 @@ class TestRegistry(unittest.TestCase):
             registry.min_cacheable_tokens("anthropic/direct", "claude-not-a-model")
 
     def test_pricing_is_date_effective(self):
-        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-07-29"), 2.00)
-        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-08-31"), 2.00)
-        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-09-01"), 3.00)
-        self.assertEqual(registry.base_rate("claude-sonnet-5", "2027-06-01"), 3.00)
+        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-07-29", "anthropic/direct"), 2.00)
+        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-08-31", "anthropic/direct"), 2.00)
+        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-09-01", "anthropic/direct"), 3.00)
+        self.assertEqual(registry.base_rate("claude-sonnet-5", "2027-06-01", "anthropic/direct"), 3.00)
 
     def test_upcoming_rate_change_is_surfaced(self):
         up = registry.upcoming_rate_change("claude-sonnet-5", "2026-07-29")
@@ -67,19 +67,19 @@ class TestCost(unittest.TestCase):
     def test_caching_can_cost_more_than_not_caching(self):
         """A write nothing reads is strictly worse than no cache."""
         u = cost.Usage(cache_write_5m=20000)
-        s = cost.price(u, "claude-sonnet-4-6", on_date="2026-07-29")
+        s = cost.price(u, "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-29")
         self.assertLess(s.saving_vs_uncached, 0)
         self.assertAlmostEqual(s.usd, 20000 * 3.0 / 1e6 * 1.25, places=9)
 
     def test_reads_are_cheap(self):
         u = cost.Usage(cache_read=20000)
-        s = cost.price(u, "claude-sonnet-4-6", on_date="2026-07-29")
+        s = cost.price(u, "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-29")
         self.assertGreater(s.saving_pct, 89)
 
     def test_effective_rate_overrides_list(self):
         u = cost.Usage(cache_read=1_000_000)
-        listed = cost.price(u, "claude-sonnet-4-6", on_date="2026-07-29")
-        negotiated = cost.price(u, "claude-sonnet-4-6", on_date="2026-07-29", effective_rate=1.50)
+        listed = cost.price(u, "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-29")
+        negotiated = cost.price(u, "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-29", effective_rate=1.50)
         self.assertAlmostEqual(negotiated.usd, listed.usd / 2, places=9)
         self.assertIn("invoice", negotiated.breakdown["rate_source"])
 
@@ -165,17 +165,17 @@ class TestModelIdNormalization(unittest.TestCase):
         with a date suffix from a genuinely unknown one.
         """
         with self.assertRaises(registry.RegistryError):
-            registry.base_rate("claude-haiku-4-5-20251001", "2026-07-29")
+            registry.base_rate("claude-haiku-4-5-20251001", "2026-07-29", "anthropic/direct")
 
     def test_one_hour_creation_prices_at_2x_not_1_25x(self):
         raw = {"cache_creation_input_tokens": 1_000_000}
         u = cost.Usage.from_anthropic(raw, ttl="1h")
-        s = cost.price(u, "claude-sonnet-4-6", on_date="2026-07-29")
+        s = cost.price(u, "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-29")
         self.assertEqual(u.cache_write_1h, 1_000_000)
         self.assertEqual(u.cache_write_5m, 0)
         self.assertAlmostEqual(s.usd, 3.0 * 2.0, places=9)
         mispriced = cost.price(cost.Usage(cache_write_5m=1_000_000),
-                               "claude-sonnet-4-6", on_date="2026-07-29")
+                               "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-29")
         self.assertAlmostEqual(s.usd / mispriced.usd, 1.6, places=9)
 
     def test_reproduces_the_measured_run(self):
@@ -193,8 +193,8 @@ class TestModelIdNormalization(unittest.TestCase):
                 cost.Usage(uncached_input=U, cache_read=P),
                 cost.Usage(uncached_input=U, cache_read=P),
                 cost.Usage(uncached_input=U, cache_read=P)]
-        t5 = sum(cost.price(u, "claude-sonnet-4-6", on_date="2026-07-28").usd for u in arm5)
-        t1 = sum(cost.price(u, "claude-sonnet-4-6", on_date="2026-07-28").usd for u in arm1)
+        t5 = sum(cost.price(u, "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-28").usd for u in arm5)
+        t1 = sum(cost.price(u, "claude-sonnet-4-6", "anthropic/direct", on_date="2026-07-28").usd for u in arm1)
         self.assertAlmostEqual(t5, 0.18983, places=5)
         self.assertAlmostEqual(t1, 0.11343, places=5)
         self.assertAlmostEqual(100 * (t5 - t1) / t5, 40.2, places=1)
@@ -674,7 +674,7 @@ class TestEveryNamedModelHasARate(unittest.TestCase):
                             ("claude-sonnet-4", 3.00), ("claude-haiku-3-5", 0.80)):
             with self.subTest(model=model):
                 def usd(**kw):
-                    return cost.price(cost.Usage(**kw), model,
+                    return cost.price(cost.Usage(**kw), model, "anthropic/direct",
                                       on_date="2026-07-30").usd
                 self.assertAlmostEqual(usd(uncached_input=1_000_000), base)
                 self.assertAlmostEqual(usd(cache_write_5m=1_000_000), base * 1.25)
@@ -828,17 +828,17 @@ class TestRoundTwelve(unittest.TestCase):
         post-September $3.00 instead of $2.00 -- a 50% overstatement on a report
         whose entire premise is date-effective pricing. `not-a-date` did the
         same without failing."""
-        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-08-01"), 2.00)
-        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-09-01"), 3.00)
+        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-08-01", "anthropic/direct"), 2.00)
+        self.assertEqual(registry.base_rate("claude-sonnet-5", "2026-09-01", "anthropic/direct"), 3.00)
         for bad in ("2026-8-1", "not-a-date", "08-01-2026", "2026/08/01", None,
                     20260801, "20260801", 20260801.0, True, b"2026-08-01"):
             with self.subTest(on_date=bad):
                 with self.assertRaises(registry.RegistryError):
-                    registry.base_rate("claude-sonnet-5", bad)
+                    registry.base_rate("claude-sonnet-5", bad, "anthropic/direct")
 
     def test_a_real_date_object_still_works(self):
         from datetime import date as _date
-        self.assertEqual(registry.base_rate("claude-sonnet-5", _date(2026, 8, 1)), 2.00)
+        self.assertEqual(registry.base_rate("claude-sonnet-5", _date(2026, 8, 1), "anthropic/direct"), 2.00)
 
     def test_unread_transcripts_block_release(self):
         """`load_sessions` counted them and put the count only in `notes`, which

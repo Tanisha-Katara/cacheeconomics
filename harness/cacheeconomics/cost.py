@@ -269,7 +269,7 @@ class Spend:
         return None if h == 0 else 100.0 * self.saving_vs_uncached / h
 
 
-def price(usage: Usage, model: str, target_id: str = "anthropic/direct",
+def price(usage: Usage, model: str, target_id: str,
           on_date: str | None = None, effective_rate: float | None = None) -> Spend:
     """Cost this usage.
 
@@ -318,7 +318,13 @@ def price(usage: Usage, model: str, target_id: str = "anthropic/direct",
         # failure mode this tool exists to prevent, arriving through the pricing
         # path rather than the measurement one.
         registry.require_priceable(target_id)
-        rate = registry.base_rate(model, on_date)
+        # The caller's surface, not the rate table's default. This dropped it
+        # entirely, so `base_rate` fell back to its own first-party default and
+        # the scope check `require_priceable` had just performed was decided
+        # against one surface while the rate came from another. Harmless only
+        # because the check above already refused unpriceable surfaces -- which
+        # is a guard holding up a bug, not an absence of one.
+        rate = registry.base_rate(model, on_date, target_id)
     m = registry.multipliers(target_id)
     # The registry publishes surfaces whose pricing does not follow the
     # Anthropic shape -- openai/direct records `read: null` and its own write

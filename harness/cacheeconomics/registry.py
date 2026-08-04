@@ -426,7 +426,7 @@ def staleness_report(as_of=None):
     return rows
 
 
-def base_rate(model: str, on_date, target_id: str = "anthropic/direct") -> float:
+def base_rate(model: str, on_date, target_id: str) -> float:
     """The dated first-party input rate, for a surface those rates apply to.
 
     Scoped on purpose. This took only model and date, so it handed back

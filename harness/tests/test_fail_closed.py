@@ -1105,15 +1105,45 @@ class TestTheRateLookupIsScoped(unittest.TestCase):
             registry.base_rate("claude-sonnet-4-6", "2026-08-01",
                                "anthropic/direct"), 0)
 
-    def test_an_omitted_surface_is_confirmed_not_assumed(self):
-        """Defaulting to anthropic/direct is fine only because
-        `require_priceable` then checks it rather than trusting it."""
-        import inspect
+    def test_a_rate_cannot_be_asked_for_without_naming_a_surface(self):
+        """This asserted the opposite, and rationalised it: "defaulting to
+        anthropic/direct is fine only because `require_priceable` then checks
+        it rather than trusting it."
 
-        from cacheeconomics import registry
-        src = inspect.getsource(registry.base_rate)
-        self.assertIn("require_priceable", src)
-        self.assertGreater(registry.base_rate("claude-sonnet-4-6", "2026-08-01"), 0)
+        It does check it — and it checks the *default*, which is a priceable
+        surface, so the check always passes. It confirms the fabrication rather
+        than the caller. Measured before this changed:
+        `cost.price(usage, "claude-opus-5")` with no surface returned $5.00 at
+        Anthropic list, silently.
+
+        A test asserting that omitted-surface pricing succeeds is the defect
+        written down, and it would have green-lit any future caller that
+        reintroduced wrong-surface dollars.
+        """
+        from cacheeconomics import cost, registry
+        with self.assertRaises(TypeError):
+            registry.base_rate("claude-sonnet-4-6", "2026-08-01")
+        with self.assertRaises(TypeError):
+            cost.price(cost.Usage(uncached_input=1_000), "claude-opus-5")
+
+    def test_a_named_surface_still_prices_normally(self):
+        from cacheeconomics import cost, registry
+        self.assertGreater(
+            registry.base_rate("claude-sonnet-4-6", "2026-08-01",
+                               "anthropic/direct"), 0)
+        self.assertGreater(
+            cost.price(cost.Usage(uncached_input=1_000), "claude-opus-5",
+                       "anthropic/direct", on_date="2026-07-29").usd, 0)
+
+    def test_the_rate_lookup_uses_the_surface_it_was_given(self):
+        """`cost.price` dropped `target_id` when calling `base_rate`, so the
+        scope check ran against one surface and the rate came from another. It
+        was harmless only because the check above already refused unpriceable
+        surfaces — a guard holding up a bug, not an absence of one."""
+        import inspect
+        from cacheeconomics import cost
+        src = inspect.getsource(cost.price)
+        self.assertIn("base_rate(model, on_date, target_id)", src)
 
 
 class TestTheRatePathNamesItsSurface(unittest.TestCase):
@@ -1194,12 +1224,12 @@ class TestThePricingPrimitivesRefuseToInvent(unittest.TestCase):
         report claimed an effective date the caller never gave."""
         from cacheeconomics import cost, registry
         with self.assertRaises(registry.RegistryError):
-            cost.price(cost.Usage(uncached_input=1_000_000), "claude-sonnet-5",
+            cost.price(cost.Usage(uncached_input=1_000_000), "claude-sonnet-5", "anthropic/direct",
                        on_date="")
 
     def test_no_date_at_all_still_means_today(self):
         from cacheeconomics import cost
-        got = cost.price(cost.Usage(uncached_input=1_000_000), "claude-sonnet-5")
+        got = cost.price(cost.Usage(uncached_input=1_000_000), "claude-sonnet-5", "anthropic/direct")
         self.assertIn("effective", got.breakdown["rate_source"])
 
     def test_upcoming_rate_change_parses_its_dates(self):

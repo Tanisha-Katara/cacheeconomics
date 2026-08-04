@@ -557,18 +557,18 @@ class TestAnInvalidEffectiveRateIsRefused(unittest.TestCase):
             with self.subTest(rate=rate):
                 with self.assertRaises(ValueError):
                     cost.price(cost.Usage(uncached_input=1_000),
-                               "claude-opus-5", on_date="2026-07-30",
+                               "claude-opus-5", "anthropic/direct", on_date="2026-07-30",
                                effective_rate=rate)
 
     def test_a_real_negotiated_rate_still_works(self):
         from cacheeconomics import cost
-        s = cost.price(cost.Usage(uncached_input=1_000_000), "claude-opus-5",
+        s = cost.price(cost.Usage(uncached_input=1_000_000), "claude-opus-5", "anthropic/direct",
                        on_date="2026-07-30", effective_rate=2.5)
         self.assertEqual(s.usd, 2.5)
 
     def test_omitting_it_still_uses_list_price(self):
         from cacheeconomics import cost
-        s = cost.price(cost.Usage(uncached_input=1_000_000), "claude-opus-5",
+        s = cost.price(cost.Usage(uncached_input=1_000_000), "claude-opus-5", "anthropic/direct",
                        on_date="2026-07-30")
         self.assertEqual(s.usd, 5.0)
 
