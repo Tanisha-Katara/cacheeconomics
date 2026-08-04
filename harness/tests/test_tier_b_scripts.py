@@ -2104,6 +2104,112 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
         self.assertNotIn("usage", row)
 
 
+class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
+    """`sweep_report.main()` exposed only `--dir`.
+
+    `counted()` and `analyse()` both take a surface and an endpoint, and `main`
+    called both with defaults — so a Bedrock, Vertex or gateway sweep could not
+    strip the surface's model prefix, could not send its counting calls anywhere
+    but the default host, and refused as stale any counted file correctly
+    produced with `--target-id`, because this path passed None. Removing the
+    `--model` flag left those exports no route through the sweep at all.
+
+    Asserted by driving `main()` and recording what reaches the two callees,
+    rather than by reading `--help`: the defect was that the values never
+    arrived, and a flag that parses and goes nowhere passes a help-text check.
+    """
+
+    def setUp(self):
+        self.m = load("sweep_report")
+        self.dir = tempfile.mkdtemp()
+        cap = os.path.join(self.dir, "interval-10m.jsonl")
+        with open(cap, "w") as f:
+            for i in range(3):
+                f.write(json.dumps({
+                    "sent_at": f"2026-08-01T09:{i * 10:02d}:00+00:00",
+                    "session": "s1",
+                    "body": {"model": "anthropic.claude-opus-5",
+                             "messages": [{"role": "user", "content": "hi"}]},
+                    "usage": {"input_tokens": 100}}) + "\n")
+        self.cap = cap
+
+    def _run_main(self, *argv):
+        """`main()` with both callees recorded and neither able to shell out."""
+        seen = {}
+
+        def fake_counted(path, *a, **k):
+            seen["counted"] = (path, a, k)
+            return path
+
+        def fake_analyse(path, *a, **k):
+            seen["analyse"] = (path, a, k)
+            return {"ttl1_raised": False, "recoverable_share": None,
+                    "measured_usd": 0.0, "window_days": 1}
+
+        real = (self.m.counted, self.m.analyse, sys.argv)
+        self.m.counted, self.m.analyse = fake_counted, fake_analyse
+        sys.argv = ["sweep_report.py", "--dir", self.dir, *argv]
+        try:
+            rc = self.m.main()
+        finally:
+            self.m.counted, self.m.analyse, sys.argv = real
+        return rc, seen
+
+    def _positional_and_kw(self, call):
+        """The values a callee received, however `main` chose to pass them."""
+        _path, args, kwargs = call
+        return list(args) + list(kwargs.values())
+
+    def test_the_surface_reaches_both_counting_and_analysis(self):
+        rc, seen = self._run_main("--target-id", "amazon-bedrock/converse")
+        self.assertEqual(rc, 0)
+        self.assertIn("amazon-bedrock/converse",
+                      self._positional_and_kw(seen["counted"]),
+                      "--target-id never reached counting, so the surface "
+                      "prefix cannot be stripped before the tokenizer is asked")
+        self.assertIn("amazon-bedrock/converse",
+                      self._positional_and_kw(seen["analyse"]),
+                      "--target-id never reached analysis")
+
+    def test_the_endpoint_reaches_counting(self):
+        rc, seen = self._run_main("--endpoint", "https://gateway.internal/count")
+        self.assertEqual(rc, 0)
+        self.assertIn("https://gateway.internal/count",
+                      self._positional_and_kw(seen["counted"]),
+                      "--endpoint never reached counting, so the calls go to "
+                      "the default host whatever the operator asked for")
+
+    def test_the_tokenizer_id_reaches_counting(self):
+        rc, seen = self._run_main("--tokenizer-id", "gateway-build-7")
+        self.assertEqual(rc, 0)
+        self.assertIn("gateway-build-7",
+                      self._positional_and_kw(seen["counted"]))
+
+    def test_counting_and_analysis_are_given_the_same_surface(self):
+        """The failure mode is not only that a value is missing, but that the
+        two halves disagree: a file counted under one surface and analysed under
+        another resolves two different models from one row."""
+        _rc, seen = self._run_main("--target-id", "amazon-bedrock/converse")
+        counted_vals = self._positional_and_kw(seen["counted"])
+        analyse_vals = self._positional_and_kw(seen["analyse"])
+        surfaces = [v for v in counted_vals if v == "amazon-bedrock/converse"]
+        self.assertTrue(surfaces and
+                        "amazon-bedrock/converse" in analyse_vals,
+                        "counting and analysis were not given the same surface")
+
+    def test_the_artifact_records_the_settings_it_was_run_with(self):
+        """They change what the points mean — the surface decides which rate
+        table applies, the endpoint decides which tokenizer sized the segments —
+        so an artifact recording neither cannot be told from one run against
+        different settings."""
+        self._run_main("--target-id", "amazon-bedrock/converse",
+                       "--endpoint", "https://gateway.internal/count")
+        art = json.load(open(os.path.join(self.dir, "sweep-report.json")))
+        self.assertEqual(art.get("target_id"), "amazon-bedrock/converse")
+        self.assertEqual(art.get("count_endpoint"),
+                         "https://gateway.internal/count")
+
+
 class TestOneCountedPathHelperForTheWholeToolchain(unittest.TestCase):
     """Two copies of the derivation is what produced the bug.
 
