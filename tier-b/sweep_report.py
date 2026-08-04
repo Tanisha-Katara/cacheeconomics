@@ -49,7 +49,8 @@ from cacheeconomics.tokenizer import counts_provenance           # noqa: E402
 
 def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
                     target_id: str | None = None,
-                    tokenizer_id: str | None = None):
+                    tokenizer_id: str | None = None,
+                    assume_serves: bool = False):
     """The capture in hand with `out`'s still-valid counts merged onto it, or
     `(None, reason)`.
 
@@ -117,7 +118,8 @@ def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
         # The package's record -- version, digests, both models, the surface --
         # plus the two settings only a re-run cares about. Built rather than
         # restated, so this and the loader compare the same fields.
-        want = counts_provenance(body, s, target_id, endpoint, tokenizer_id)
+        want = counts_provenance(body, s, target_id, endpoint,
+                                 tokenizer_id, assume_serves)
         for field, expected in want.items():
             if p.get(field) != expected:
                 return None, (f"row {i} was counted with "
@@ -131,12 +133,13 @@ def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
 
 def counted(path: str, endpoint: str = DEFAULT_ENDPOINT,
             target_id: str | None = None,
-            tokenizer_id: str | None = None) -> str:
+            tokenizer_id: str | None = None,
+            assume_serves: bool = False) -> str:
     """Exact token counts, or the structural findings carry no figures."""
     out = counted_path(path)
     if os.path.exists(out):
         merged, why = reusable_counts(path, out, endpoint, target_id,
-                                      tokenizer_id)
+                                      tokenizer_id, assume_serves)
         if why is None:
             # Rewritten from the capture in hand rather than handed back as
             # found. Every row is the current one; only the counts came from the
@@ -166,6 +169,8 @@ def counted(path: str, endpoint: str = DEFAULT_ENDPOINT,
         cmd += ["--target-id", target_id]
     if tokenizer_id:
         cmd += ["--tokenizer-id", tokenizer_id]
+    if assume_serves:
+        cmd += ["--assume-endpoint-serves"]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         # Named, not just reported. This returns the *uncounted* capture, so
@@ -286,6 +291,9 @@ def main() -> int:
     p.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
                    help=f"where to send counting calls (default: "
                         f"{DEFAULT_ENDPOINT})")
+    p.add_argument("--assume-endpoint-serves", action="store_true",
+                   help="count rows whose model id cannot be vouched for "
+                        "locally, asserting that --endpoint serves them")
     p.add_argument("--tokenizer-id",
                    help="identifier for the tokenizer deployment behind "
                         "--endpoint; without it counted captures are not "
@@ -311,7 +319,8 @@ def main() -> int:
             print("    no gaps; skipped", file=sys.stderr)
             continue
         a = analyse(counted(f, args.endpoint, args.target_id,
-                            args.tokenizer_id), args.target_id)
+                            args.tokenizer_id, args.assume_endpoint_serves),
+                    args.target_id)
         rows.append({"label": label, **c, **a})
 
     def schedule_seconds(r):

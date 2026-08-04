@@ -380,7 +380,7 @@ class TestTheDefaultPathCounts(unittest.TestCase):
         return subprocess.run(
             [sys.executable, os.path.join(TIER_B, "run_diagnostic.py"), self.src,
              "--endpoint", f"http://127.0.0.1:{self.port}/v1/messages/count_tokens",
-             "--allow-unreconciled", *extra],
+             "--assume-endpoint-serves", "--allow-unreconciled", *extra],
             capture_output=True, text=True,
             env=dict(os.environ, ANTHROPIC_API_KEY="test",
                      CACHEECONOMICS_HMAC_KEY="k" * 32))
@@ -902,6 +902,7 @@ class TestAnAbortedCountLeavesNothingOnDisk(unittest.TestCase):
         self.addCleanup(setattr, self.ct, "count_segments", real)
         argv = sys.argv[:]
         sys.argv = ["count_tokens", self.src, "--out", self.out,
+                    "--assume-endpoint-serves",
                     "--endpoint", "http://127.0.0.1:1/unused"]
         try:
             self.ct.main()
@@ -1035,15 +1036,51 @@ class TestOneDigestServesBothSidesOfTheProvenanceGate(unittest.TestCase):
         """
         from cacheeconomics.adapters.bodies import _counts_are_vouched
         from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
-                                              counts_provenance)
+                                              FIRST_PARTY_COUNT_ENDPOINT,
+                                              counts_provenance, countable,
+                                              row_models)
+        checked = 0
         for body in self.BODIES:
             row = {"body": body}
+            if not countable(row_models(row, body), FIRST_PARTY_COUNT_ENDPOINT)[0]:
+                continue          # covered by the negative test below
             row[COUNTS_PROVENANCE_KEY] = counts_provenance(
-                body, row, None, "https://endpoint", "tokenizer-1")
+                body, row, None, FIRST_PARTY_COUNT_ENDPOINT, "tokenizer-1")
             with self.subTest(body=body):
                 self.assertTrue(
                     _counts_are_vouched(row, body, None),
                     "the package built a record its own gate refuses")
+            checked += 1
+        self.assertGreater(checked, 0, "no countable fixture body to check")
+
+    def test_a_row_the_counter_would_refuse_cannot_be_vouched_for(self):
+        """The blind spot the paired test had.
+
+        `countable()` refuses a row with no resolvable model outright -- there is
+        nothing to ask -- while the gate checked only that the recomputed fields
+        matched. Both halves of the old pairing were satisfied while a
+        hand-built or buggy record for a no-model body made arbitrary positive
+        `segment_tokens` load as exact. The two predicates agreed by luck; they
+        are one predicate now, and this is the case that proves it.
+        """
+        from cacheeconomics.adapters.bodies import _counts_are_vouched
+        from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
+                                              FIRST_PARTY_COUNT_ENDPOINT,
+                                              counts_provenance, countable,
+                                              row_models)
+        body = {"messages": [{"role": "user", "content": "hi"}]}   # no model
+        row = {"body": body}
+        self.assertFalse(countable(row_models(row, body),
+                                   FIRST_PARTY_COUNT_ENDPOINT)[0],
+                         "fixture is countable, so it proves nothing here")
+        # Otherwise-perfect provenance: every recomputable field matches,
+        # endpoint and tokenizer identity both present.
+        row[COUNTS_PROVENANCE_KEY] = counts_provenance(
+            body, row, None, FIRST_PARTY_COUNT_ENDPOINT, "tokenizer-1")
+        self.assertFalse(
+            _counts_are_vouched(row, body, None),
+            "counts were vouched for a row the counter would have refused to "
+            "count, so arbitrary numbers on a body with no model load as exact")
 
     def test_the_gate_still_refuses_a_record_missing_either_half(self):
         """The other direction, so the property above cannot be satisfied by a
@@ -1058,8 +1095,9 @@ class TestOneDigestServesBothSidesOfTheProvenanceGate(unittest.TestCase):
         self.assertFalse(_counts_are_vouched(row, body, None),
                          "a record with no endpoint or tokenizer identity was "
                          "accepted")
+        from cacheeconomics.tokenizer import FIRST_PARTY_COUNT_ENDPOINT
         row[COUNTS_PROVENANCE_KEY] = counts_provenance(
-            body, row, None, "https://endpoint", "tokenizer-1")
+            body, row, None, FIRST_PARTY_COUNT_ENDPOINT, "tokenizer-1")
         row[COUNTS_PROVENANCE_KEY]["body_sha256"] = "tampered"
         self.assertFalse(_counts_are_vouched(row, body, None))
 
@@ -1151,8 +1189,10 @@ class TestTheLoaderOnlyTrustsCountsItCanVouchFor(unittest.TestCase):
                          "cache_creation_input_tokens": 0},
                "segment_tokens": counts}
         if provenance == "valid":
+            from cacheeconomics.tokenizer import FIRST_PARTY_COUNT_ENDPOINT
             row[self.ct.PROVENANCE_KEY] = self.ct.provenance(
-                row, body, "https://anything", None, "stub-tokenizer-1")
+                row, body, FIRST_PARTY_COUNT_ENDPOINT, None,
+                "stub-tokenizer-1")
         elif provenance is not None:
             row[self.ct.PROVENANCE_KEY] = provenance
         return row
@@ -1260,7 +1300,8 @@ class TestTheLoaderOnlyTrustsCountsItCanVouchFor(unittest.TestCase):
         out = os.path.join(self.dir, "counted.jsonl")
         r = subprocess.run(
             [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
-             "-o", out, "--tokenizer-id", "stub-1", "--endpoint",
+             "-o", out, "--tokenizer-id", "stub-1",
+             "--assume-endpoint-serves", "--endpoint",
              f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens"],
             capture_output=True, text=True, timeout=90,
             env=dict(os.environ, ANTHROPIC_API_KEY="test"))
@@ -1301,7 +1342,8 @@ class TestTheLoaderOnlyTrustsCountsItCanVouchFor(unittest.TestCase):
         out = os.path.join(self.dir, "flat-counted.jsonl")
         r = subprocess.run(
             [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
-             "-o", out, "--tokenizer-id", "stub-1", "--endpoint",
+             "-o", out, "--tokenizer-id", "stub-1",
+             "--assume-endpoint-serves", "--endpoint",
              f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens"],
             capture_output=True, text=True, timeout=90,
             env=dict(os.environ, ANTHROPIC_API_KEY="test"))
@@ -1551,6 +1593,15 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         return p
 
     def _run(self, src, *extra):
+        # `--assume-endpoint-serves` because the stub IS a custom endpoint.
+        # Nothing can vouch locally that a loopback host serves any model id, so
+        # the rule refuses it -- which is the rule working, and is exactly what
+        # an operator pointing at their own gateway does. Tests that exercise
+        # the refusal itself use `_run_unasserted`.
+        return self._run_unasserted(src, "--assume-endpoint-serves", *extra)
+
+    def _run_unasserted(self, src, *extra):
+        """The same run with nothing asserted, for the refusal cases."""
         return subprocess.run(
             [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
              "-o", self.out,
@@ -1691,7 +1742,7 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
             f.write(json.dumps({"body": {
                 "model": "model-nobody-has-heard-of",
                 "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
-        r = self._run(p, "--allow-partial")
+        r = self._run_unasserted(p, "--allow-partial")
         self.assertIn("NOT load as exact", r.stderr)
         self.assertIn("row 0:", r.stderr)
         self.assertLess(r.stderr.index("NOT load as exact"),
@@ -1820,7 +1871,7 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                 "model": "   ",
                 "system": [{"type": "text", "text": "SECRET-POLICY"}],
                 "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
-        r = self._run(p, "--allow-partial")
+        r = self._run_unasserted(p, "--allow-partial")
         self.assertEqual(_ModelStub.seen, [],
                          "a prompt body was sent under a blank model id")
         self.assertIn("no model id", r.stderr)
@@ -1835,7 +1886,7 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                 "model": "anthropic.claude-opus-5",
                 "system": [{"type": "text", "text": "SECRET-POLICY"}],
                 "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
-        r = self._run(p, "--allow-partial")
+        r = self._run_unasserted(p, "--allow-partial")
         self.assertEqual(_ModelStub.seen, [],
                          "a prompt body was sent under a surface routing prefix")
         self.assertIn("--target-id", r.stderr)
@@ -1874,11 +1925,11 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                         "model": model,
                         "system": [{"type": "text", "text": "SECRET-POLICY"}],
                         "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
-                r = self._run(p, "--allow-partial")
+                r = self._run_unasserted(p, "--allow-partial")
                 self.assertEqual(_ModelStub.seen, [],
                                  f"a prompt body was sent for {model!r}, whose "
                                  f"call could not have returned a usable count")
-                self.assertIn("not a model this registry knows", r.stderr)
+                self.assertIn("Pass --assume-endpoint-serves", r.stderr)
 
     def test_the_operator_can_assert_a_gateway_serves_an_unknown_id(self):
         """The override. A gateway with its own model names is a real case, and
@@ -1888,7 +1939,7 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
             f.write(json.dumps({"body": {
                 "model": "claude-opus-5",
                 "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
-        r = self._run(p, "--assume-endpoint-serves")
+        r = self._run(p)
         self.assertEqual(r.returncode, 0, r.stderr[-300:])
         self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"})
 
@@ -2044,6 +2095,7 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
         subprocess.run(
             [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
              "-o", os.path.join(d, "out.jsonl"), "--allow-partial",
+             "--assume-endpoint-serves",
              "--endpoint", f"http://127.0.0.1:{srv.server_address[1]}/count"],
             capture_output=True, text=True, timeout=60,
             env=dict(os.environ, ANTHROPIC_API_KEY="test"))
@@ -2307,7 +2359,7 @@ class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
         self.addCleanup(stub.shutdown)
         subprocess.run(
             [sys.executable, "-B", os.path.join(TIER_B, "run_diagnostic.py"),
-             src, "--endpoint",
+             src, "--assume-endpoint-serves", "--endpoint",
              f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens",
              "--allow-unreconciled"],
             capture_output=True, text=True, timeout=120,
@@ -2343,7 +2395,8 @@ class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
         for endpoint in ("http://127.0.0.1:1/x", live):
             subprocess.run(
                 [sys.executable, "-B", os.path.join(TIER_B, "run_diagnostic.py"),
-                 src, "--endpoint", endpoint, "--allow-unreconciled"],
+                 src, "--assume-endpoint-serves",
+                 "--endpoint", endpoint, "--allow-unreconciled"],
                 capture_output=True, text=True, timeout=120,
                 env=dict(os.environ, ANTHROPIC_API_KEY="test",
                          CACHEECONOMICS_HMAC_KEY="k" * 32))
@@ -2400,9 +2453,15 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
         return p
 
     def _count(self, src, out, *extra):
+        # `--assume-endpoint-serves` because the stub IS a custom endpoint.
+        # Nothing can vouch locally that a loopback host serves any model id, so
+        # the rule refuses it -- which is the rule working, and is exactly what
+        # an operator pointing at their own gateway does. Tests that exercise
+        # the refusal itself use `a bare subprocess call`.
         return subprocess.run(
             [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
-             "-o", out, "--endpoint", self.endpoint, *extra],
+             "-o", out, "--endpoint", self.endpoint,
+             "--assume-endpoint-serves", *extra],
             capture_output=True, text=True, timeout=90,
             env=dict(os.environ, ANTHROPIC_API_KEY="test"))
 
@@ -2446,7 +2505,7 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
             set(row[m.PROVENANCE_KEY]),
             {"version", "tool", "row_sha256", "body_sha256", "cuts_sha256",
              "tokenizer_model", "analysis_model", "endpoint", "target_id",
-             "tokenizer_id"})
+             "tokenizer_id", "assume_endpoint_serves"})
 
     def test_the_row_digest_covers_what_the_body_digest_misses(self):
         """The body digest is blind to the top-level model, and to usage,
@@ -2844,6 +2903,19 @@ class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
         self.assertIn("--tokenizer-id", cmd)
         self.assertEqual(cmd[cmd.index("--tokenizer-id") + 1], "gateway-build-7")
 
+    def test_the_serveability_override_reaches_counting_and_not_analysis(self):
+        """`run_diagnostic.py` did not know the flag, so the one-command path
+        could not turn the override on at all -- and because it forwards
+        unrecognised flags, the attempt would have handed
+        `--assume-endpoint-serves` to `cacheeconomics analyze`, which has no such
+        option."""
+        rc, seen = self._run_main("--assume-endpoint-serves")
+        self.assertEqual(rc, 0)
+        self.assertIn("--assume-endpoint-serves", self._count_cmd(seen))
+        self.assertNotIn("--assume-endpoint-serves",
+                         self._analyse_values(seen),
+                         "the override was handed to the analyzer")
+
     def test_all_three_arrive_together(self):
         """Each flag has its own append, and one missing is the whole defect."""
         rc, seen = self._run_main("--target-id", "amazon-bedrock/converse",
@@ -2880,6 +2952,81 @@ class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
         self.assertEqual(art.get("target_id"), "amazon-bedrock/converse")
         self.assertEqual(art.get("count_endpoint"),
                          "https://gateway.internal/count")
+
+
+class TestTheDiagnosticForwardsTheOverrideAndOnlyToCounting(unittest.TestCase):
+    """`run_diagnostic.py` did not know `--assume-endpoint-serves`.
+
+    Two consequences, both bad. The one-command path could not turn the override
+    on at all, so a gateway or dated-id capture had no route through it. And
+    because the wrapper forwards flags it does not recognise to `cacheeconomics
+    analyze`, the attempt would have handed the flag to a command with no such
+    option -- turning "counting refused these rows" into "the analysis failed".
+
+    Asserted at the boundary that matters: the flag must appear on the
+    `count_tokens.py` command line and must not appear on the analyzer's.
+    """
+
+    def setUp(self):
+        self.m = load("run_diagnostic")
+        self.dir = tempfile.mkdtemp()
+        self.src = os.path.join(self.dir, "cap.jsonl")
+        with open(self.src, "w") as f:
+            f.write(json.dumps({"sent_at": "2026-08-01T09:00:00Z", "body": {
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}]},
+                "usage": {"input_tokens": 100}}) + "\n")
+
+    def _run_main(self, *argv):
+        """`main()` with every subprocess recorded and none actually run."""
+        cmds = []
+
+        class _Rec:
+            @staticmethod
+            def run(cmd, *a, **k):
+                cmds.append(list(cmd))
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        real, argv_real = self.m.subprocess, sys.argv
+        self.m.subprocess = _Rec
+        sys.argv = ["run_diagnostic.py", self.src, *argv]
+        try:
+            self.m.main()
+        finally:
+            self.m.subprocess, sys.argv = real, argv_real
+        counting = [c for c in cmds
+                    if any(str(x).endswith("count_tokens.py") for x in c)]
+        analysis = [c for c in cmds if "cacheeconomics.cli" in c]
+        return counting, analysis
+
+    def test_the_flag_is_recognised_at_all(self):
+        """Before it was declared, argparse dropped it into the passthrough."""
+        counting, _ = self._run_main("--assume-endpoint-serves")
+        self.assertTrue(counting, "counting never ran")
+
+    def test_it_reaches_the_counting_subprocess(self):
+        counting, _ = self._run_main("--assume-endpoint-serves")
+        self.assertIn("--assume-endpoint-serves", counting[0],
+                      "the override never reached counting, so the one-command "
+                      "path cannot count a gateway or dated-id capture")
+
+    def test_it_never_reaches_the_analyzer(self):
+        counting, analysis = self._run_main("--assume-endpoint-serves")
+        self.assertTrue(analysis, "the analyzer never ran")
+        self.assertNotIn("--assume-endpoint-serves", analysis[0],
+                         "the override was forwarded to `cacheeconomics "
+                         "analyze`, which has no such option")
+
+    def test_it_is_absent_when_not_asked_for(self):
+        counting, analysis = self._run_main()
+        self.assertNotIn("--assume-endpoint-serves", counting[0])
+        self.assertNotIn("--assume-endpoint-serves", analysis[0])
+
+    def test_an_unrelated_flag_still_reaches_the_analyzer(self):
+        """The passthrough must keep working: declaring one flag here must not
+        turn the wrapper into a whitelist."""
+        _counting, analysis = self._run_main("--allow-unreconciled")
+        self.assertIn("--allow-unreconciled", analysis[0])
 
 
 class TestOneCountedPathHelperForTheWholeToolchain(unittest.TestCase):

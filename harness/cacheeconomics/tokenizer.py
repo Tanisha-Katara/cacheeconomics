@@ -54,7 +54,7 @@ import json
 import os
 import typing
 
-from .registry import normalize_model, providers
+from .registry import normalize_model, pricing, providers
 from .segment import walk
 from .trace import _first, _text, request_from_row
 
@@ -442,11 +442,81 @@ def row_models(row: dict, body: dict,
     return RowModels(tokenizer, analysis, prefix)
 
 
+
+# The host Anthropic answers count-tokens on. A string identity used to decide
+# what can be vouched for locally, never to make a call -- this package imports
+# no network library and a test asserts it.
+FIRST_PARTY_COUNT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
+
+
+def locally_vouched_serveable(tokenizer_id: str, endpoint: str) -> bool:
+    """Whether it can be shown *without asking* that `endpoint` serves this id.
+
+    Deliberately narrow, and narrower than it looks. The registry is a price
+    table: it lists 14 bare model ids and records no availability, no retirement
+    and no per-endpoint catalogue. So the only thing that can be established
+    here is that an id is one this project prices on the first-party host --
+    which is evidence, not proof, that the host will serve it.
+
+    Exact match, not normalised. A previous version accepted anything whose
+    *base* was priced, which is priceability wearing serveability's name:
+    `claude-opus-5-99999999` normalises to a priced base and sailed through, so
+    a prompt body went out and the remote 400 was what established the id was
+    not countable -- the exact thing the rule exists to prevent. A dated
+    snapshot is the common case of priceable-but-maybe-not-served.
+
+    Everything this cannot vouch for -- dated ids, retired ids, ids from a
+    custom gateway, any non-first-party endpoint -- needs the operator to assert
+    it. Erring toward the assertion is fine; erring toward sending is not.
+    """
+    if endpoint != FIRST_PARTY_COUNT_ENDPOINT:
+        return False
+    return tokenizer_id in pricing()["models"]
+
+
+def countable(models: RowModels, endpoint: str, assume_serves: bool = False):
+    """Whether a counting request may be built for this row at all.
+
+    The rule, in the one place it is enforced, called by the writer before any
+    payload exists and by the loader before any counts are believed: **nothing
+    is sent, and nothing is trusted, unless the id that would be sent is one the
+    selected endpoint can be shown to serve.**
+
+    This replaces a growing list of individual refusals. Blank models, routing
+    prefixes and Bedrock ids were each found by a separate review and closed one
+    at a time, and the guarantee held for the shapes that had been found rather
+    than as a rule.
+
+    Shared rather than duplicated. The writer's refusal and the reader's
+    acceptance used to be two predicates that happened to agree, and they did
+    not agree everywhere: a record whose `tokenizer_model` was None -- a row the
+    writer refuses outright, because there is nothing to ask -- was accepted by
+    the reader, so arbitrary positive counts on a body with no model loaded as
+    exact.
+    """
+    if not models.tokenizer:
+        if models.prefix:
+            return False, (f"its model id carries the routing prefix "
+                           f"{models.prefix!r} and no --target-id says which "
+                           f"surface that is, so the id a tokenizer would be "
+                           f"asked for cannot be worked out")
+        return False, ("no model id on this row or its body, so there is no "
+                       "tokenizer to ask")
+    if assume_serves:
+        return True, None
+    if locally_vouched_serveable(models.tokenizer, endpoint):
+        return True, None
+    return False, (f"nothing here can show {endpoint} serves "
+                   f"{models.tokenizer!r} -- it is not one of the exact model "
+                   f"ids this registry prices on the first-party host, and a "
+                   f"dated, retired or gateway-specific id cannot be checked "
+                   f"locally. Pass --assume-endpoint-serves to assert it")
+
 # The vouching contract, in one place. The writer stamps it, the loader checks
 # it, and the key and version were transcribed into both before this -- three
 # copies of a constant whose whole job is that two sides agree on it.
 COUNTS_PROVENANCE_KEY = "segment_tokens_provenance"
-COUNTS_PROVENANCE_VERSION = 3
+COUNTS_PROVENANCE_VERSION = 4
 
 
 def recomputable_provenance(body, row=None, target_id=None) -> dict:
@@ -470,7 +540,7 @@ def recomputable_provenance(body, row=None, target_id=None) -> dict:
 
 
 def counts_provenance(body, row=None, target_id=None, endpoint=None,
-                      tokenizer_id=None) -> dict:
+                      tokenizer_id=None, assume_serves=False) -> dict:
     """The whole record a counted row carries.
 
     Everything a reader can recompute, plus the two things it cannot: which host
@@ -481,4 +551,9 @@ def counts_provenance(body, row=None, target_id=None, endpoint=None,
     a fixture discovers and a caller discovers in production.
     """
     return {**recomputable_provenance(body, row, target_id),
-            "endpoint": endpoint, "tokenizer_id": tokenizer_id}
+            "endpoint": endpoint, "tokenizer_id": tokenizer_id,
+            # Recorded so a reader can evaluate the *same* countability
+            # predicate the writer did. Without it the reader could only guess
+            # whether an id it cannot vouch for was asserted or slipped through,
+            # and the two sides would agree by luck rather than by construction.
+            "assume_endpoint_serves": bool(assume_serves)}

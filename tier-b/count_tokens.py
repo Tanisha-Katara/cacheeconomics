@@ -59,17 +59,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "harness"))
 
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
-from cacheeconomics.registry import normalize_model, pricing     # noqa: E402
 from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,      # noqa: E402
                                       COUNTS_PROVENANCE_VERSION,
-                                      RowModels, count_segments,
+                                      FIRST_PARTY_COUNT_ENDPOINT, RowModels,
+                                      count_segments, countable,
                                       counts_provenance, row_models)
 
 # Overridable, because the clients most likely to care about egress are the
 # ones who cannot reach this host. An enterprise gateway, a Bedrock or Vertex
 # deployment, or a self-hosted proxy all mean the counting call has to go
 # somewhere else, and a hard-coded host makes the answer "edit the source".
-DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
+#
+# The identity itself lives in the package, because deciding whether an id can
+# be vouched for is the package's job now and both sides need the same answer.
+DEFAULT_ENDPOINT = FIRST_PARTY_COUNT_ENDPOINT
 
 # Both owned by `cacheeconomics.tokenizer`, which defines the vouching contract
 # the loader checks. Constants here as well as there was three copies of a pair
@@ -99,54 +102,6 @@ def counted_path(path: str) -> str:
     return os.path.join(head, f"{root}-counted{ext or '.jsonl'}")
 
 
-def countable(models: RowModels, endpoint: str,
-              assume_serves: bool = False):
-    """Whether a counting request may be built for this row at all.
-
-    The rule, in the one place it is enforced: **nothing is sent unless the id
-    that would be sent is one the selected endpoint is known to serve.**
-
-    This replaces a growing list of individual refusals. Blank models, surface
-    routing prefixes and Bedrock ids were each found by a separate review and
-    closed one at a time, and the guarantee -- no prompt content leaves the
-    machine for a call that cannot return a usable count -- was true for the
-    three shapes that had been found and not as a rule. An unknown model, an
-    OpenAI id against api.anthropic.com, or a composite routed id with no
-    --target-id all still sent a body and learned it was hopeless from the
-    remote error.
-
-    "Known to serve" means the registry recognises the id, bare or dated. The
-    registry is what prices these models, so an id it does not know is one this
-    toolchain cannot price either -- counting it exactly would buy a precise
-    size for a request whose cost is unknown.
-
-    `assume_serves` is the operator asserting compatibility for a gateway whose
-    models the registry has never heard of. Explicit, because it is the one way
-    prompt content goes out on an id nothing here can vouch for.
-    """
-    if not models.tokenizer:
-        if models.prefix:
-            return False, (f"its model id carries the routing prefix "
-                           f"{models.prefix!r} and no --target-id says which "
-                           f"surface that is, so the id a tokenizer would be "
-                           f"asked for cannot be worked out")
-        return False, ("no model id on this row or its body, so there is no "
-                       "tokenizer to ask")
-    if assume_serves:
-        return True, None
-    if _registry_knows(models.tokenizer):
-        return True, None
-    return False, (f"{models.tokenizer!r} is not a model this registry knows, "
-                   f"so nothing here can say {endpoint} would serve it or that "
-                   f"the answer could be priced. Pass "
-                   f"--assume-endpoint-serves to assert it yourself")
-
-
-def _registry_knows(model_id: str) -> bool:
-    """Whether the registry recognises this id, bare or wearing a date."""
-    known = pricing()["models"]
-    return model_id in known or normalize_model(model_id, None)[0] in known
-
 def counter_id(models: RowModels, endpoint: str,
                tokenizer_id: str | None) -> str:
     """The cache scope: everything that decides what a count comes back as.
@@ -163,7 +118,7 @@ def counter_id(models: RowModels, endpoint: str,
 
 
 def provenance(row, body, endpoint: str, target_id: str | None,
-               tokenizer_id: str | None) -> dict:
+               tokenizer_id: str | None, assume_serves: bool = False) -> dict:
     """What produced this row's `segment_tokens`.
 
     Counted rows used to carry the array and nothing else, and the loader
@@ -188,7 +143,8 @@ def provenance(row, body, endpoint: str, target_id: str | None,
     # two digests the loader checks are not restated here: `counts_provenance` is
     # the one place they are produced, so a field added to the contract reaches
     # every counted row without this function being edited.
-    return {**counts_provenance(body, row, target_id, endpoint, tokenizer_id),
+    return {**counts_provenance(body, row, target_id, endpoint, tokenizer_id,
+                                assume_serves),
             "tool": "tier-b/count_tokens.py"}
 
 
@@ -364,7 +320,11 @@ def main() -> int:
     #
     # Stated, not refused: an operator may want the counts for something other
     # than a report, and this script is not the place to decide that for them.
-    if not args.tokenizer_id:
+    if not args.tokenizer_id and not args.dry_run:
+        # Not during a dry run, which writes nothing and has its own wording
+        # below. The point of this notice is that it is accurate at the moment
+        # the choice is still open, and "the counts will be written" is not true
+        # of a run that writes nothing.
         print("  NOTE: no --tokenizer-id, so this export will NOT load as exact."
               "\n  The counts will be written and the analyzer will estimate "
               "those rows anyway,\n  because nothing in the file would say which "
@@ -446,7 +406,8 @@ def main() -> int:
                     # exactly what a stale export looks like.
                     row[PROVENANCE_KEY] = provenance(
                         src_row, src_body, args.endpoint,
-                        args.target_id, args.tokenizer_id)
+                        args.target_id, args.tokenizer_id,
+                        args.assume_endpoint_serves)
                     counted += 1
                 except Exception as e:                                # noqa: BLE001
                     # The row survives without counts and the analyzer falls back to

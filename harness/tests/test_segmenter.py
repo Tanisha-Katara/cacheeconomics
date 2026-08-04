@@ -974,10 +974,11 @@ class TestExactTokenCountsWhenSupplied(unittest.TestCase):
             # The record the loader now requires before it will treat counts as
             # exact. A real counted export carries it; this fixture stands in
             # for one, so it carries it too.
-            from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
-                                                  counts_provenance)
+            from cacheeconomics.tokenizer import (
+                COUNTS_PROVENANCE_KEY, FIRST_PARTY_COUNT_ENDPOINT,
+                counts_provenance)
             row[COUNTS_PROVENANCE_KEY] = counts_provenance(
-                row["request"], row, None, "https://test-endpoint",
+                row["request"], row, None, FIRST_PARTY_COUNT_ENDPOINT,
                 "test-tokenizer")
         return row
 

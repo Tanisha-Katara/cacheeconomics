@@ -76,6 +76,16 @@ def main() -> int:
     p.add_argument("--target-id",
                    help="the provider surface this traffic went to. Passed to "
                         "counting and to analysis, which must agree on it")
+    # Declared here so it never reaches the analyzer. An unrecognised flag falls
+    # into `passthrough`, which is handed to `cacheeconomics analyze` -- so
+    # without this the one-command path could not turn the override on at all,
+    # and the attempt would have sent `--assume-endpoint-serves` to a command
+    # that has no such option.
+    p.add_argument("--assume-endpoint-serves", action="store_true",
+                   help="count rows whose model id cannot be vouched for "
+                        "locally -- dated, retired, or a gateway's own names -- "
+                        "asserting that --endpoint serves them. Passed to "
+                        "counting only; the analyzer has no such option")
     p.add_argument("--tokenizer-id",
                    help="identifier for the tokenizer deployment behind "
                         "--endpoint; without it counting does not resume from a "
@@ -106,6 +116,8 @@ def main() -> int:
             cmd += ["--target-id", args.target_id]
         if args.tokenizer_id:
             cmd += ["--tokenizer-id", args.tokenizer_id]
+        if args.assume_endpoint_serves:
+            cmd += ["--assume-endpoint-serves"]
         if args.endpoint:
             cmd += ["--endpoint", args.endpoint]
         if args.dry_run:

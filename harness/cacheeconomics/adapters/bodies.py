@@ -33,7 +33,8 @@ from ..segment import (_billed_input, _requested_ttl, _scale_to_measured,
                        segments_from_request, usage_from_response)
 
 from ..tokenizer import (COUNTS_PROVENANCE_KEY, COUNTS_PROVENANCE_VERSION,
-                        apply_counts, recomputable_provenance)
+                        apply_counts, countable,
+                        recomputable_provenance, row_models)
 from ..trace import (Segment, Tier, TraceSet, _is_token_count, _parse_ts,
                      request_from_row, resolve_tenant)
 
@@ -76,7 +77,19 @@ def _counts_are_vouched(row: dict, body: dict, target_id: str | None) -> bool:
     # it requires them to be there. A counted export produced without
     # `--tokenizer-id` claims nothing about what tokenizer answered, and that is
     # the same unbacked claim `sweep_report` already refuses to reuse.
-    return bool(p.get("endpoint")) and bool(p.get("tokenizer_id"))
+    if not (p.get("endpoint") and p.get("tokenizer_id")):
+        return False
+    # And the row must be one that could have been counted at all, by the same
+    # predicate the counter applies before it sends. These were two predicates
+    # that happened to agree, and they did not agree everywhere: `countable`
+    # refuses a row with no resolvable model outright, while this gate checked
+    # only that the recomputed fields matched -- so a record for a body naming
+    # no model made arbitrary positive counts load as exact. Sharing the
+    # predicate also means a correction to what counts as servable reaches the
+    # reader without anyone remembering to bring it here.
+    ok, _why = countable(row_models(row, body, target_id), p["endpoint"],
+                         p.get("assume_endpoint_serves", False))
+    return ok
 
 # Where the request body and the response live in each export shape. Checked in
 # order; the first that yields a dict with `messages` wins. Adding a format is a

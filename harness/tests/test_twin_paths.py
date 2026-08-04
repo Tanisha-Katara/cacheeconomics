@@ -51,9 +51,14 @@ def _vouched(row, body_key="request", target_id=None):
     carry the same record one would.
     """
     from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
+                                          FIRST_PARTY_COUNT_ENDPOINT,
                                           counts_provenance)
+    # The first-party endpoint, so the loader's serveability check actually runs
+    # against these fixtures rather than being waved through: a counted export
+    # is only believed when the id it names can be shown to be served.
     row[COUNTS_PROVENANCE_KEY] = counts_provenance(
-        row[body_key], row, target_id, "https://test-endpoint", "test-tokenizer")
+        row[body_key], row, target_id, FIRST_PARTY_COUNT_ENDPOINT,
+        "test-tokenizer")
     return row
 
 
