@@ -155,6 +155,50 @@ class _ScopeState:
     firing: OrderedDict = field(default_factory=OrderedDict)
 
 
+class _RegistryReads:
+    """Every registry lookup one request's checks made, and which of them the
+    registry could not answer.
+
+    The seam exists so that the announcement follows the *actual* dependency
+    instead of a hardcoded probe. RT-NOSURFACE used to test
+    `min_cacheable_tokens` and nothing else, so a surface that recorded a
+    minimum and no breakpoint budget disabled the marker-budget check in
+    silence -- and `lookback_blocks`, which nobody had thought to list at all,
+    did the same to RT-TTL's rewrite timeline. A check that reads a new key
+    through `get` is announced from the moment it is written; one that calls
+    `registry` directly is not, and INV-5 in the test suite is what catches
+    that, by watching which keys the module actually reads.
+
+    Two ways a lookup goes unanswered, and both reach the same silent state:
+    `RegistryError` when the surface records no such key, and a recorded
+    `None`. A recorded *zero* is an answer -- `deepseek/direct` allows no
+    explicit breakpoints, which is a fact about the surface and not a gap in
+    the registry -- so `is None` is the test, never falsiness.
+
+    Bounded by construction: one entry per literal key named in this file, and
+    one `needed_for` string per call site. Both are fixed at import time.
+    """
+    __slots__ = ("unanswered",)
+
+    def __init__(self):
+        self.unanswered: dict = {}
+
+    def get(self, key, fn, *, needed_for):
+        """Read `key` from the registry, recording it when the answer is not
+        there. Returns None in that case, and the caller decides what to do --
+        abstain, or carry on unbounded -- because that differs per check."""
+        try:
+            value = fn()
+        except registry.RegistryError:
+            why = "not recorded for this surface"
+        else:
+            if value is not None:
+                return value
+            why = "recorded as null"
+        self.unanswered.setdefault(key, (why, set()))[1].add(needed_for)
+        return None
+
+
 class Monitor:
     """Feed it requests as they happen; it hands back alerts.
 
@@ -226,9 +270,13 @@ class Monitor:
         rebuild_st = self._scope(rebuild_scope)
         shape_st = self._scope(shape_scope) if shape_scope != pool_scope else pool_st
         alerts: list[Alert] = []
+        # One per request, drained at the bottom. Every registry lookup any
+        # check makes goes through it, so what gets announced is whatever was
+        # actually asked for rather than a list somebody maintained by hand.
+        reads = _RegistryReads()
 
         if shape:
-            self._track_shape(shape_st, request)
+            self._track_shape(shape_st, request, reads)
         if usage:
             self._track_usage(pool_st, request)
         shape_checks = []
@@ -256,55 +304,88 @@ class Monitor:
                 subject="blind", at=request.sent_at,
                 fix="Capture through the recorder, or export request bodies, to turn "
                     "the structural checks on.")
-            if ("RT-BLIND", "blind") not in shape_st.firing:
-                shape_st.firing[("RT-BLIND", "blind")] = True
-                alerts.append(blind)
-        # The surface equivalent of RT-BLIND, and for the same reason: three
-        # checks read the registry for this target and `return` when it does
-        # not know it -- RT-BLOCKED and RT-MIN need the minimum cacheable
-        # prefix, RT-BUDGET needs the breakpoint budget. Measured: a 200-token
-        # marker below the 512-token minimum raises RT-MIN on
-        # `anthropic/direct` and *nothing at all* on an unnamed surface. The
-        # operator sees a quiet dashboard and reads it as healthy.
-        #
-        # Said once per scope, like RT-BLIND, through the same `firing` table
-        # rather than a second dedup mechanism.
-        try:
-            registry.min_cacheable_tokens(request.target_id, request.model)
-        except registry.RegistryError:
-            if ("RT-NOSURFACE", "nosurface") not in shape_st.firing:
-                shape_st.firing[("RT-NOSURFACE", "nosurface")] = True
-                alerts.append(Alert(
-                    "RT-NOSURFACE", "low", shape_scope,
-                    f"no recorded limits for {request.target_id!r}, so several "
-                    f"checks are inactive",
-                    "The prefix-minimum, blocked-prefix and marker-budget checks "
-                    "all need this surface's recorded limits, and there are none "
-                    "on file for it. Their silence means unmeasured, not healthy: "
-                    "a marker below the minimum caches nothing and the provider "
-                    "returns no error either. Cadence, drift, fan-out and rebuild "
-                    "are unaffected -- they do not depend on the surface.",
-                    subject="nosurface", at=request.sent_at,
-                    fix="Name the surface on the stream, or add its limits to "
-                        "the registry with a dated source."))
+            self._fire(shape_st, blind, alerts)
         for st, scope, checks in (
             (shape_st, shape_scope, shape_checks),
             (pool_st, pool_scope, usage_checks),
             (rebuild_st, rebuild_scope, rebuild_checks),
         ):
             for check in checks:
-                for a in check(st, request, scope) or ():
-                    # Once per subject until it clears, so a drifting prefix does
-                    # not alert on every request forever -- while a *second*
-                    # drifting segment is still its own alert.
-                    key = (a.code, a.subject)
-                    if key in st.firing:
-                        continue
-                    st.firing[key] = True
-                    while len(st.firing) > MAX_FIRING:
-                        st.firing.popitem(last=False)
-                    alerts.append(a)
+                # `reads` is handed to every check, including the four that do
+                # not currently touch the registry. A check that grows a lookup
+                # later gets the announcing seam without anyone editing this
+                # loop, which is the whole point of the change.
+                for a in check(st, request, scope, reads) or ():
+                    self._fire(st, a, alerts)
+        # The surface equivalent of RT-BLIND, and for the same reason: several
+        # checks read the registry for this target and abstain when it cannot
+        # answer. Measured: a 200-token marker below the 512-token minimum
+        # raises RT-MIN on `anthropic/direct` and *nothing at all* on an
+        # unnamed surface. The operator sees a quiet dashboard and reads it as
+        # healthy.
+        #
+        # Emitted after the checks, not before, because the checks are what
+        # establishes which lookups this request actually needed. Said once per
+        # scope through the same `firing` table as every other alert rather
+        # than a second dedup mechanism -- keyed on the *set* of unanswered
+        # lookups, so fixing one of them and leaving another still gets
+        # reported instead of being swallowed as a repeat.
+        if reads.unanswered:
+            self._fire(shape_st,
+                       self._nosurface(request, shape_scope, reads), alerts)
         return alerts
+
+    @staticmethod
+    def _nosurface(r, scope, reads: _RegistryReads) -> Alert:
+        """One alert naming every registry lookup this request could not get.
+
+        Composed from what was asked, so the text cannot drift out of date the
+        way the hardcoded version did: it named three checks and omitted
+        RT-TTL, whose rewrite timeline silently loses its lookback bound when
+        `lookback_blocks` is missing and over-credits as a result.
+        """
+        missing = sorted(reads.unanswered)
+        detail = "; ".join(
+            f"{key} ({why}) -- needed by {', '.join(sorted(users))}"
+            for key, (why, users) in sorted(reads.unanswered.items()))
+        what = (f"the {missing[0]} lookup" if len(missing) == 1
+                else f"{len(missing)} of the registry lookups")
+        # The illustration is attached to the dependency it illustrates. The
+        # hardcoded version carried it unconditionally, so a surface missing
+        # only `lookback_blocks` was told about sub-minimum markers, which is
+        # the same defect as the hardcoded probe wearing different clothes.
+        example = (" A marker below the minimum caches nothing and the "
+                   "provider returns no error either."
+                   if "min_cacheable_tokens" in reads.unanswered else "")
+        return Alert(
+            "RT-NOSURFACE", "low", scope,
+            f"{r.target_id!r} cannot answer {what} these checks make, so they "
+            f"are inactive or unbounded",
+            f"The registry could not answer: {detail}. Their silence means "
+            f"unmeasured, not healthy.{example} Only the checks named here are "
+            f"affected -- the rest read nothing from the registry.",
+            subject="nosurface:" + ",".join(missing), at=r.sent_at,
+            fix="Name the surface on the stream, or record these limits in the "
+                "registry with a dated source.")
+
+    def _fire(self, st: _ScopeState, a: Alert, into: list) -> None:
+        """Emit an alert once per `(code, subject)` for this scope.
+
+        The one suppression table. RT-BLIND and RT-NOSURFACE wrote to `firing`
+        by hand and skipped the eviction the check loop does, which was
+        harmless while both used a constant subject and is not once a subject
+        varies -- and RT-NOSURFACE's now does.
+        """
+        key = (a.code, a.subject)
+        if key in st.firing:
+            return
+        # Once per subject until it clears, so a drifting prefix does not alert
+        # on every request forever -- while a *second* drifting segment is
+        # still its own alert.
+        st.firing[key] = True
+        while len(st.firing) > MAX_FIRING:
+            st.firing.popitem(last=False)
+        into.append(a)
 
     def clear(self, scope: tuple, code: str, subject: str | None = None) -> None:
         """Let a code fire again for this scope once it has been dealt with.
@@ -390,7 +471,7 @@ class Monitor:
             self._scopes.move_to_end(scope)
         return st
 
-    def _track_shape(self, st: _ScopeState, r) -> None:
+    def _track_shape(self, st: _ScopeState, r, reads: _RegistryReads) -> None:
         """State derived from what was sent. Disjoint from `_track_usage`, so
         the two can run at different moments without double-counting.
 
@@ -431,7 +512,7 @@ class Monitor:
         # Bounded exactly as before: `int -> datetime`, capped at MAX_FIRING.
         # Cost is one hash per segment per request.
         seen_before = None
-        for boundary in self._prefix_hashes(r):
+        for boundary in self._prefix_hashes(r, reads):
             when = st.last_marked_at.get(boundary)
             if when is not None and (seen_before is None or when > seen_before):
                 seen_before = when
@@ -500,7 +581,7 @@ class Monitor:
                           if s.index <= top))
 
     @staticmethod
-    def _prefix_hashes(r) -> list:
+    def _prefix_hashes(r, reads: _RegistryReads) -> list:
         """One hash per prefix boundary this request could actually read from.
 
         The read side of the containment test. An entry past every marker this
@@ -518,18 +599,23 @@ class Monitor:
         marked = [s.index for s in r.segments if s.cache_marked]
         if not marked:
             return []
-        try:
-            window = registry.capability(r.target_id, "lookback_blocks")
-        except registry.RegistryError:
-            window = None
+        # Both lookups abstain into "no narrowing" rather than into silence,
+        # which over-credits rather than under-reporting -- so RT-NOSURFACE has
+        # to say the timeline is unbounded, not merely that a check is off.
+        window = reads.get(
+            "lookback_blocks",
+            lambda: registry.capability(r.target_id, "lookback_blocks"),
+            needed_for="RT-TTL (its rewrite timeline is then unbounded and "
+                       "credits rewrites the provider could not have read back)")
         # Below the provider's minimum no entry is written, so a boundary
         # shorter than it can never be read back. The batch helper applies this
         # and this side did not, so RT-TTL fired on a sub-minimum marker where
         # TTL-1 refuses -- a divergence introduced by fixing one side.
-        try:
-            floor = registry.min_cacheable_tokens(r.target_id, r.model)
-        except registry.RegistryError:
-            floor = None
+        floor = reads.get(
+            "min_cacheable_tokens",
+            lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            needed_for="RT-TTL (rewrites of a prefix too short to cache are "
+                       "then counted as recoverable)")
         top = max(marked)
         ordered = sorted(r.segments, key=lambda s: s.index)
         # Marker positions as lengths in this sequence, which is the unit
@@ -574,7 +660,11 @@ class Monitor:
 
     # --- checks -----------------------------------------------------------
 
-    def _drift(self, st: _ScopeState, r, scope):
+    # Every check takes `reads` whether or not it uses one, so that adding a
+    # registry lookup to any of them is a one-line change that is announced
+    # from the moment it is written.
+
+    def _drift(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Positions inside the cached prefix that keep changing."""
         marked = [s.index for s in r.segments if s.cache_marked]
         if not marked:
@@ -610,7 +700,7 @@ class Monitor:
                 subject=f"seg{s.index}", at=r.sent_at,
                 fix="Move that section below the last cache marker, or stop varying it.")
 
-    def _rebuild(self, st: _ScopeState, r, scope):
+    def _rebuild(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """The prefix is being thrown away and paid for again.
 
         The only check here that needs no prompt structure at all -- three usage
@@ -745,7 +835,7 @@ class Monitor:
                 "rotating identifier and reordered tool definitions are the usual "
                 "three, and a model switch is a separate cache pool by design.")
 
-    def _blocked(self, st: _ScopeState, r, scope):
+    def _blocked(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Nothing is cached here, and this position is the reason.
 
         `_drift` reports a marked prefix being invalidated, which means it can
@@ -759,9 +849,11 @@ class Monitor:
         if any(s.cache_marked for s in r.segments):
             return
         segs = sorted(r.segments, key=lambda s: s.index)
-        try:
-            minimum = registry.min_cacheable_tokens(r.target_id, r.model)
-        except registry.RegistryError:
+        minimum = reads.get(
+            "min_cacheable_tokens",
+            lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            needed_for="RT-BLOCKED (inactive)")
+        if minimum is None:
             return
         for pos, s in enumerate(segs):
             seen = st.seg_values.get(s.index)
@@ -793,7 +885,7 @@ class Monitor:
                     "behavioural eval before it ships.")
             return
 
-    def _below_minimum(self, st: _ScopeState, r, scope):
+    def _below_minimum(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """A marker on a prefix too short to cache, which fails silently."""
         # Every marker, through the same walk MIN-1 uses. This summed to the
         # outermost marker only, so a 200-token marker under a 30k one read as
@@ -802,9 +894,11 @@ class Monitor:
         prefixes = marked_prefixes(r.segments)
         if not prefixes:
             return
-        try:
-            minimum = registry.min_cacheable_tokens(r.target_id, r.model)
-        except registry.RegistryError:
+        minimum = reads.get(
+            "min_cacheable_tokens",
+            lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            needed_for="RT-MIN (inactive)")
+        if minimum is None:
             return
         short = [p for p in prefixes if p < minimum]
         if not short:
@@ -818,13 +912,17 @@ class Monitor:
             subject=str(minimum), at=r.sent_at,
             fix=f"Lengthen the cached prefix past {minimum:,} tokens, or drop the marker.")
 
-    def _marker_budget(self, st: _ScopeState, r, scope):
+    def _marker_budget(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Marker count creeping toward the limit, which errors at the limit."""
         count = sum(1 for s in r.segments if s.cache_marked)
-        try:
-            budget = registry.capability(r.target_id, "max_breakpoints")
-        except registry.RegistryError:
-            return
+        budget = reads.get(
+            "max_breakpoints",
+            lambda: registry.capability(r.target_id, "max_breakpoints"),
+            needed_for="RT-BUDGET (inactive)")
+        # A recorded zero is an answer, not a gap: `deepseek/direct` allows no
+        # explicit breakpoints and there is no budget to run out of. Only the
+        # `None` from `reads.get` above is unanswered, and that one has already
+        # been recorded for RT-NOSURFACE by the time it gets here.
         if not budget or count < budget:
             return
         yield Alert(
@@ -836,7 +934,7 @@ class Monitor:
             subject="budget", at=r.sent_at,
             fix="Merge sections that change at similar rates until markers are free.")
 
-    def _cadence_vs_ttl(self, st: _ScopeState, r, scope):
+    def _cadence_vs_ttl(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Request spacing that the configured lifetime does not suit."""
         # Gaps between rewrites of one prefix, not gaps between requests. TTL-1
         # walks a per-prefix timeline for the same reason: a longer lifetime
@@ -887,7 +985,7 @@ class Monitor:
                 subject="to-5m", at=r.sent_at,
                 fix="Drop back to the five-minute default for this workload.")
 
-    def _cold_fanout(self, st: _ScopeState, r, scope):
+    def _cold_fanout(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Concurrent requests each paying to write the same prefix."""
         if st.concurrent_writers < 2:
             return

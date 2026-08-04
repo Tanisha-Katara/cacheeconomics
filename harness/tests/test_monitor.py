@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cacheeconomics import monitor  # noqa: E402
+from cacheeconomics import monitor, registry  # noqa: E402
 from cacheeconomics.monitor import WINDOW, Monitor  # noqa: E402
 from cacheeconomics.trace import Request, Segment  # noqa: E402
 
@@ -662,6 +662,217 @@ class TestEveryAlertCanBeRendered(unittest.TestCase):
         for a in fired:
             with self.subTest(code=a.code):
                 self.assertIsInstance(str(a), str)
+
+
+class TestARegistryLookupItCannotMakeIsSaidAloud(unittest.TestCase):
+    """A check that abstains because the registry could not answer must say so.
+
+    RT-NOSURFACE existed for this, and probed exactly one key --
+    `min_cacheable_tokens`. Measured before the fix, over 30 requests on a
+    surface where one lookup at a time was made to fail:
+
+        min_cacheable_tokens unavailable      -> RT-NOSURFACE, 1 alert
+        capability('max_breakpoints') missing -> 0 alerts
+        capability('lookback_blocks') missing -> 0 alerts
+
+    A surface can answer the minimum and not the budget, so the one probe did
+    not imply the other two. `lookback_blocks` was in no review; it was found
+    by asking the code which keys it reads. So the tests below discover the
+    dependency set the same way -- by watching the reads -- rather than naming
+    the three that are known today.
+    """
+
+    def _spy(self, on_capability, on_minimum):
+        """Swap both registry entry points, restoring them in a `finally`.
+
+        A leaked monkeypatch corrupts every test that runs afterwards and the
+        failure surfaces somewhere unrelated, so nothing here patches without
+        this wrapper.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def patched():
+            real_cap = registry.capability
+            real_min = registry.min_cacheable_tokens
+            registry.capability = on_capability(real_cap)
+            registry.min_cacheable_tokens = on_minimum(real_min)
+            try:
+                yield
+            finally:
+                registry.capability = real_cap
+                registry.min_cacheable_tokens = real_min
+        return patched()
+
+    def _stream(self, target="anthropic/direct", n=30):
+        m, fired = Monitor(), []
+        for i in range(n):
+            fired += m.observe(req(i, [sg(0, "system", 8000, "sys",
+                                          "instructions", marked=True, ttl="5m"),
+                                       sg(1, "user", 100, f"t{i}", "user_turn")],
+                                   target=target, session="s"))
+        return m, fired
+
+    def _dependencies(self):
+        """Which registry keys the checks actually read, discovered by
+        watching them read, so a key added later is covered here without
+        anyone editing this file."""
+        asked = set()
+
+        def cap(real):
+            def f(target_id, name, allow_contested=False):
+                asked.add(("capability", name))
+                return real(target_id, name, allow_contested)
+            return f
+
+        def mn(real):
+            def f(target_id, model):
+                asked.add(("min_cacheable_tokens", None))
+                return real(target_id, model)
+            return f
+
+        with self._spy(cap, mn):
+            self._stream()
+        return sorted(asked, key=lambda d: (d[0], d[1] or ""))
+
+    def _with_unavailable(self, kind, name, *, as_null=False):
+        """One stream where exactly one lookup cannot be answered.
+
+        `as_null` picks the second route into the same silence: the capability
+        *is* recorded, as JSON null. `amazon-bedrock/converse` and
+        `openai/direct` both ship that way, so this is not a hypothetical.
+        """
+        def cap(real):
+            def f(target_id, cname, allow_contested=False):
+                if kind == "capability" and cname == name:
+                    if as_null:
+                        return None
+                    raise registry.RegistryError(f"test: {cname} unavailable")
+                return real(target_id, cname, allow_contested)
+            return f
+
+        def mn(real):
+            def f(target_id, model):
+                if kind == "min_cacheable_tokens":
+                    if as_null:
+                        return None
+                    raise registry.RegistryError("test: minimum unavailable")
+                return real(target_id, model)
+            return f
+
+        with self._spy(cap, mn):
+            return self._stream()[1]
+
+    def test_there_are_dependencies_to_check(self):
+        """Guard the guard: if the discovery finds nothing, every assertion
+        below is vacuously true."""
+        self.assertTrue(self._dependencies())
+
+    def test_an_unanswerable_lookup_is_announced(self):
+        silent = []
+        for kind, name in self._dependencies():
+            with self.subTest(dependency=f"{kind}:{name}"):
+                fired = self._with_unavailable(kind, name)
+                if "RT-NOSURFACE" not in {a.code for a in fired}:
+                    silent.append(f"{kind}({name})")
+        self.assertEqual([], silent,
+                         "these disable or unbound a check with no alert: "
+                         + ", ".join(silent))
+
+    def test_a_lookup_answered_with_null_is_announced_too(self):
+        """The second route to the same silence. `capability()` returning None
+        never raised, so the `except RegistryError` guard never saw it and
+        `if not budget: return` swallowed it."""
+        silent = []
+        for kind, name in self._dependencies():
+            with self.subTest(dependency=f"{kind}:{name}"):
+                fired = self._with_unavailable(kind, name, as_null=True)
+                if "RT-NOSURFACE" not in {a.code for a in fired}:
+                    silent.append(f"{kind}({name})")
+        self.assertEqual([], silent,
+                         "these are recorded as null and disable a check with "
+                         "no alert: " + ", ".join(silent))
+
+    def test_the_alert_names_the_key_and_what_it_costs(self):
+        """"Some checks are inactive" is not actionable. The reader needs the
+        key to record and the check they are currently not getting."""
+        fired = self._with_unavailable("capability", "max_breakpoints")
+        a = next(x for x in fired if x.code == "RT-NOSURFACE")
+        self.assertIn("max_breakpoints", a.detail)
+        self.assertIn("RT-BUDGET", a.detail)
+        self.assertIn("unmeasured, not healthy", a.detail)
+        self.assertNotIn("lookback_blocks", a.detail,
+                         "only the lookup that failed may be named")
+
+    def test_a_fully_recorded_surface_is_not_nagged(self):
+        self.assertNotIn("RT-NOSURFACE",
+                         {a.code for a in self._stream()[1]})
+
+    def test_it_is_said_once_per_scope_not_once_per_request(self):
+        fired = self._with_unavailable("capability", "max_breakpoints")
+        self.assertEqual(1, [a.code for a in fired].count("RT-NOSURFACE"))
+
+    def test_fixing_one_lookup_still_reports_the_others(self):
+        """The dedup is keyed on the *set* of unanswered lookups, so a surface
+        that gains one recorded key and still lacks another is reported again
+        rather than swallowed as a repeat of an alert about a different gap."""
+        state = {"deny": {"max_breakpoints", "lookback_blocks"}}
+
+        def cap(real):
+            def f(target_id, name, allow_contested=False):
+                if name in state["deny"]:
+                    raise registry.RegistryError(f"test: {name} unavailable")
+                return real(target_id, name, allow_contested)
+            return f
+
+        fired = []
+        with self._spy(cap, lambda real: real):
+            m = Monitor()
+            for i in range(20):
+                if i == 10:
+                    state["deny"] = {"lookback_blocks"}
+                fired += m.observe(req(i, STABLE, session="s"))
+        subjects = [a.subject for a in fired if a.code == "RT-NOSURFACE"]
+        self.assertEqual(2, len(subjects), subjects)
+        self.assertNotEqual(subjects[0], subjects[1])
+
+    def test_the_suppression_table_stays_bounded(self):
+        """RT-NOSURFACE's subject now varies, and the two hand-rolled dedup
+        sites it and RT-BLIND used wrote to `firing` without the eviction the
+        check loop does. Same table, same cap, one code path."""
+        m, _ = self._stream()
+        st = m._scopes[(None, "anthropic/direct", "claude-opus-5")]
+        for i in range(monitor.MAX_FIRING * 4):
+            m._fire(st, monitor.Alert("RT-SYNTHETIC", "low", ("x",), "s", "d",
+                                      subject=f"n{i}"), [])
+        self.assertLessEqual(len(st.firing), monitor.MAX_FIRING)
+
+    def test_a_recorded_zero_is_an_answer_not_a_gap(self):
+        """`deepseek/direct` records `max_breakpoints: 0` -- it allows no
+        explicit breakpoints. That is a fact about the surface, so RT-BUDGET
+        is correctly quiet and there is nothing to announce. Testing the value
+        with `not budget` rather than `is None` would have reported it as
+        missing registry data and sent somebody to fix a file that is right."""
+        fired = self._stream(target="deepseek/direct")[1]
+        a = next(x for x in fired if x.code == "RT-NOSURFACE")
+        self.assertNotIn("max_breakpoints", a.detail)
+
+    def test_a_shipped_surface_with_a_null_capability_says_so(self):
+        """No monkeypatching at all: these are rows in the registry as it
+        ships, and both reach the silent path this class is about."""
+        for target, key in (("amazon-bedrock/converse", "lookback_blocks"),
+                            ("openai/direct", "max_breakpoints")):
+            with self.subTest(target=target):
+                fired = self._stream(target=target)[1]
+                a = next((x for x in fired if x.code == "RT-NOSURFACE"), None)
+                self.assertIsNotNone(a, f"{target} abstains in silence")
+                self.assertIn(key, a.detail)
+
+    def test_the_notice_carries_no_dollar_figure(self):
+        for target in ("deepseek/direct", "openai/direct"):
+            for a in self._stream(target=target)[1]:
+                with self.subTest(target=target, code=a.code):
+                    self.assertNotIn("$", a.summary + a.detail + a.fix)
 
 
 if __name__ == "__main__":
