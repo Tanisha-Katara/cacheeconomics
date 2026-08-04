@@ -31,7 +31,9 @@ from cacheeconomics.allocate import allocator_lite, litellm_auto  # noqa: E402
 from cacheeconomics.allocator import allocator_full  # noqa: E402
 from cacheeconomics.analyzer import analyze  # noqa: E402
 from cacheeconomics.relocate import relocation_lite  # noqa: E402
-from cacheeconomics.trace import UNATTRIBUTED, Request, Segment, Tier, TraceSet  # noqa: E402
+from cacheeconomics.trace import (ASSUMED_PROVIDER_SURFACE,  # noqa: E402
+                                  UNATTRIBUTED, Request, Segment, Tier,
+                                  TraceSet)
 
 T0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
 UNKNOWN_MODEL = "nobody-has-ever-registered-this"
@@ -2314,62 +2316,75 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
     # names the assumed input in the DRAFT banner, so admitting the wrong one
     # prints the wrong remedy, and admitting *any* input would let a fabricated
     # surface satisfy the rule under an unrelated name.
-    SURFACE = "provider surface"
+    SURFACE = ASSUMED_PROVIDER_SURFACE
 
-    def _rows(self):
-        """One priceable row per loader, in each loader's own payload shape.
+    # Enough rows, spread far enough apart, that *every* spend figure is
+    # publishable -- so an unpublished one can be attributed to the surface.
+    #
+    # Both numbers are load-bearing and were found by measurement, not chosen.
+    # At one row per loader the monthly projection had no window at all, so
+    # `monthly_input_usd` came back None and the check simply skipped it: a
+    # non-surface blocker could sit there unnoticed. At 8 rows over 1.17 days it
+    # existed and was withheld for "monthly figures need at least 10 requests
+    # and this trace has 8" -- a second, unrelated blocker coexisting with the
+    # one under test. 14 rows four hours apart clears both floors.
+    ROWS = 14
+    STEP_SECONDS = 4 * 3600
+    START = datetime(2026, 7, 10, 9, tzinfo=timezone.utc)
 
-        Priceable is the whole point and the first version was not. Its LiteLLM
+    def _rows(self, name):
+        """This loader's payload shape, `ROWS` of them.
+
+        Priceable is the whole point and the first version was not. The LiteLLM
         row carried a top-level `usage` dict, which that adapter does not read
         -- it prices from `prompt_tokens_details`, `metadata.usage_object` or
         `response.usage` -- and no `startTime`. Measured: `usage` loaded as
         `{}`, `has_usage` False, `sent_at` None, 0 of 1 analysable, and the
         withheld reason came back "no invoice was supplied". So the consequence
         check passed for that loader without the surface having anything to do
-        with it, and a regression on real StandardLoggingPayload rows would have
-        gone straight through.
+        with it.
 
-        Each row now reaches coverage 1.0 with cache reads and no writes, so the
-        *only* thing standing between it and a published figure is the surface.
-        No writes on purpose: an unprovable write lifetime is its own blocker
-        and would mask the one being tested.
+        Cache reads and no writes, deliberately: an unprovable write lifetime is
+        its own blocker and would mask the one being tested.
         """
         usage = {"input_tokens": 5_000, "output_tokens": 200,
                  "cache_read_input_tokens": 20_000,
                  "cache_creation_input_tokens": 0}
-        return {
-            # LiteLLM's own normalised counters, plus the epoch stamp it writes.
-            "load_litellm": {
-                "model": "claude-opus-5",
-                "startTime": 1785312000.0, "endTime": 1785312002.0,
-                "prompt_tokens": 25_000, "completion_tokens": 200,
-                "prompt_tokens_details": {"cached_tokens": 20_000,
-                                          "text_tokens": 5_000}},
-            "load_jsonl": {
-                "request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
-                "model": "claude-opus-5", "segments": [],
-                "usage": dict(usage)},
-            "load_bodies": {
-                "request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
-                "body": {"model": "claude-opus-5",
-                         "messages": [{"role": "user",
-                                       "content": "hello there"}]},
-                "usage": dict(usage)},
-        }
+        out = []
+        for i in range(self.ROWS):
+            at = self.START + timedelta(seconds=self.STEP_SECONDS * i)
+            if name == "load_litellm":
+                out.append({"model": "claude-opus-5",
+                            "startTime": at.timestamp(),
+                            "endTime": at.timestamp() + 2,
+                            "prompt_tokens": 25_000, "completion_tokens": 200,
+                            "prompt_tokens_details": {"cached_tokens": 20_000,
+                                                      "text_tokens": 5_000}})
+            elif name == "load_jsonl":
+                out.append({"request_id": f"r{i}", "sent_at": at.isoformat(),
+                            "model": "claude-opus-5", "segments": [],
+                            "usage": dict(usage)})
+            else:
+                out.append({"request_id": f"r{i}", "sent_at": at.isoformat(),
+                            "usage": dict(usage),
+                            "body": {"model": "claude-opus-5",
+                                     "messages": [{"role": "user",
+                                                   "content": "hello there"}]}})
+        return out
 
-    def _load(self, tmp, name, **surface):
-        """Run one loader over its own row. `surface` is how a caller states one,
-        spelled differently per loader on purpose -- `default_target` for two of
-        them and `target_id` for the third -- which is exactly the variation
-        that let the inverse check cover one loader and miss two."""
+    def _load(self, tmp, name, row_extra=None, **surface):
+        """Run one loader over its own rows. `surface` is how a caller states
+        one, spelled differently per loader on purpose -- `default_target` for
+        two of them and `target_id` for the third -- which is exactly the
+        variation that let the inverse check cover one loader and miss two."""
         from cacheeconomics.adapters.bodies import load_bodies
         from cacheeconomics.adapters.litellm import load_litellm
         from cacheeconomics.trace import load_jsonl
-        row = dict(self._rows()[name])
-        row.update(surface.pop("row_extra", {}))
+        rows = [{**r, **(row_extra or {})} for r in self._rows(name)]
         path = os.path.join(tmp, f"{name}.jsonl")
         with open(path, "w") as f:
-            f.write(json.dumps(row) + "\n")
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
         if name == "load_litellm":
             return load_litellm(path, **surface)
         if name == "load_jsonl":
@@ -2382,8 +2397,10 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
                   "load_jsonl": "default_target",
                   "load_bodies": "target_id"}
 
+    LOADERS = ("load_litellm", "load_jsonl", "load_bodies")
+
     def _every_loader(self, tmp):
-        return {name: self._load(tmp, name) for name in self._rows()}
+        return {name: self._load(tmp, name) for name in self.LOADERS}
 
     def test_every_loader_leaves_a_providerless_row_unattributed(self):
         """The property, not its symptom.
@@ -2432,32 +2449,81 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
                 self.assertEqual(1.0, a.coverage["fraction"], f"{name} coverage")
                 self.assertTrue(all(r.sent_at for r in ts.requests),
                                 f"{name}: undated rows are unpriceable anyway")
+                # Every money figure has to actually EXIST, or the checks below
+                # skip it and pass. This is the hole that survived the first fix
+                # of it: at one row per loader the projection path never ran, so
+                # `monthly_input_usd` was None rather than a withheld Figure,
+                # `hasattr(v, "released")` filtered it out, and a non-surface
+                # blocker could sit there unseen. Reverting ROWS to 1 passed
+                # every other assertion in this class.
+                figures = {k for k, v in a.spend.items()
+                           if hasattr(v, "released")}
+                self.assertEqual(
+                    {"input_usd", "if_uncached_usd", "caching_saved_usd",
+                     "monthly_input_usd"}, figures,
+                    f"{name}: the fixture did not produce every spend figure, "
+                    f"so the checks below silently skip the missing ones")
 
-    def test_and_withholds_dollars_because_of_the_surface(self):
-        """The consequence, attributed to the right cause.
+    def test_the_same_rows_release_every_figure_once_a_surface_is_stated(self):
+        """The symmetric half, and the one that makes the claim provable.
+
+        "Nothing was released" is weak on its own: it is also true of a trace
+        nobody could price for a dozen unrelated reasons. Pairing it with "the
+        identical rows release *everything* the moment a surface is stated"
+        pins the surface as the single variable, and pins it over every spend
+        figure rather than the one this test happened to look at.
+
+        Which mattered: the earlier version inspected `input_usd` alone, and
+        `monthly_input_usd` sat beside it withheld for "monthly figures need at
+        least 10 requests" -- a second blocker the check could not see.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in self.LOADERS:
+                arg = self.CALLER_ARG[name]
+                with self.subTest(loader=name):
+                    stated = analyze(self._load(tmp, name,
+                                                **{arg: "anthropic/direct"}),
+                                     allow_unreconciled=True)
+                    figures = {k: v for k, v in stated.spend.items()
+                               if hasattr(v, "released")}
+                    self.assertTrue(figures, f"{name}: no spend figures at all")
+                    withheld = sorted(k for k, v in figures.items()
+                                      if not v.released)
+                    self.assertEqual(
+                        [], withheld,
+                        f"{name}: these stayed withheld with a stated surface, "
+                        f"so the survey cannot attribute their absence to the "
+                        f"surface: {withheld}")
+
+    def test_and_withholds_every_one_of_them_for_the_surface_when_it_is_not(self):
+        """The other half of the pair, over every figure and naming the cause.
 
         Asserting only that nothing was released let the LiteLLM row pass while
         it was in fact unreadable: `usage` came back `{}`, `sent_at` None, 0 of
-        1 analysable, and the stated reason was "no invoice was supplied". The
-        reason is now part of the assertion, so the check cannot be satisfied by
-        a row that failed for some other reason entirely.
+        1 analysable, and the stated reason was "no invoice was supplied".
         """
         with tempfile.TemporaryDirectory() as tmp:
             loaders = self._every_loader(tmp)
         for name, ts in loaders.items():
             with self.subTest(loader=name):
                 a = analyze(ts, allow_unreconciled=True)
-                released = [k for k, v in a.spend.items()
-                            if getattr(v, "released", False)]
+                figures = {k: v for k, v in a.spend.items()
+                           if hasattr(v, "released")}
+                self.assertTrue(figures, f"{name}: no spend figures at all")
+                released = sorted(k for k, v in figures.items() if v.released)
                 self.assertEqual(
                     [], released,
                     f"{name} published dollars over an unattributed surface: "
                     + ", ".join(released))
-                why = getattr(a.spend["input_usd"], "withheld_because", "")
-                self.assertIn(
-                    "surface is not stated", why,
-                    f"{name} withheld for some other reason, so this proves "
-                    f"nothing about the surface: {why[:160]!r}")
+                wrong = sorted(
+                    k for k, v in figures.items()
+                    if "surface is not stated" not in (v.withheld_because or ""))
+                self.assertEqual(
+                    [], wrong,
+                    f"{name}: these were withheld for some other reason, so a "
+                    f"non-surface blocker is hiding inside this check: "
+                    + ", ".join(f"{k} ({figures[k].withheld_because[:60]!r})"
+                                for k in wrong))
 
     def test_a_loader_that_supplies_a_surface_has_to_admit_it(self):
         """The rule stated positively, over the same fixture.
@@ -2513,17 +2579,61 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
                         f"{name} recorded a caller-stated surface as assumed, "
                         f"which would downgrade a correct report to DRAFT")
 
-    def test_a_row_stated_surface_is_not_an_assumption_either(self):
-        """The third way a surface arrives: read from the row itself. LiteLLM is
-        the loader that can do this, through `custom_llm_provider`."""
+    # Every route by which a surface reaches a request *from the data*, and the
+    # surface each one should yield. Enumerated from the loaders before the test
+    # was written, rather than extended each time a review named another one:
+    #
+    #   `litellm.target_from_row` has two -- the `custom_llm_provider` field,
+    #   and the routing prefix on `model` when that field is absent.
+    #   `trace.request_from_row` has one, a row-level `target_id`, and it serves
+    #   both `load_jsonl` and `load_bodies`, so each is exercised separately
+    #   because they reach it by different paths.
+    #
+    # Three rounds running, the fix covered the route being looked at. This is
+    # the table that stops that: a fourth route is a row here, and a route that
+    # starts reporting itself as assumed fails whichever one it is.
+    ROW_STATED_ROUTES = (
+        ("load_litellm", {"custom_llm_provider": "bedrock"},
+         "amazon-bedrock/converse"),
+        ("load_litellm", {"model": "anthropic/claude-opus-5"},
+         "anthropic/direct"),
+        ("load_jsonl", {"target_id": "amazon-bedrock/converse"},
+         "amazon-bedrock/converse"),
+        ("load_bodies", {"target_id": "amazon-bedrock/converse"},
+         "amazon-bedrock/converse"),
+    )
+
+    def test_a_row_stated_surface_is_not_an_assumption_by_any_route(self):
+        """The third way a surface arrives: read from the data itself.
+
+        A regression marking any of these as assumed downgrades a legitimate
+        report to DRAFT once a consumer gates on the field -- and the previous
+        version of this test covered one of the four.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            ts = self._load(tmp, "load_litellm",
-                            row_extra={"custom_llm_provider": "anthropic"})
-        self.assertEqual({"anthropic/direct"},
-                         {r.target_id for r in ts.requests},
-                         "the row's own provider field was not read")
-        self.assertEqual((), tuple(getattr(ts, "assumed_inputs", ()) or ()),
-                         "a surface read from the row is not an assumption")
+            for name, extra, expected in self.ROW_STATED_ROUTES:
+                route = ",".join(sorted(extra))
+                with self.subTest(loader=name, route=route):
+                    ts = self._load(tmp, name, row_extra=extra)
+                    self.assertEqual(
+                        {expected}, {r.target_id for r in ts.requests},
+                        f"{name} did not read the surface from {route}")
+                    self.assertEqual(
+                        (), tuple(getattr(ts, "assumed_inputs", ()) or ()),
+                        f"{name} called a surface it read from {route} an "
+                        f"assumption, which would downgrade a correct report")
+
+    def test_the_route_table_covers_every_loader_that_can_read_one(self):
+        """Guard the guard: a table is only as good as its coverage, and this
+        one is the fix for a test that covered a quarter of the routes."""
+        covered = {name for name, _extra, _exp in self.ROW_STATED_ROUTES}
+        self.assertEqual(set(self.LOADERS), covered,
+                         "a loader that can read a surface from its rows is "
+                         "missing from the route table")
+        self.assertGreaterEqual(
+            sum(1 for n, _e, _x in self.ROW_STATED_ROUTES if n == "load_litellm"),
+            2, "litellm has two routes -- the provider field and the model "
+               "prefix -- and both have to be exercised")
 
     def test_the_admission_names_the_surface_and_only_the_surface(self):
         """The exact contract, on the one loader that legitimately assumes.
@@ -2564,3 +2674,177 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
         legacy.__dict__.pop("assumed_inputs")
         self.assertEqual((), legacy.assumed_inputs)
         self.assertEqual((), dc.replace(legacy, source="x").assumed_inputs)
+
+
+class TestABooleanMultiplierIsRefusedRatherThanPricedAtOneX(unittest.TestCase):
+    """`bool` subclasses `int`, so every numeric guard on a multiplier let it in.
+
+    `isinstance(True, (int, float))` is True, so a hand-edited or corrupted
+    registry row carrying `write_5m: true` passed the type check in `cost.price`
+    and was multiplied straight into the figure as 1.0x. Measured on
+    anthropic/direct, one million 5m-write tokens:
+
+        write_5m = True  ->  $5.00
+        write_5m = 1.25  ->  $6.25          a silent 20% understatement
+
+    1.0x is a plausible-looking number, so nothing downstream reads as broken --
+    which is what makes it worse than a crash. `read: true` is the same defect
+    pointing the other way: 1.0x instead of 0.1x makes a cache read cost the
+    same as fresh input, so the allocator scores every plan worse than uncached
+    and places no marker at all.
+
+    Found by Track A closing it in the analyzer's four consumers and then
+    AST-walking the package for the rest. `cost.py` had two and `tiers.py` a
+    third -- the module the analyzer *delegates pricing to*, which is the
+    partial-closure shape this round has been about. `cost.price` is the serious
+    one: every priced figure in the package goes through it.
+
+    `cost.py` already excluded `bool` for `effective_rate`, one branch away, for
+    the same reason and with the same consequence. The rule was known here; it
+    just was not applied to the multipliers beside it.
+    """
+
+    KEYS = ("read", "write_5m", "write_1h")
+
+    def setUp(self):
+        from cacheeconomics import registry
+        self.registry = registry
+        self.real = dict(registry.multipliers("anthropic/direct"))
+        self._orig = registry.multipliers
+
+    def tearDown(self):
+        self.registry.multipliers = self._orig
+
+    def _poison(self, key, value):
+        m = {**self.real, key: value}
+        self.registry.multipliers = lambda _t, _m=m: _m
+
+    def test_the_predicate_rejects_bool_and_accepts_numbers(self):
+        self.assertFalse(cost.is_multiplier(True))
+        self.assertFalse(cost.is_multiplier(False))
+        self.assertFalse(cost.is_multiplier(None))
+        self.assertFalse(cost.is_multiplier("1.25"))
+        self.assertTrue(cost.is_multiplier(1.25))
+        self.assertTrue(cost.is_multiplier(0))
+        self.assertTrue(cost.is_multiplier(2))
+
+    def test_the_hole_is_real_in_the_language(self):
+        """The reason this needs a named predicate at all: the obvious guard is
+        wrong, and reads as correct."""
+        self.assertIsInstance(True, int)
+        self.assertTrue(isinstance(True, (int, float)))
+
+    def test_price_refuses_a_boolean_multiplier(self):
+        usage = cost.Usage(uncached_input=0, cache_read=0,
+                           cache_write_5m=1_000_000)
+        for key in self.KEYS:
+            with self.subTest(multiplier=key):
+                self._poison(key, True)
+                with self.assertRaises(self.registry.RegistryError) as e:
+                    cost.price(usage, "claude-opus-5",
+                               target_id="anthropic/direct",
+                               on_date="2026-07-29")
+                self.assertIn(key, str(e.exception))
+
+    def test_and_would_otherwise_have_understated_by_twenty_percent(self):
+        """The measured consequence, pinned so the number is not just prose."""
+        usage = cost.Usage(uncached_input=0, cache_read=0,
+                           cache_write_5m=1_000_000)
+        correct = cost.price(usage, "claude-opus-5",
+                             target_id="anthropic/direct",
+                             on_date="2026-07-29").usd
+        self.assertAlmostEqual(6.25, correct, places=6)
+        # 1.0x is what `True` would have multiplied by.
+        as_one_x = correct / self.real["write_5m"]
+        self.assertAlmostEqual(5.0, as_one_x, places=6)
+
+    def test_ttl_crossover_refuses_one(self):
+        for key in self.KEYS:
+            with self.subTest(multiplier=key):
+                self._poison(key, True)
+                with self.assertRaises(self.registry.RegistryError):
+                    cost.ttl_crossover("anthropic/direct")
+
+    def test_the_allocator_refuses_a_boolean_read_multiplier(self):
+        """`read: true` scores a cache read at the price of fresh input, so
+        every plan loses to uncached and the allocator silently places nothing.
+        A refusal names the surface; a 1.0x read looks like a workload that
+        cannot benefit from caching."""
+        self._poison("read", True)
+        with self.assertRaises(tiers.Unsupported) as e:
+            tiers._surface("anthropic/direct", "claude-opus-5")
+        self.assertIn("read multiplier", str(e.exception))
+
+    def test_a_boolean_write_multiplier_drops_that_tier_rather_than_pricing_it(self):
+        """The deliberate half, kept. A surface may advertise a lifetime the
+        registry records no premium for, and that tier is simply unavailable to
+        the plan -- which is why absent write multipliers are skipped rather
+        than fatal. Accepting a *boolean* one was not deliberate: it entered the
+        search as a 1.0x write premium nobody recorded."""
+        self._poison("write_5m", True)
+        _budget, rates, _read = tiers._surface("anthropic/direct",
+                                               "claude-opus-5")
+        self.assertNotIn("5m", rates, "a boolean premium entered the plan")
+        self.assertEqual({"1h": self.real["write_1h"]}, rates)
+
+    def test_and_refuses_outright_when_no_lifetime_survives(self):
+        self.registry.multipliers = lambda _t: {**self.real,
+                                                "write_5m": True,
+                                                "write_1h": True}
+        with self.assertRaises(tiers.Unsupported) as e:
+            tiers._surface("anthropic/direct", "claude-opus-5")
+        self.assertIn("no matching write", str(e.exception))
+
+    # KNOWN-FAILING in this worktree only, and deliberately an invariant rather
+    # than a scoped check. The four analyzer consumers delegate to Track A's
+    # `_lifetime_multipliers`, which lives on their branch; here they are
+    # genuinely unguarded, so this reports the true state of *this* tree. At
+    # merge it flips to "Unexpected success" and forces the marker's deletion,
+    # which is the confirmation that all seven are closed together -- exactly
+    # what a scoped-to-my-files version could never tell anyone.
+    @unittest.expectedFailure
+    def test_every_consumer_of_the_registry_multipliers_validates(self):
+        """Discovered by AST walk, not by a list written here.
+
+        Track A found the two in `cost.py` this way after fixing four in the
+        analyzer, which is the only reason they were found at all. The same walk
+        runs here so a consumer added later is covered by construction rather
+        than by somebody remembering this class exists.
+
+        The analyzer's four are checked by name because they delegate to its own
+        `_lifetime_multipliers`, which lives in a file this track does not edit.
+        """
+        import ast
+        import pathlib
+        pkg = pathlib.Path(cost.__file__).parent
+        found = []
+        for path in sorted(pkg.rglob("*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            parents = {c: p for p in ast.walk(tree)
+                       for c in ast.iter_child_nodes(p)}
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                f = node.func
+                if not (isinstance(f, ast.Attribute) and f.attr == "multipliers"
+                        and isinstance(f.value, ast.Name)
+                        and f.value.id == "registry"):
+                    continue
+                fn, p = "<module>", node
+                while p in parents:
+                    p = parents[p]
+                    if isinstance(p, ast.FunctionDef):
+                        fn, src = p.name, ast.unparse(p)
+                        break
+                else:
+                    src = ""
+                found.append((path.name, fn, src))
+        self.assertTrue(found, "no consumers discovered; this check is vacuous")
+        unguarded = [
+            f"{mod}:{fn}" for mod, fn, src in found
+            if not ("is_multiplier" in src or "unusable_multipliers" in src
+                    or "_lifetime_multipliers" in src)]
+        self.assertEqual(
+            [], unguarded,
+            "these read registry.multipliers without validating the values, so "
+            "a boolean prices at 1.0x: " + ", ".join(unguarded))

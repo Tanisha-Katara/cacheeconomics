@@ -55,6 +55,24 @@ QUALIFIES_SPEND = "excluded from every dollar figure"
 # bill would match.
 UNATTRIBUTED = "unknown/unattributed"
 
+# The name a loader records in `TraceSet.assumed_inputs` when it supplied the
+# provider surface itself rather than reading it from the export or being told
+# it by the caller.
+#
+# A constant, not a literal, because three files have to agree on it and two of
+# them are other people's: the loader writes it, `analyze` reads it to cap the
+# release at DRAFT, and it is rendered verbatim into a user-visible sentence --
+# "the provider surface used to price this trace was assumed rather than read
+# from the export". Spelled out in each place, a rewording in one becomes a
+# silent divergence in the others: the loader keeps admitting an assumption the
+# analyzer no longer recognises, and the report goes back to reconciled.
+#
+# It lives here rather than in `registry` or `analyzer` because `trace.py`
+# imports nothing from the package -- which is what lets every loader and the
+# analyzer import it without a cycle -- and because the field it names is
+# defined a few dozen lines below.
+ASSUMED_PROVIDER_SURFACE = "provider surface"
+
 
 def note_blocks_spend(text: str) -> bool:
     """Does this note qualify a number that was published?
@@ -314,7 +332,10 @@ class TraceSet:
     # unknown denominator rather than a reconciliation.
     skipped_rows: int = 0
     # Which inputs to the pricing were assumed rather than read from the export,
-    # named individually: `("provider surface",)`.
+    # named individually: `(ASSUMED_PROVIDER_SURFACE,)`. Use the constants
+    # rather than literals -- the names are read by `analyze` and printed to a
+    # client, so a spelling that drifts between writer and reader silently
+    # restores the defect this field exists to close.
     #
     # Structured rather than recovered from `blocking_notes`, and the three
     # reasons are measured rather than argued. A blocking note may equally mean

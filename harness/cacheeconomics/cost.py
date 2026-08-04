@@ -269,6 +269,52 @@ class Spend:
         return None if h == 0 else 100.0 * self.saving_vs_uncached / h
 
 
+# The three multipliers this cost model is shaped for. Named once because four
+# call sites checked for them independently and two of them checked differently.
+ANTHROPIC_SHAPED_MULTIPLIERS = ("read", "write_5m", "write_1h")
+
+
+def is_multiplier(value) -> bool:
+    """Is this a number a token count may be multiplied by?
+
+    `bool` is excluded, and that is the whole reason this exists. `bool`
+    subclasses `int`, so `isinstance(True, (int, float))` is True and a
+    hand-edited registry row carrying `write_5m: true` sailed through every
+    numeric guard in the package and priced at 1.0x. Measured on
+    anthropic/direct: one million 5m-write tokens came back $5.00 instead of
+    $6.25, a silent 20% understatement of the one figure the whole tool exists
+    to get right -- and 1.0x is a plausible-looking number, so nothing
+    downstream reads as broken.
+
+    `read: true` is worse in a different way: 1.0x instead of 0.1x makes a cache
+    read cost the same as fresh input, so the allocator models caching as
+    worthless and declines to place a marker at all.
+
+    This file already applied the rule one branch away -- `effective_rate`
+    excludes `bool` explicitly, for the same reason and with the same
+    consequence -- which is why it is now a named predicate rather than a
+    condition each caller writes out.
+
+    `None` fails here too. `read: null` is a real registry value on
+    openai/direct, and multiplying by it raised a TypeError one layer from the
+    cause instead of a refusal naming the surface.
+    """
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def unusable_multipliers(mapping, keys=ANTHROPIC_SHAPED_MULTIPLIERS) -> list:
+    """Which of `keys` are absent, null, or not a usable multiplier.
+
+    Returns names rather than raising, so each caller can refuse in its own
+    idiom: `cost.price` raises because it is where a figure is produced,
+    `tiers._surface` raises `Unsupported` because a plan cannot be scored, and
+    `analyzer._lifetime_multipliers` returns None because a rule that cannot
+    price simply does not run. One predicate, three refusals.
+    """
+    m = mapping if isinstance(mapping, dict) else {}
+    return [k for k in keys if not is_multiplier(m.get(k))]
+
+
 def price(usage: Usage, model: str, target_id: str,
           on_date: str | None = None, effective_rate: float | None = None) -> Spend:
     """Cost this usage.
@@ -332,12 +378,12 @@ def price(usage: Usage, model: str, target_id: str,
     # report. A surface this model cannot price has to say so, so the analyzer
     # can exclude those requests and fail the publication gate the same way it
     # does for an unknown model.
-    missing = [k for k in ("read", "write_5m", "write_1h")
-               if not isinstance(m.get(k), (int, float))]
+    missing = unusable_multipliers(m)
     if missing:
         raise registry.RegistryError(
             f"{target_id} does not record Anthropic-shaped multipliers "
-            f"({', '.join(missing)} absent or null), so this cost model cannot price it. "
+            f"({', '.join(missing)} absent, null or not a number), so this cost "
+            f"model cannot price it. "
             f"Add a target-specific pricing path before analysing this surface.")
     per = rate / 1_000_000
 
@@ -418,12 +464,12 @@ def ttl_crossover(target_id: str) -> dict:
     # report. A surface this model cannot price has to say so, so the analyzer
     # can exclude those requests and fail the publication gate the same way it
     # does for an unknown model.
-    missing = [k for k in ("read", "write_5m", "write_1h")
-               if not isinstance(m.get(k), (int, float))]
+    missing = unusable_multipliers(m)
     if missing:
         raise registry.RegistryError(
             f"{target_id} does not record Anthropic-shaped multipliers "
-            f"({', '.join(missing)} absent or null), so this cost model cannot price it. "
+            f"({', '.join(missing)} absent, null or not a number), so this cost "
+            f"model cannot price it. "
             f"Add a target-specific pricing path before analysing this surface.")
     return {
         "applicable": True,

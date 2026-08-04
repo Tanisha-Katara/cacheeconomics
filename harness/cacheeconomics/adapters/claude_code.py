@@ -46,7 +46,8 @@ from datetime import datetime
 from glob import glob
 
 from ..registry import normalize_model
-from ..trace import UNATTRIBUTED, Request, Tier, TraceSet, _parse_ts
+from ..trace import (ASSUMED_PROVIDER_SURFACE, UNATTRIBUTED, Request, Tier,
+                     TraceSet, _parse_ts)
 
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 
@@ -286,8 +287,8 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
                     # the release label come from one fact rather than from a
                     # renderer re-reading prose. Named, not a flag, so the note
                     # downstream can say *which* input was assumed.
-                    assumed_inputs=(("provider surface",) if surface_assumed
-                                    else ()))
+                    assumed_inputs=((ASSUMED_PROVIDER_SURFACE,)
+                                    if surface_assumed else ()))
 
 
 def _agent_of(rec: dict) -> str:

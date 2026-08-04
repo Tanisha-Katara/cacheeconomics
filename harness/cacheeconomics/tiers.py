@@ -58,7 +58,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from . import registry
+from . import cost, registry
 
 _TTL = re.compile(r"^(\d+)([smh])$")
 _UNIT = {"s": 1, "m": 60, "h": 3600}
@@ -178,14 +178,25 @@ def _surface(target_id: str, model: str | None = None):
         raise Unsupported(
             f"{target_id} records no supported cache lifetimes"
             + (f" for {model}" if model else ""))
-    if not isinstance(mult.get("read"), (int, float)):
+    # `cost.is_multiplier`, not a local isinstance. `bool` subclasses `int`, so
+    # `read: true` passed the old check and came back as a 1.0x read rate --
+    # which makes a cache read cost the same as fresh input, so every plan
+    # scores worse than uncached and the allocator places nothing at all. Same
+    # defect as the one that priced a `write_5m: true` at 1.0x in `cost.price`;
+    # one predicate now, because these two drifted while agreeing in words.
+    if not cost.is_multiplier(mult.get("read")):
         raise Unsupported(
             f"{target_id} does not record an Anthropic-shaped read multiplier, "
             f"so this cost model cannot compare plans on it.")
     rates = {}
     for t in ttls:
         key = f"write_{t}"
-        if isinstance(mult.get(key), (int, float)):
+        # Skipping an *absent* write multiplier is deliberate: a surface can
+        # advertise a lifetime the registry has no premium for, and the plan
+        # simply cannot use that tier. Accepting a *boolean* one was not -- it
+        # entered the search as a 1.0x write and priced a premium nobody
+        # recorded.
+        if cost.is_multiplier(mult.get(key)):
             rates[t] = mult[key]
     if not rates:
         raise Unsupported(
