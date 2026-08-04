@@ -159,36 +159,53 @@ def _json_safe(value):
     return value
 
 
+def analysis_json(a, tier_name: str = "", coverage=None) -> str:
+    """The machine-readable analysis, as one callable both the CLI and its
+    tests go through.
+
+    Extracted from `cmd_analyze` because it was inline, and an invariant
+    written to check "every dollar field in the JSON carries release state"
+    could not reach it without a `Namespace` and a loaded trace. So the test
+    grew a mirror of this dict instead -- and then tested the mirror. The
+    mirror agreed with itself perfectly while the real output shipped finding
+    figures with no release state at all.
+
+    An invariant that cannot reach the real code path will be given a
+    convincing substitute. The fix is not a better mirror, it is a seam.
+    """
+    # Figures are rendered through `str`, so a withheld one serialises as
+    # "[withheld: ...]" rather than a number somebody's script would treat
+    # as spend. `raw()` is deliberately not reachable from here.
+    return json.dumps({
+        "tier": tier_name,
+        "coverage": coverage,
+        "window_days": a.window_days,
+        "spend": {k: str(v) for k, v in a.spend.items()},
+        # A script reading this saw only strings and could not tell a
+        # draft figure from an invoice-checked one. The state is the
+        # machine-readable half of the DRAFT banner.
+        "release_state": {k: getattr(v, "released_as", "")
+                          for k, v in a.spend.items()
+                          if hasattr(v, "released_as")},
+        "reconciliation": _json_safe(a.reconciliation),
+        "findings": [{"code": f.code, "severity": f.severity,
+                      "title": f.title, "confidence": f.confidence,
+                      "affected_requests": f.affected_requests,
+                      "avoidable_usd_month": (str(f.avoidable_usd_month)
+                                              if f.avoidable_usd_month
+                                              else None)}
+                     for f in a.findings],
+        "notes": a.notes,
+    }, indent=2, default=str, allow_nan=False)
+
+
 def cmd_analyze(args) -> int:
     ts = _load(args)
     a = analyze(ts, invoice_usd=args.invoice_usd,
                 effective_rate=args.effective_rate, on_date=args.on_date,
                 allow_unreconciled=args.allow_unreconciled)
     if args.format == "json":
-        # Figures are rendered through `str`, so a withheld one serialises as
-        # "[withheld: ...]" rather than a number somebody's script would treat
-        # as spend. `raw()` is deliberately not reachable from here.
-        out = json.dumps({
-            "tier": ts.tier.name,
-            "coverage": ts.coverage,
-            "window_days": a.window_days,
-            "spend": {k: str(v) for k, v in a.spend.items()},
-            # A script reading this saw only strings and could not tell a
-            # draft figure from an invoice-checked one. The state is the
-            # machine-readable half of the DRAFT banner.
-            "release_state": {k: getattr(v, "released_as", "")
-                              for k, v in a.spend.items()
-                              if hasattr(v, "released_as")},
-            "reconciliation": _json_safe(a.reconciliation),
-            "findings": [{"code": f.code, "severity": f.severity,
-                          "title": f.title, "confidence": f.confidence,
-                          "affected_requests": f.affected_requests,
-                          "avoidable_usd_month": (str(f.avoidable_usd_month)
-                                                  if f.avoidable_usd_month
-                                                  else None)}
-                         for f in a.findings],
-            "notes": a.notes,
-        }, indent=2, default=str, allow_nan=False)
+        out = analysis_json(a, tier_name=ts.tier.name, coverage=ts.coverage)
     elif args.format == "html":
         out = report.render_html(a, client=args.client or "",
                                  window_label=args.window_label or "")

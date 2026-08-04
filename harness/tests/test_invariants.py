@@ -86,27 +86,41 @@ def walk_figures(obj, path="root", _depth=0):
             yield from walk_figures(value, f"{path}.{name}", _depth + 1)
 
 
-def _figure_returning_methods():
-    """Nullary Figure->Figure methods, found by calling them.
+def figure_round_trips():
+    """Every Figure -> Figure path, as `(label, callable)`.
 
-    Named-list versions of this are what let `__abs__` drop `released_as` for
-    as long as it did: every test listed the operations it already knew about,
-    so the one nobody thought of was the one that broke.
+    Was a `dir()` probe that kept only dunder names callable with no arguments.
+    That found exactly one operation -- `__abs__` -- so an invariant advertising
+    "survives every Figure operation" checked one, and `release()`, pickling,
+    copying, equality and hashing all went unexamined while a new `projected`
+    field was threaded through every one of them.
+
+    Discovery is still real, in the direction that matters: the *table* is
+    explicit, and `test_the_round_trip_table_covers_every_state_carrier` fails
+    if `Figure.__slots__` grows a field this table does not exercise. Naming the
+    operations while checking the *fields* automatically is the way round that
+    holds -- a new slot is the thing likely to be forgotten, not a new dunder.
     """
-    probe = Figure(-1.0, money.MEASURED)
-    out = []
-    for name in dir(Figure):
-        if not name.startswith("__") or name in ("__class__", "__init__"):
-            continue
-        attr = getattr(Figure, name, None)
-        if not callable(attr):
-            continue
-        try:
-            if isinstance(attr(probe), Figure):
-                out.append(name)
-        except Exception:
-            continue
-    return out
+    import copy
+    import pickle
+    return [
+        ("abs()", lambda f: abs(f)),
+        ("release(True)", lambda f: f.release(True, as_=f.released_as or None)
+         if f.released_as else f.release(True)),
+        ("release(True, as_=DRAFT)", lambda f: f.release(True, as_=money.DRAFT)),
+        ("release(False)", lambda f: f.release(False, "test")),
+        ("pickle", lambda f: pickle.loads(pickle.dumps(f))),
+        ("copy", lambda f: copy.copy(f)),
+        ("deepcopy", lambda f: copy.deepcopy(f)),
+    ]
+
+
+# Every slot on `Figure` that carries state rather than the amount itself.
+# `withheld_because` is here because the guard below caught its absence: I
+# listed the slots I had just been editing and missed the one I had not, which
+# is the failure this whole file is about, occurring inside it.
+STATE_SLOTS = ("basis", "released", "released_as", "projected",
+               "withheld_because")
 
 
 def renderers():
@@ -178,6 +192,35 @@ class TestEveryProjectedFigureRespectsTheProjectionFloor(unittest.TestCase):
             "\n".join(f"    {p} = {f} (released_as={f.released_as})"
                       for p, f in leaked))
 
+    def test_every_monthly_named_figure_is_actually_tagged(self):
+        """The bypass check: `projected` is a tag, and a tag can be skipped.
+
+        The test above finds figures *marked* projected. A monthly figure built
+        without going through `_monthly` would be semantically projected,
+        untagged, and therefore invisible to it -- the invariant would go green
+        while the defect it was written for shipped. Acknowledging that in a
+        docstring, which the first version did, does not close it.
+
+        So this asks the question from the other side, using a signal the code
+        cannot fake: the *name of the field the figure is stored in*. Anything
+        reachable at a path saying "month" must carry the tag. A new monthly
+        figure that skips `_monthly` fails here, because it still has to be
+        called something.
+
+        Not a proof either. A projected figure stored under a name with no
+        "month" in it evades both checks. Together they require a bypass to be
+        both untagged and unnamed, which is a good deal narrower than either
+        alone.
+        """
+        a = short_window_analysis()
+        untagged = [p for p, f in walk_figures(a)
+                    if "month" in p.lower() and not f.projected]
+        self.assertEqual(
+            [], untagged,
+            "figures stored under a monthly name that never went through "
+            "`_monthly`, so the projection floor cannot see them: " +
+            ", ".join(untagged))
+
 
 # --- INV-2 -----------------------------------------------------------------
 
@@ -209,14 +252,71 @@ class TestEveryFigureCarriesItsReleaseProvenance(unittest.TestCase):
         to encode an opinion rather than a requirement. Recorded in PENDING.md
         as a latent sharp edge instead.
         """
-        draft = Figure(-12.34, money.MEASURED).release(True, as_=money.DRAFT)
-        object.__setattr__(draft, "projected", True)
-        for name in _figure_returning_methods():
-            with self.subTest(op=name):
-                out = getattr(draft, name)()
-                self.assertEqual(money.DRAFT, out.released_as,
-                                 f"{name} laundered DRAFT into {out.released_as!r}")
-                self.assertTrue(out.projected, f"{name} dropped `projected`")
+        draft = Figure(-12.34, money.MEASURED, released=True,
+                       released_as=money.DRAFT, projected=True)
+        for label, op in figure_round_trips():
+            with self.subTest(op=label):
+                out = op(draft)
+                self.assertTrue(out.projected,
+                                f"{label} dropped `projected`")
+                if out.released:
+                    self.assertTrue(out.released_as,
+                                    f"{label} released a figure with no provenance")
+                if label in ("abs()", "pickle", "copy", "deepcopy"):
+                    self.assertEqual(
+                        money.DRAFT, out.released_as,
+                        f"{label} laundered DRAFT into {out.released_as!r}")
+
+    def test_the_round_trip_table_covers_every_state_carrying_slot(self):
+        """If `Figure` grows a slot, this fails until the table exercises it.
+
+        The point of failure this guards is precise and has already happened
+        once: a field was added to `__slots__` and threaded through some of the
+        paths that rebuild a Figure. Naming operations by hand is fine; letting
+        the *fields* go unchecked is not.
+        """
+        carriers = [s for s in Figure.__slots__ if s not in ("_usd",)]
+        self.assertEqual(
+            sorted(STATE_SLOTS), sorted(carriers),
+            "Figure.__slots__ changed. Add the new field to STATE_SLOTS and "
+            "make sure every entry in figure_round_trips() preserves it.")
+
+    def test_state_carrying_slots_survive_every_round_trip(self):
+        """The generic form: no round trip may alter any state slot.
+
+        Written against the slot list rather than against named attributes, so
+        a field added tomorrow is checked on every path from the moment
+        `STATE_SLOTS` learns about it.
+        """
+        original = Figure(42.0, money.MODELED, released=True,
+                          released_as=money.DRAFT, projected=True)
+        for label, op in figure_round_trips():
+            if label.startswith("release("):
+                continue        # release deliberately changes release state
+            out = op(original)
+            for slot in STATE_SLOTS:
+                with self.subTest(op=label, slot=slot):
+                    self.assertEqual(
+                        getattr(original, slot), getattr(out, slot),
+                        f"{label} changed {slot}")
+
+    def test_equality_and_hash_see_every_state_slot(self):
+        """Two figures differing only in a state slot must not compare equal.
+
+        `__eq__` and `__hash__` were both updated for `projected`; nothing
+        checked that they were. A field invisible to equality lets a withheld
+        and a released figure test as interchangeable in any set or dict.
+        """
+        base = dict(released=True, released_as=money.RECONCILED, projected=False)
+        a = Figure(10.0, money.MODELED, **base)
+        for slot, other in (("projected", {**base, "projected": True}),
+                            ("released_as", {**base, "released_as": money.DRAFT}),
+                            ("released", {**base, "released": False,
+                                          "released_as": ""})):
+            with self.subTest(slot=slot):
+                b = Figure(10.0, money.MODELED, **other)
+                self.assertNotEqual(a, b, f"__eq__ ignores {slot}")
+                self.assertNotEqual(hash(a), hash(b), f"__hash__ ignores {slot}")
 
     def test_the_json_output_carries_release_state_for_every_figure(self):
         """Every dollar field in `--format json`, not only `spend`.
@@ -238,40 +338,19 @@ class TestEveryFigureCarriesItsReleaseProvenance(unittest.TestCase):
 
 
 def _analysis_json(a: Analysis) -> str:
-    """The CLI's own JSON, reached without re-implementing it here.
+    """The CLI's own JSON, via the CLI's own function. No fallback.
 
-    Re-implementing is how the two renderers diverged. This drives the real
-    code path so the invariant checks what a user actually receives.
+    The previous version called `cli._emit_analysis_json` *if it existed* and
+    otherwise used a local mirror. It did not exist. So this invariant spent
+    its whole life checking a copy of the serializer that lived in the test
+    file, which of course agreed with itself, while the real `--format json`
+    shipped finding figures carrying no release state.
+
+    `getattr` with a fallback is how a test quietly stops testing the thing it
+    names. If the seam disappears, this raises.
     """
     from cacheeconomics import cli
-    import argparse
-    import io
-    import contextlib
-    ns = argparse.Namespace(format="json", client="", window_label="")
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        cli._emit_analysis_json(a, ns) if hasattr(cli, "_emit_analysis_json") \
-            else print(_fallback_json(a))
-    return buf.getvalue()
-
-
-def _fallback_json(a: Analysis) -> str:
-    """Mirrors `cmd_analyze`'s json branch for the fields this test reads.
-
-    Marked clearly as a mirror: if `cmd_analyze` grows a section, this does not
-    know, and the test above will under-report. That is a real limit of this
-    invariant and the reason the CLI branch should be factored out.
-    """
-    return json.dumps({
-        "spend": {k: str(v) for k, v in a.spend.items()},
-        "release_state": {k: getattr(v, "released_as", "")
-                          for k, v in a.spend.items()
-                          if hasattr(v, "released_as")},
-        "findings": [{"code": f.code,
-                      "avoidable_usd_month": (str(f.avoidable_usd_month)
-                                              if f.avoidable_usd_month else None)}
-                     for f in a.findings],
-    }, indent=2, default=str, allow_nan=False)
+    return cli.analysis_json(a, tier_name="USAGE_ONLY", coverage=1.0)
 
 
 def _json_money_sections(payload: dict) -> dict:
@@ -374,39 +453,77 @@ class TestNoMutatingEntryPointDefaultsToASurface(unittest.TestCase):
     MUTATION_SWITCHES = ("apply", "mutate")
 
     def _public_callables(self):
-        for name, obj in vars(plugin).items():
-            if name.startswith("_"):
+        """Every public callable in the package, not just the plugin module.
+
+        The first version walked `plugin` alone, and that scoping *was* the
+        defect one level up: `Recorder.__init__` defaults
+        `target_id='anthropic/direct'` and lives in `cacheeconomics.recorder`,
+        so an invariant named after one module would have gone green while an
+        identical door stood open in the module next to it. An invariant that
+        picks its own scope narrowly proves only that the author looked where
+        they already knew to look.
+
+        `__init__` is included deliberately: a constructor that takes a surface
+        and a mutation switch is an entry point, whatever it is named.
+        """
+        import importlib
+        import pkgutil
+        import cacheeconomics
+
+        for mod_info in pkgutil.iter_modules(cacheeconomics.__path__):
+            if mod_info.name.startswith("_"):
                 continue
-            if inspect.isfunction(obj):
-                yield f"plugin.{name}", obj
-            elif inspect.isclass(obj) and obj.__module__ == plugin.__name__:
-                for mname, m in vars(obj).items():
-                    if not mname.startswith("_") and inspect.isfunction(m):
-                        yield f"plugin.{name}.{mname}", m
+            try:
+                mod = importlib.import_module(f"cacheeconomics.{mod_info.name}")
+            except Exception:
+                continue
+            for name, obj in vars(mod).items():
+                if name.startswith("_"):
+                    continue
+                if inspect.isfunction(obj) and obj.__module__ == mod.__name__:
+                    yield f"{mod_info.name}.{name}", obj
+                elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
+                    for mname, m in vars(obj).items():
+                        if inspect.isfunction(m) and (not mname.startswith("_")
+                                                      or mname == "__init__"):
+                            yield f"{mod_info.name}.{name}.{mname}", m
 
     def test_there_are_entry_points_to_check(self):
         found = [n for n, _ in self._public_callables()]
         self.assertTrue(found, "no public plugin callables discovered")
 
-    def test_no_mutating_entry_point_has_a_real_surface_default(self):
+    def test_no_entry_point_defaults_to_a_named_surface(self):
+        """Not "no *mutating* entry point" -- no entry point at all.
+
+        The narrower version was the second scoping mistake in this one test.
+        `target_id` selects the rate table and the capability limits on every
+        path that reads it, not only the ones that rewrite a request: a static
+        check that silently answers for `anthropic/direct` while the caller runs
+        on Bedrock returns a confident PASS from the wrong surface's minimum.
+        The package's stated rule is default-deny -- a surface earns first-party
+        rates by being *named* -- and a parameter default is exactly how a
+        surface gets named without anyone choosing it.
+
+        Requiring a mutation switch alongside narrowed this from 7 members to
+        2, and the 2 it kept were the 2 the review had already found by hand.
+
+        `None` is not flagged: it means "unspecified", and what a callee does
+        with it is that callee's contract. A named surface is different -- it
+        is an answer nobody gave.
+        """
         offenders = []
         for name, fn in self._public_callables():
-            sig = inspect.signature(fn)
-            if "target_id" not in sig.parameters:
+            p = inspect.signature(fn).parameters.get("target_id")
+            if p is None or p.default is inspect.Parameter.empty:
                 continue
-            can_mutate = any(s in sig.parameters for s in self.MUTATION_SWITCHES)
-            if not can_mutate:
+            if p.default is None or p.default == registry.UNATTRIBUTED:
                 continue
-            default = sig.parameters["target_id"].default
-            if default is inspect.Parameter.empty:
-                continue
-            if default != registry.UNATTRIBUTED:
-                offenders.append(f"{name}(target_id={default!r})")
+            offenders.append(f"{name}(target_id={p.default!r})")
         self.assertEqual(
-            [], offenders,
-            "these can mutate a request and default to a named surface, so a "
-            "caller that never chose one is priced and bounded as though it "
-            "had: " + ", ".join(offenders))
+            [], sorted(offenders),
+            "these default to a named surface, so a caller that never chose one "
+            "is priced and bounded as though it had:\n    " +
+            "\n    ".join(sorted(offenders)))
 
     def test_mutation_defaults_to_off(self):
         """The other half of the same door. A surface guard does not help if
