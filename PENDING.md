@@ -298,11 +298,17 @@ Two independent reasons merging is not justified:
 - **A** — reviewed through round 5; round 6 unreviewed.
 - **B** — reviewed through round 8; round 9 (`cost.py` bool fix) unreviewed.
 - **C** — reviewed through round 7; round 8 unreviewed.
-- **D** — TWO HIGH FINDINGS OPEN AND UNFIXED: `countable()` proves priceability
-  rather than endpoint serveability, so a dated id like
-  `claude-opus-5-99999999` still sends prompt content; and the loader gate
-  accepts provenance whose `tokenizer_model` is `None`, which the counter itself
-  refuses. **Track D must not merge in its current state.**
+- **D** — those two HIGH findings are now CLOSED at `4a55fb7`, after this entry
+  was first written. `locally_vouched_serveable()` requires the exact id in the
+  price table AND the first-party endpoint, with everything else falling to an
+  explicit `--assume-endpoint-serves`; and `countable()` moved into the package
+  so the writer's refusal and the loader's acceptance are ONE predicate rather
+  than two that agreed by luck.
+
+  Its own revert-proof then found that **two of its four fixes had no test at
+  all** — reverting each left the file green — and it closed that gap in a
+  separate commit so both are legible. Unreviewed externally like everything
+  after Track B's round 9.
 - **E** — reviewed through round 6; round 7 unreviewed.
 
 ### Merge order and actions, when verification resumes
