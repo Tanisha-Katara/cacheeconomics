@@ -114,7 +114,7 @@ def _countable(cut: dict) -> dict:
     return body
 
 
-def _cache_key(cut: dict) -> str:
+def _cache_key(cut: dict, counter_id: str = "") -> str:
     """A digest of the prefix, not the prefix.
 
     The key used to be `json.dumps(cut)`, so `<out>.cache.json` was a verbatim
@@ -129,12 +129,29 @@ def _cache_key(cut: dict) -> str:
     key, which a per-run secret would defeat. A digest still lets somebody
     confirm a prompt they already guessed; it does not hand them the prompt,
     which is what this replaced.
+    `counter_id` names the tokenizer that produced the count -- the model and
+    the endpoint. Without it the key was the prefix alone, so a cache written by
+    one tokenizer was reused by another without a single call being made, and
+    those counts load as *exact*: `tokens_counted` reaches 1.0 and structural
+    money is released on per-segment sizes from a model that was never asked.
+    Different Claude generations tokenize differently, and a gateway endpoint
+    may not be Anthropic's tokenizer at all.
+
+    Scoped rather than versioned. A header recording the counter and refusing
+    to resume on a mismatch is this codebase's usual reflex and it is the wrong
+    one here: scoped keys let one cache file hold counts from several models
+    safely, which is what an operator comparing two models does, and a mismatch
+    self-heals -- the entries miss, the counter runs, the new ones are written
+    beside the old. The worst case is API calls, not a published figure, which
+    is the opposite trade from the places this project fails closed.
     """
     return hashlib.sha256(
-        json.dumps(cut, sort_keys=True, default=str).encode()).hexdigest()
+        (counter_id + "\x00"
+         + json.dumps(cut, sort_keys=True, default=str)).encode()).hexdigest()
 
 
-def count_segments(body: dict, count, cache: dict | None = None) -> list:
+def count_segments(body: dict, count, cache: dict | None = None,
+                   counter_id: str = "") -> list:
     """Exact token count per segment, in segment order.
 
     `count` takes a request body and returns its input token count. `cache` is
@@ -147,12 +164,12 @@ def count_segments(body: dict, count, cache: dict | None = None) -> list:
         return []
 
     def counted(cut):
-        key = _cache_key(cut)
+        key = _cache_key(cut, counter_id)
         if key not in cache:
             cache[key] = count(_countable(cut))
         return cache[key]
 
-    base_key = _cache_key({})
+    base_key = _cache_key({}, counter_id)
     if base_key not in cache:
         cache[base_key] = count(_countable({}))
     prev = cache[base_key]

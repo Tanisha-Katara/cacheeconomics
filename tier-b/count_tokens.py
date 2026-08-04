@@ -128,7 +128,11 @@ def main() -> int:
     if os.path.exists(cache_path) and not args.dry_run:
         with open(cache_path) as f:
             cache = json.load(f)
-        print(f"  resumed from {len(cache):,} cached counts", file=sys.stderr)
+        # Naming the counter, because after key scoping a model or endpoint
+        # change resumes from 0 against a full file, which otherwise reads as a
+        # missing cache rather than a deliberate recount.
+        print(f"  resumed from {len(cache):,} cached counts "
+              f"({args.model} via {args.endpoint})", file=sys.stderr)
     elif args.dry_run and os.path.exists(cache_path):
         # A dry run starts from an empty cache on purpose. The question it
         # answers is "what would you send", and the honest answer is what a
@@ -140,6 +144,11 @@ def main() -> int:
               f"a dry run ignores them and reports a cold run)", file=sys.stderr)
 
     stats = {"calls": 0}
+    # Which tokenizer these counts came from. Folded into every cache key, so a
+    # cache written for one model or endpoint cannot be silently reused by
+    # another -- those counts load as *exact* and would release structural money
+    # on sizes the new model was never asked for.
+    counter_id = f"{args.model}\x00{args.endpoint}"
     count = counter(args.model, key, stats, args.endpoint, args.dry_run)
     if args.dry_run:
         print(f"  DRY RUN: nothing will be sent. Host that would receive the "
@@ -184,7 +193,8 @@ def main() -> int:
                     skipped += 1
                     continue
                 try:
-                    row["segment_tokens"] = count_segments(body, count, cache)
+                    row["segment_tokens"] = count_segments(body, count, cache,
+                                                      counter_id)
                     counted += 1
                 except Exception as e:                                # noqa: BLE001
                     # The row survives without counts and the analyzer falls back to

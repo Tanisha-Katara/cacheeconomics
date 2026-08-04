@@ -890,11 +890,11 @@ class TestAnAbortedCountLeavesNothingOnDisk(unittest.TestCase):
         real = self.ct.count_segments
         seen = {"n": 0}
 
-        def wrapped(body, count, cache):
+        def wrapped(body, count, cache, counter_id=""):
             seen["n"] += 1
             if seen["n"] > 1:
                 raise after
-            return real(body, count, cache)
+            return real(body, count, cache, counter_id)
 
         self.ct.count_segments = wrapped
         self.addCleanup(setattr, self.ct, "count_segments", real)
@@ -978,3 +978,70 @@ class TestACaptureCannotQuietlyMixTwoRuns(_ProxyCase):
         self.assertTrue(all(r.get("capture_run") for r in rows))
         self.assertEqual(len({r["capture_run"] for r in rows}), 1,
                          "one process, one run id")
+
+
+class TestTheCountCacheIsScopedToItsCounter(unittest.TestCase):
+    """The cache key was a digest of the prompt prefix and nothing else, while
+    `count_tokens.py` exposes both `--model` and `--endpoint`.
+
+    So a cache written by one tokenizer was reused by another without a single
+    call being made — and those counts load as *exact*: `tokens_counted` reaches
+    1.0 and structural money is released on per-segment sizes from a model that
+    was never asked. Different Claude generations tokenize differently, and a
+    gateway endpoint may not be Anthropic's tokenizer at all.
+    """
+
+    BODY = {"model": "claude-opus-5",
+            "system": [{"type": "text", "text": "policy " * 200}],
+            "messages": [{"role": "user", "content": "hi"}]}
+
+    def _run(self, cache, counter_id, value):
+        from cacheeconomics.tokenizer import count_segments
+        calls = []
+        count_segments(self.BODY, lambda b: (calls.append(1), value)[1],
+                       cache, counter_id)
+        return len(calls)
+
+    def test_a_different_model_is_actually_asked(self):
+        cache = {}
+        self._run(cache, "claude-opus-5\x00https://a", 100)
+        self.assertGreater(self._run(cache, "claude-haiku-4-5\x00https://a", 999), 0)
+
+    def test_a_different_endpoint_is_actually_asked(self):
+        cache = {}
+        self._run(cache, "claude-opus-5\x00https://a", 100)
+        self.assertGreater(self._run(cache, "claude-opus-5\x00https://b", 999), 0)
+
+    def test_the_same_counter_still_resumes_for_free(self):
+        """The other direction. A key that never hits has traded a wrong answer
+        for a bill, which is its own kind of wrong."""
+        cache = {}
+        self._run(cache, "claude-opus-5\x00https://a", 100)
+        self.assertEqual(self._run(cache, "claude-opus-5\x00https://a", 100), 0)
+
+    def test_the_counts_do_not_bleed_between_counters(self):
+        """Not just that it re-ran, but that it got its own answer."""
+        from cacheeconomics.tokenizer import count_segments
+        # Counters that scale with body size, so the *differences* differ.
+        # A constant counter returns all-zero differences either way, which
+        # would pass this test without proving anything.
+        cache = {}
+        a = count_segments(self.BODY, lambda b: len(json.dumps(b)),
+                           cache, "opus\x00https://a")
+        b = count_segments(self.BODY, lambda b: len(json.dumps(b)) * 10,
+                           cache, "haiku\x00https://a")
+        self.assertTrue(any(a), "fixture produced no counts at all")
+        self.assertNotEqual(a, b)
+
+    def test_scoping_did_not_put_prompt_text_back_in_the_cache(self):
+        """The key is still a digest. This is the property the digest-key change
+        established and it must survive a change to what is digested."""
+        from cacheeconomics.tokenizer import count_segments
+        cache = {}
+        count_segments({"system": [{"type": "text", "text": "SECRET-POLICY"}],
+                        "messages": [{"role": "user", "content": "CONFIDENTIAL"}]},
+                       lambda b: 10, cache, "claude-opus-5\x00https://a")
+        blob = json.dumps(cache)
+        self.assertNotIn("SECRET-POLICY", blob)
+        self.assertNotIn("CONFIDENTIAL", blob)
+        self.assertNotIn("claude-opus-5", blob)
