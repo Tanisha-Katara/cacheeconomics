@@ -588,23 +588,38 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         So: drive the mutating path, and make the handler's own `target_id` the
         *wrong* surface on purpose. `custom_llm_provider` outranks it, so
         everything must resolve to Vertex, and any use of the handler default
-        at the recheck shows up as `anthropic/direct` in the reads. Asserting
-        the marker reached the returned body is what proves the recheck ran at
-        all: the body is only patched past `if not decision.applied`, which is
-        the branch that used to skip the guard entirely.
+        at the recheck shows up as `anthropic/direct`.
+
+        And attribute every read to the call site that made it, because the
+        marker on the returned body proves only that `decision.applied` got
+        past the early return -- not that the recheck itself executed. Three
+        different places ask this question on one request: `_decide`, the
+        runtime monitor's RT-BUDGET check, and the post-patch recheck. Reading
+        the caller's frame is what makes the assertion below satisfiable by the
+        third alone; deleting the recheck outright leaves the other two
+        answering, and every previous version of this test passed on them.
         """
         import asyncio
+        import os
+        import sys as _sys
         from datetime import datetime, timedelta, timezone
 
         from cacheeconomics import registry
         from cacheeconomics.plugin import CachePlugin, litellm_handler
+
+        # The function that holds the post-patch recheck. Named rather than
+        # line-numbered so ordinary edits to plugin.py do not move it, and so a
+        # rename fails loudly here instead of quietly matching nothing.
+        RECHECK_SITE = ("plugin.py", "_pre_call")
 
         t0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
         asked = []
         real = registry.capability
 
         def spy(target_id, name, *a, **kw):
-            asked.append((target_id, name))
+            frame = _sys._getframe(1)
+            asked.append((os.path.basename(frame.f_code.co_filename),
+                          frame.f_code.co_name, target_id, name))
             return real(target_id, name, *a, **kw)
 
         p = CachePlugin(key=b"k" * 32, warmup=4)
@@ -645,14 +660,23 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         marked = any(isinstance(m.get("content"), list)
                      and any("cache_control" in b for b in m["content"])
                      for m in out["messages"])
-        self.assertTrue(marked, "nothing was patched, so the post-patch recheck "
-                                "never ran and the assertions below are vacuous")
-        budgets = [t for t, n in asked if n == "max_breakpoints"]
-        self.assertTrue(budgets, "the budget guard never ran")
-        self.assertNotIn("anthropic/direct", budgets,
+        # Necessary, not sufficient: it says the mutating path ran, which is
+        # what gives the recheck a chance to run. The assertion that the
+        # recheck *did* run is the next one.
+        self.assertTrue(marked, "nothing was patched, so the mutating path "
+                                "never completed")
+        budgets = [(f, fn, t) for f, fn, t, n in asked
+                   if n == "max_breakpoints"]
+        recheck = [t for f, fn, t in budgets if (f, fn) == RECHECK_SITE]
+        self.assertTrue(
+            recheck,
+            "the post-patch recheck never asked about the budget. Budget reads "
+            "seen, by call site: "
+            + repr(sorted({(f, fn) for f, fn, _ in budgets})))
+        self.assertNotIn("anthropic/direct", recheck,
                          "the live hook enforced Anthropic's budget on a Vertex "
                          "request; it must ask about the resolved surface")
-        self.assertIn("google-cloud/vertex", budgets)
+        self.assertEqual({"google-cloud/vertex"}, set(recheck))
 
 
 class TestSegmentIdsAreScopedToTheTenant(unittest.TestCase):

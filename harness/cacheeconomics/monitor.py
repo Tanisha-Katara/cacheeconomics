@@ -161,7 +161,13 @@ class _ScopeState:
     # and leaving the *state* pooled is the worse half of that bug: the
     # original was silence, this was a live alert computed from evidence the
     # rule says it cannot read.
-    last_marked_at: OrderedDict = field(default_factory=OrderedDict)
+    #
+    # Partitioned by lifetime, like the gaps it feeds. One shared map meant a
+    # lifetime the rule refuses could overwrite a span's timestamp and destroy
+    # the evidence for one it can evaluate -- the mirror image of the pooled
+    # window that let it invent evidence.
+    last_marked_at: dict = field(default_factory=lambda: {
+        name: OrderedDict() for name in TTL_SECONDS})
     # One bucket per lifetime RT-TTL can evaluate, created once and never
     # added to -- `_ttl_rt_ttl_can_read` returns a member of TTL_SECONDS or
     # None, so no other key can be written and the map cannot grow.
@@ -637,27 +643,42 @@ class Monitor:
         # registry lookups inside `_prefix_hashes` are not made at all on
         # traffic whose lifetime the check will refuse, which is why they are
         # no longer announced there either.
-        lifetime = self._ttl_rt_ttl_can_read(r)
+        lifetime = self._ttl_rt_ttl_can_read(r, reads)
+        # Everything below is per evaluable lifetime, timeline included.
+        #
+        # Partitioning the *gaps* alone left one shared span->timestamp map
+        # that every marked request wrote to, so a 30m write on a span
+        # overwrote the 5m timestamp sitting there and the next 5m request
+        # found nothing to measure from. Measured: a 5m stream that fires
+        # RT-TTL with 19 gaps recorded zero gaps and never fired once
+        # identical 30m writes were interleaved between the same requests.
+        # The first version of this fix let an unevaluable lifetime invent
+        # evidence; that one let it destroy evidence instead. A lifetime the
+        # rule refuses now touches none of this state at all.
+        #
+        # Not an early return: `last_sent` below is the scope's request
+        # cadence, which every lifetime contributes to and the plugin reads.
+        # Only the per-lifetime rewrite timeline is skipped.
         if lifetime is not None:
+            marks = st.last_marked_at[lifetime]
             seen_before = None
             for boundary in self._prefix_hashes(r, reads):
-                prev = st.last_marked_at.get(boundary)
-                # Same lifetime on both ends. A span marked under 30m and
-                # rewritten under 5m is not a 5m rewrite, and counting it as
-                # one is how the pooled window got its wrong median.
-                if prev is None or prev[1] != lifetime:
-                    continue
-                if seen_before is None or prev[0] > seen_before:
-                    seen_before = prev[0]
+                when = marks.get(boundary)
+                if when is not None and (seen_before is None
+                                         or when > seen_before):
+                    seen_before = when
             if seen_before is not None:
                 rewrite_gap = (r.sent_at - seen_before).total_seconds()
                 if rewrite_gap >= 0:
                     st.rewrite_gaps[lifetime].append(rewrite_gap)
-        for span_hash in self._marked_hashes(r):
-            st.last_marked_at[span_hash] = (r.sent_at, lifetime)
-            st.last_marked_at.move_to_end(span_hash)
-        while len(st.last_marked_at) > MAX_FIRING:
-            st.last_marked_at.popitem(last=False)
+            for span_hash in self._marked_hashes(r):
+                marks[span_hash] = r.sent_at
+                marks.move_to_end(span_hash)
+            # Capped per lifetime, so the whole map is bounded by
+            # len(TTL_SECONDS) * MAX_FIRING and neither bucket can evict the
+            # other.
+            while len(marks) > MAX_FIRING:
+                marks.popitem(last=False)
         # Only forward. A negative gap was already dropped, but `last_sent` moved
         # backwards anyway, so the *next* request measured from the regressed
         # clock and recorded a gap inflated by however far time had gone back --
@@ -761,6 +782,8 @@ class Monitor:
         floor = reads.get(
             "min_cacheable_tokens",
             lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            inspect=lambda: registry.min_cacheable_tokens(
+                r.target_id, r.model, allow_contested=True),
             needed_for="RT-TTL (rewrites of a prefix too short to cache are "
                        "then counted as recoverable)")
         top = max(marked)
@@ -784,14 +807,43 @@ class Monitor:
         return out
 
     @staticmethod
-    def _ttl_rt_ttl_can_read(r):
+    def _offered_ttls(r, allow_contested=False):
+        """Lifetimes this surface accepts for this model, or None if it does
+        not say.
+
+        `registry.supported_ttls` collapses a null capability into `[]`, and
+        `[]` is also what `deepseek/direct` legitimately records to mean the
+        surface offers no lifetime control at all. Those two need opposite
+        answers here -- the first is a registry gap to announce, the second is
+        a fact RT-TTL should simply respect -- so presence is asked separately.
+        The narrowing itself is still the registry's, including the per-model
+        map that keeps a 1h recommendation off a Bedrock model where 1h never
+        went GA.
+        """
+        if registry.capability(r.target_id, "supported_ttls",
+                               allow_contested) is None:
+            return None
+        return registry.supported_ttls(r.target_id, r.model, allow_contested)
+
+    @staticmethod
+    def _ttl_rt_ttl_can_read(r, reads: _RegistryReads):
         """The lifetime RT-TTL will actually reason about here, or None.
 
-        One definition, read by `_cadence_vs_ttl` to decide whether to speak
-        and by `_prefix_hashes` to decide whether its registry lookups are
-        worth announcing. Restating the condition in the second place is how
-        the announcement and the check drift apart -- which is the shape of
-        defect this file has already paid for twice.
+        One definition, read by `_cadence_vs_ttl` to decide whether to speak,
+        by `_track_shape` to decide whether to collect evidence at all, and by
+        `_prefix_hashes` for its registry lookups. Restating the condition in
+        any of them is how the announcement, the evidence and the check drift
+        apart -- which is the shape of defect this file has already paid for
+        three times.
+
+        Two conditions, and the second was missing. `TTL_SECONDS` is what this
+        module can *reason* about; `registry.supported_ttls` is what the
+        surface will *accept*. Checking only the first told an operator to
+        "set a one-hour TTL" on `openai/direct`, whose row advertises 30m and
+        nothing else -- a recommendation the provider would reject, produced
+        with full confidence from twenty perfectly good observations. Both
+        halves have to hold: a lifetime this module cannot model is not
+        actionable, and a lifetime the surface does not offer is not available.
         """
         lifetimes = r.marker_lifetimes
         # Two lifetimes in one request is a deliberate pattern -- a durable
@@ -808,7 +860,21 @@ class Monitor:
         # request, so it reported the wrong one and the recommendation was a
         # no-op the operator would have had to disprove themselves.
         ttl = next(iter(lifetimes), None) or r.ttl_requested
-        return ttl if ttl in TTL_SECONDS else None
+        if ttl not in TTL_SECONDS:
+            return None
+        # Through the seam, so a surface that cannot answer this is announced
+        # rather than quietly treated as permissive. Defaulting to "supported"
+        # is how the false recommendation above would come back.
+        offered = reads.get(
+            "supported_ttls",
+            lambda: Monitor._offered_ttls(r),
+            inspect=lambda: Monitor._offered_ttls(r, allow_contested=True),
+            needed_for="RT-TTL (inactive: without the surface's lifetimes it "
+                       "cannot tell a switch the provider would accept from "
+                       "one it would reject)")
+        if offered is None:
+            return None
+        return ttl if ttl in offered else None
 
     @staticmethod
     def _marked_hashes(r) -> list:
@@ -1026,6 +1092,8 @@ class Monitor:
         minimum = reads.get(
             "min_cacheable_tokens",
             lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            inspect=lambda: registry.min_cacheable_tokens(
+                r.target_id, r.model, allow_contested=True),
             needed_for="RT-BLOCKED (inactive)")
         if minimum is None:
             return
@@ -1071,6 +1139,8 @@ class Monitor:
         minimum = reads.get(
             "min_cacheable_tokens",
             lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            inspect=lambda: registry.min_cacheable_tokens(
+                r.target_id, r.model, allow_contested=True),
             needed_for="RT-MIN (inactive)")
         if minimum is None:
             return
@@ -1132,7 +1202,7 @@ class Monitor:
         # Which lifetime this advice is about, resolved first, because it also
         # selects the evidence. Shared with `_track_shape`, which files each
         # gap under the lifetime that was in force when it was observed.
-        ttl = self._ttl_rt_ttl_can_read(r)
+        ttl = self._ttl_rt_ttl_can_read(r, reads)
         if ttl is None:
             return
         # This lifetime's own rewrites, never the scope's pooled history. A

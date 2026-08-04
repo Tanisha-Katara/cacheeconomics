@@ -124,14 +124,23 @@ def multipliers(target_id):
     return m
 
 
-def min_cacheable_tokens(target_id, model):
+def min_cacheable_tokens(target_id, model, allow_contested=False):
     """Minimum prefix that will actually cache, for this target and model.
 
     Deliberately has no default. Guessing a minimum is how the silent failure
     this function exists to prevent gets reintroduced: below the threshold the
     provider processes the request uncached and returns no error at all.
+
+    `allow_contested` matches `capability` and means the same thing: inspect,
+    never publish. Without it a caller could not tell a contested row that
+    records a minimum from one that records none, because `ContestedRow` was
+    raised before the row was ever read -- so the live monitor reported
+    `openai/bedrock`'s missing minimum as merely "disputed", and an operator
+    who settled the contest would have found the same checks still off for a
+    second reason nobody had mentioned. Defaults to False, so every existing
+    call keeps refusing contested rows exactly as before.
     """
-    t = target(target_id)
+    t = target(target_id, allow_contested)
     # Followed to the end, with a cycle guard. One level was assumed, so a chain
     # silently stopped short and a row inheriting from itself recursed until the
     # error a caller saw had nothing to do with the registry.
@@ -144,7 +153,10 @@ def min_cacheable_tokens(target_id, model):
                 f"{' -> '.join(list(seen) + [nxt])}. A minimum has to come from "
                 f"somewhere; a loop means no row actually records one.")
         seen.add(nxt)
-        src = target(nxt)
+        # The inherited row is inspected on the same terms as the one that
+        # pointed at it. A chain that ends on a contested row must not become
+        # fact by being reached indirectly.
+        src = target(nxt, allow_contested)
     mins = src.get("min_cacheable_tokens", {})
     if model in mins:
         return mins[model]
@@ -158,7 +170,8 @@ def min_cacheable_tokens(target_id, model):
     )
 
 
-def supported_ttls(target_id: str, model: str | None = None) -> list:
+def supported_ttls(target_id: str, model: str | None = None,
+                   allow_contested=False) -> list:
     """Lifetimes this surface accepts, narrowed to the model when it matters.
 
     `supported_ttls` is the surface's maximum. On Bedrock the 1h lifetime went
@@ -166,14 +179,27 @@ def supported_ttls(target_id: str, model: str | None = None) -> list:
     while the capability stayed surface-wide -- so the linter blessed a 1h
     marker on a model that would reject it. A per-model map is consulted when
     the row carries one.
+
+    `allow_contested` is the same inspect-never-publish affordance `capability`
+    carries, threaded through so a caller can find out whether a contested row
+    records lifetimes at all. Defaults to False; existing calls are unchanged.
     """
-    surface = capability(target_id, "supported_ttls") or []
+    surface = capability(target_id, "supported_ttls", allow_contested) or []
     if model is None:
         return list(surface)
-    try:
-        by_model = capability(target_id, "supported_ttls_by_model")
-    except RegistryError:
-        return list(surface)
+    # An optional refinement, read as one. This used to call `capability` and
+    # swallow the `RegistryError` it raises for an absent key, which is the
+    # wrong tool twice over: `capability`'s contract is that a missing key is
+    # an error, and this caller's contract -- stated in the docstring above --
+    # is that a missing map means no per-model narrowing is recorded. A
+    # swallowed exception standing in for "this field is optional" also made
+    # the map look like a dependency to anything watching which capabilities
+    # get read, when its absence disables nothing and changes no answer.
+    #
+    # `target` rather than a bare dict walk, so a contested row is still
+    # refused on exactly the same terms as every other read here.
+    by_model = target(target_id, allow_contested).get(
+        "capabilities", {}).get("supported_ttls_by_model")
     if not isinstance(by_model, dict):
         return list(surface)
     bare, _date = normalize_model(model, target_id)
