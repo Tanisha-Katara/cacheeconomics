@@ -2051,6 +2051,190 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
             self.assertIn("never reached the arms", b.verdict)
             self.assertIsNone(b.delta_pct)
 
+    def _agents(self, spec):
+        """`spec` maps agent name -> request count, all clean."""
+        out = []
+        for agent, n in spec.items():
+            for i in range(n):
+                out.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[Segment(id=f"h{agent}{i}", role="system",
+                                      tokens=300, index=0),
+                              Segment(id="body", role="system", tokens=30_000,
+                                      index=1, cache_marked=True, ttl="5m")]))
+        return out
+
+    def test_a_sub_threshold_agents_rows_are_not_dropped_silently(self):
+        """The by-agent path read one field of the whole result.
+
+        `_unreported_exclusions` covers billed rows that are not analysable. It
+        does not cover *analysable* rows nobody reports, and an agent below the
+        three-request minimum is dropped without a word: its requests contribute
+        to no group, appear in no output, and qualify nothing.
+
+        This is the CLI's own shape -- `reqs == trace.analysable`, no breach.
+        Measured before: the whole-workload run returned "indeterminate: 1 of 7
+        requests contributed nothing" and the by-agent run printed alpha at
+        20.0% with draft dollars beside it.
+        """
+        reqs = self._agents({"alpha": 6})
+        reqs.append(Request(
+            request_id="solo0", sent_at=T0 + timedelta(seconds=999),
+            model="claude-opus-5", agent="solo", tenant="t", session="ssolo",
+            target_id="anthropic/direct", ttl_requested="5m",
+            usage={"input_tokens": 40_000, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            segments=[]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        self.assertEqual(len(ts.analysable), len(reqs),
+                         "the fixture must be the CLI's own shape, or this "
+                         "tests a breach instead of the hole")
+        self.assertEqual(ts.excluded_billed, {},
+                         "the row must be analysable, or the older derivation "
+                         "catches it and this proves nothing")
+        whole = simulate.bake_off(ts.analysable, trace=ts,
+                                  allow_unreconciled=True)
+        self.assertIsNone(whole.delta_pct,
+                          "the whole workload must be indeterminate here")
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         allow_unreconciled=True)
+        self.assertTrue(out, "no groups came back, so nothing was checked")
+        self.assertEqual({b.group for b in out}, {"alpha"})
+        for b in out:
+            self.assertIsNone(b.delta_pct, b.group)
+            self.assertFalse(b.arms["as-shipped"]["spend"].released, b.group)
+            self.assertIn("too few requests to report", b.verdict)
+
+    def test_the_invoice_note_is_not_stated_over_an_indeterminate_whole(self):
+        """The worst part of that finding: a sentence asserting something the
+        object it came from declined to assert.
+
+        `reconciled` is one field of the whole result. A run can reconcile
+        against an invoice that matched a subtotal computed over rows
+        contributing nothing, and reading that field alone put "the invoice
+        reconciles against the whole workload" directly beneath a verdict of
+        "indeterminate: 1 of 7 requests contributed nothing".
+
+        The fixture is beta-is-misscaled rather than the dropped-agent one, and
+        that matters. With a dropped agent the unreported-rows blocker fires
+        first and this assertion passes with the guard deleted -- checked, and
+        it did. Here every row belongs to a reported group, so nothing else can
+        be doing the work: beta diagnoses its own sizes, alpha is clean, and the
+        whole workload is indeterminate with no unreported rows anywhere.
+        """
+        reqs = self._agents({"alpha": 6})
+        for i in range(6):
+            reqs.append(Request(
+                request_id=f"beta{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                model="claude-opus-5", agent="beta", tenant="t", session="sb",
+                target_id="anthropic/direct", ttl_requested="5m",
+                usage={"input_tokens": 300,
+                       "cache_creation_input_tokens": 30_000,
+                       "cache_read_input_tokens": 0},
+                segments=[Segment(id=f"hb{i}", role="system", tokens=300,
+                                  index=0),
+                          Segment(id="body", role="system", tokens=3_000_000,
+                                  index=1, cache_marked=True, ttl="5m")]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        subtotal = simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        checked = simulate.bake_off(ts.analysable, trace=ts,
+                                    invoice_usd=subtotal)
+        self.assertTrue(checked.reconciled,
+                        "the invoice must match the subtotal, or the "
+                        "contradiction this guards cannot arise")
+        self.assertTrue(checked.blocked_because,
+                        "and the whole result must still be indeterminate")
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=subtotal)
+        self.assertEqual({b.group for b in out}, {"alpha", "beta"},
+                         "every row must belong to a reported group, or the "
+                         "unreported-rows blocker does this test's work")
+        for b in out:
+            why = b.arms["as-shipped"]["spend"].withheld_because
+            self.assertNotIn("reconciles against the whole workload", why,
+                             f"{b.group} asserted a reconciliation the whole "
+                             f"result refused")
+            self.assertNotIn("no invoice was supplied", why,
+                             f"{b.group} was told no invoice was supplied when "
+                             f"one was")
+
+    def test_extra_rows_on_a_sub_threshold_agent_are_still_a_breach(self):
+        """The equality check computed both halves of the match and blocked on
+        one. A caller passing every analysable row *plus* extra rows attributed
+        to an agent that never reaches the minimum had those rows filtered out
+        by the group threshold, so no per-group call ever saw them and the
+        remaining groups released over a `reqs` that was not the analysable set
+        at all. `bake_off` catches this; by-agent discarded its verdict."""
+        clean = self._agents({"alpha": 6, "beta": 6})
+        ts = TraceSet(requests=clean, tier=Tier.INSTRUMENTED, source="x")
+        ghost = Request(
+            request_id="ghost0", sent_at=T0 + timedelta(seconds=5000),
+            model="claude-opus-5", agent="ghost", tenant="t", session="sg",
+            target_id="anthropic/direct", ttl_requested="5m",
+            usage={"input_tokens": 300, "cache_creation_input_tokens": 30_000,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id="hg", role="system", tokens=300, index=0),
+                      Segment(id="body", role="system", tokens=30_000, index=1,
+                              cache_marked=True, ttl="5m")])
+        passed = list(ts.analysable) + [ghost]
+        self.assertIsNone(
+            simulate.bake_off(passed, trace=ts,
+                              allow_unreconciled=True).delta_pct,
+            "the single-arm path must already refuse this")
+        out = simulate.bake_off_by_agent(passed, trace=ts,
+                                         allow_unreconciled=True)
+        self.assertTrue(out)
+        for b in out:
+            self.assertIsNone(b.delta_pct, b.group)
+            self.assertFalse(b.arms["as-shipped"]["spend"].released, b.group)
+            self.assertIn("not the trace's analysable set", b.verdict)
+
+    def test_a_defect_inside_one_kept_group_does_not_blank_another(self):
+        """The scoping this function spent three rounds learning, guarded
+        against the fix above.
+
+        `whole` is indeterminate here too -- beta's sizes disagree with its bill
+        -- but beta is reported and diagnoses that itself. Inheriting the whole
+        verdict wholesale would blank alpha for a defect in beta, which is the
+        round-2 finding arriving from the opposite direction. What a group
+        cannot see is a row it does not have; that is the only thing inherited.
+        """
+        reqs = self._agents({"alpha": 6})
+        for i in range(6):
+            reqs.append(Request(
+                request_id=f"beta{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                model="claude-opus-5", agent="beta", tenant="t", session="sb",
+                target_id="anthropic/direct", ttl_requested="5m",
+                usage={"input_tokens": 300,
+                       "cache_creation_input_tokens": 30_000,
+                       "cache_read_input_tokens": 0},
+                # Segments summing to 100x what the provider billed.
+                segments=[Segment(id=f"hb{i}", role="system", tokens=300,
+                                  index=0),
+                          Segment(id="body", role="system", tokens=3_000_000,
+                                  index=1, cache_marked=True, ttl="5m")]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        self.assertIsNone(
+            simulate.bake_off(ts.analysable, trace=ts,
+                              allow_unreconciled=True).delta_pct,
+            "the whole workload must be indeterminate, or this proves nothing")
+        out = {b.group: b for b in simulate.bake_off_by_agent(
+            ts.analysable, trace=ts, allow_unreconciled=True)}
+        self.assertEqual(set(out), {"alpha", "beta"})
+        self.assertIsNotNone(out["alpha"].delta_pct,
+                             "alpha was blanked by a defect in beta")
+        self.assertTrue(out["alpha"].arms["as-shipped"]["spend"].released)
+        self.assertIsNone(out["beta"].delta_pct)
+
     def test_the_subset_invariant_is_what_says_so(self):
         """And it is an invariant, not a condition: every request handed to the
         arms is in `trace.analysable`. Stated as one checkable sentence so there
