@@ -42,6 +42,18 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
 
+def _counted_path(path: str) -> str:
+    """`run.jsonl` -> `run-counted.jsonl`, beside it.
+
+    Split on the basename so a directory named `something.jsonl` is left alone,
+    and give an extensionless input a real extension rather than a name
+    identical to itself.
+    """
+    head, base = os.path.split(path)
+    root, ext = os.path.splitext(base)
+    return os.path.join(head, f"{root}-counted{ext or '.jsonl'}")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         description=__doc__.split("\n")[0],
@@ -61,13 +73,30 @@ def main() -> int:
     p.add_argument("--model", default="claude-haiku-4-5")
     args, passthrough = p.parse_known_args()
 
+    # A sibling path, derived from the basename only. This was
+    # `args.path.replace(".jsonl", "-counted.jsonl")`, which is wrong in three
+    # ways an operator can hit: an input with no `.jsonl` produced a path equal
+    # to the input, so `count_tokens.py` overwrote the source it was reading;
+    # a directory component containing `.jsonl` was rewritten too, sending the
+    # output somewhere else entirely; and a name containing `.jsonl` twice had
+    # both occurrences replaced.
+    #
+    # This is the one command that produces client evidence. Destroying the
+    # capture it was handed is the worst thing in its reach.
+    counted_path = _counted_path(args.path)
+    if os.path.abspath(counted_path) == os.path.abspath(args.path):
+        print(f"  refusing to run: the counted output would be written over "
+              f"the input at {args.path}. Rename the input, or pass "
+              f"--estimate-only to skip counting.", file=sys.stderr)
+        return 2
+
     counted = args.path
     if args.estimate_only:
         print("  counting skipped (--estimate-only). Structural findings will "
               "carry no dollar figures.", file=sys.stderr)
     else:
         cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), args.path,
-               "-o", args.path.replace(".jsonl", "-counted.jsonl"),
+               "-o", counted_path,
                "--model", args.model]
         if args.endpoint:
             cmd += ["--endpoint", args.endpoint]
@@ -85,7 +114,7 @@ def main() -> int:
             print("  counting failed; continuing with estimates. Structural "
                   "figures will be withheld.", file=sys.stderr)
         else:
-            counted = args.path.replace(".jsonl", "-counted.jsonl")
+            counted = counted_path
 
     env = dict(os.environ, PYTHONPATH=os.path.join(ROOT, "harness"))
     return subprocess.run(

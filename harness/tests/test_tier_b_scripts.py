@@ -1108,3 +1108,72 @@ class TestEverySuffixWeDeriveFromOutIsIgnored(unittest.TestCase):
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
+
+
+class TestTheDiagnosticCannotOverwriteItsOwnInput(unittest.TestCase):
+    """`run_diagnostic.py` derived the counted export with
+    `args.path.replace(".jsonl", "-counted.jsonl")`, which is wrong in three
+    ways an operator can hit:
+
+      capture               -> capture            output *is* the input
+      a.jsonl/b.jsonl       -> a-counted.jsonl/…  a directory rewritten
+      my.jsonl.backup.jsonl -> both occurrences replaced
+
+    The first destroys the capture: `count_tokens.py` opens the derived path
+    for writing while reading the source. This is the one command that produces
+    client evidence, and losing the evidence it was handed is the worst thing
+    in its reach.
+    """
+
+    def _mod(self):
+        return load("run_diagnostic")
+
+    def test_an_extensionless_input_gets_a_distinct_output(self):
+        m = self._mod()
+        self.assertNotEqual(m._counted_path("capture"), "capture")
+        self.assertTrue(m._counted_path("capture").endswith(".jsonl"))
+
+    def test_a_directory_named_like_the_file_is_left_alone(self):
+        m = self._mod()
+        self.assertEqual(m._counted_path("a.jsonl/b.jsonl"),
+                         os.path.join("a.jsonl", "b-counted.jsonl"))
+
+    def test_only_the_extension_is_replaced_not_every_occurrence(self):
+        m = self._mod()
+        self.assertEqual(m._counted_path("my.jsonl.backup.jsonl"),
+                         "my.jsonl.backup-counted.jsonl")
+
+    def test_the_ordinary_case_is_unchanged(self):
+        m = self._mod()
+        self.assertEqual(m._counted_path("run.jsonl"), "run-counted.jsonl")
+        self.assertEqual(m._counted_path("/tmp/x/run.jsonl"),
+                         "/tmp/x/run-counted.jsonl")
+
+    def test_no_input_shape_produces_a_colliding_output(self):
+        """The property, not the four cases: whatever the shape, the counted
+        path is never the path being read."""
+        m = self._mod()
+        for p in ("run.jsonl", "capture", "run.jsonl.gz", "a.jsonl/b.jsonl",
+                  "my.jsonl.backup.jsonl", "/tmp/x/run.jsonl", ".jsonl",
+                  "x/y.jsonl", "no-ext-at-all"):
+            with self.subTest(path=p):
+                self.assertNotEqual(os.path.abspath(m._counted_path(p)),
+                                    os.path.abspath(p))
+
+    def test_end_to_end_the_source_survives(self):
+        """The consequence, driven through the real command."""
+        d = tempfile.mkdtemp()
+        src = os.path.join(d, "capture")            # no extension
+        row = json.dumps({"request": {
+            "model": "claude-opus-5",
+            "system": [{"type": "text", "text": "ORIGINAL-CAPTURE"}],
+            "messages": [{"role": "user", "content": "hi"}]}})
+        with open(src, "w") as f:
+            f.write(row + "\n")
+        subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "run_diagnostic.py"),
+             src, "--endpoint", "http://127.0.0.1:1/x"],
+            capture_output=True, text=True, timeout=90,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        self.assertIn("ORIGINAL-CAPTURE", open(src).read(),
+                      "the diagnostic overwrote the capture it was given")
