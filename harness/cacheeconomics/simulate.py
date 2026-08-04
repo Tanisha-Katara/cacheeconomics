@@ -547,6 +547,12 @@ class BakeOff:
     # verdict beside it declined to say. This field is the verdict itself, so a
     # caller inheriting a decision inherits the whole of it.
     blocked_because: str = ""
+    # Why the released figures are DRAFT rather than RECONCILED, for the
+    # renderer to state once. `Figure` clears `withheld_because` on release, so
+    # a released-but-unchecked figure carries the *label* and not the reason,
+    # and the reason is what tells a reader whether to go and fetch an invoice
+    # or go and state their provider surface.
+    draft_because: str = ""
 
     def _range(self, pess, opt):
         if pess is None or opt is None:
@@ -588,7 +594,25 @@ class BakeOff:
             # withheld form is the short label, with the reason stated once
             # below: `str(Figure)` carries the full sentence, and four arms x two
             # ends repeated it until the block was unreadable.
-            cell = (f"${a['spend']:.4f}" if a["spend"].released else "[withheld]")
+            # Provenance rides on the cell, not only on the object. `Figure`
+            # grew `released_as` because "a figure released by
+            # `--allow-unreconciled` was byte-identical to one an invoice had
+            # checked -- same value, same basis, same string -- and no renderer
+            # *could* mark one and not the other". This renderer then did not
+            # read it, so the field was right and the output was unchanged:
+            # measured, an assumed-surface run and a reconciled one produced
+            # byte-identical lines and the word "draft" appeared nowhere.
+            #
+            # On the cell rather than only in the caveat below, because a line
+            # of this block is exactly what gets copied into a message, and a
+            # dollar amount that travels without its provenance is the thing
+            # `released_as` exists to prevent.
+            if not a["spend"].released:
+                cell = "[withheld]"
+            elif a["spend"].released_as == money.DRAFT:
+                cell = f"${a['spend']:.4f} DRAFT"
+            else:
+                cell = f"${a['spend']:.4f}"
             lines.append(f"  {p:<16} {cell}   "
                          f"hit {a['reads']:>3} wrote {a['writes']:>3}"
                          f" cold {a['cold']:>3}{d}")
@@ -597,6 +621,13 @@ class BakeOff:
         held = [a["spend"] for a in self.arms.values() if not a["spend"].released]
         if held:
             lines.append(f"  !! per-arm spend withheld: {held[0].withheld_because}.")
+        drafts = [a["spend"] for a in self.arms.values()
+                  if a["spend"].released and a["spend"].released_as == money.DRAFT]
+        if drafts:
+            lines.append(
+                f"  !! per-arm spend is DRAFT, not reconciled: "
+                f"{self.draft_because or 'not tied to a provider invoice'}. "
+                f"Not for external use.")
         lines.append(f"  range vs baseline  placement  "
                      f"{self._range(self.delta_pct, self.delta_pct_optimistic)}")
         lines.append(f"                     relocation "
@@ -629,18 +660,26 @@ class BakeOff:
 
 GATE_THRESHOLD_PCT = 10.0
 
+# Requests an agent needs before it gets a comparison of its own. Below this the
+# per-agent answer rests on too little traffic to mean anything -- but the rows
+# still cost money, so they are reported together rather than dropped.
+MIN_GROUP_REQUESTS = 3
+
 
 # What `Request.agent` says when nothing said. A row wearing this could belong
 # to any group, so it qualifies all of them rather than none.
 UNATTRIBUTED_AGENT = "unknown"
 
 
-def _agent_trace(trace, agent: str):
-    """The trace as it looks to one agent's group.
+def _agent_trace(trace, agent):
+    """The trace as it looks to one group.
 
-    Carries that agent's rows plus every row nobody could attribute, so a failed
-    row belonging to agent B stops blocking agent A's clean group while a failed
-    row belonging to nobody still blocks both. `skipped_rows` rides along
+    `agent` is a name or a set of them -- the sub-threshold agents are reported
+    together, so the group they form spans several.
+
+    Carries those agents' rows plus every row nobody could attribute, so a
+    failed row belonging to agent B stops blocking agent A's clean group while a
+    failed row belonging to nobody still blocks both. `skipped_rows` rides along
     untouched because it is a field, which is exactly right: a line that never
     parsed into a `Request` names no agent and cannot be anyone's alone.
 
@@ -648,13 +687,14 @@ def _agent_trace(trace, agent: str):
     whether the sizes were counted describe the capture, and one agent's slice
     of a file cannot be better evidenced than the file.
     """
+    agent = {agent} if isinstance(agent, str) else set(agent)
     if trace is None:
         return None
     rows = getattr(trace, "requests", None)
     if rows is None:
         return trace
     mine = [r for r in rows
-            if r.agent == agent or r.agent == UNATTRIBUTED_AGENT]
+            if r.agent in agent or r.agent == UNATTRIBUTED_AGENT]
     try:
         return _dc_replace(trace, requests=mine)
     except (TypeError, ValueError):
@@ -1177,6 +1217,18 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     assumed = tuple(getattr(trace, "assumed_inputs", ()) or ())
     spend_as = (money.RECONCILED if (reconciled is True and not assumed)
                 else money.DRAFT)
+    # Stated once for the renderer, and both reasons named when both apply: a
+    # reader who is told only "draft" does not know whether to go and fetch an
+    # invoice or go and state their provider surface.
+    _draft_reasons = []
+    if assumed:
+        _draft_reasons.append(
+            f"pricing inputs were assumed rather than stated "
+            f"({', '.join(assumed)}), so no invoice can check the rate these "
+            f"were priced at")
+    if reconciled is not True:
+        _draft_reasons.append("they have not been tied to a provider invoice")
+    draft_because = "; and ".join(_draft_reasons)
     # Reordered so each blocker states itself. The size and omission branches
     # used to sit below the invoice ones and were reached only because those
     # carried `not misscaled and not omitted` guards; spelling the precedence
@@ -1292,7 +1344,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
                            delta_pct_relocation_optimistic=None,
-                           reconciled=reconciled)
+                           reconciled=reconciled, draft_because=draft_because)
         if excluded_billed:
             excluded_note = (
                 "indeterminate: the trace carries billed rows that never reached "
@@ -1313,7 +1365,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
                            delta_pct_relocation_optimistic=None,
-                           reconciled=reconciled)
+                           reconciled=reconciled, draft_because=draft_because)
         if misscaled and not omitted:
             # Sizes alone. Returned through the same path rather than an earlier
             # one, because a short-circuit made this check mask the omission
@@ -1342,7 +1394,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
                            delta_pct_relocation_optimistic=None,
-                           reconciled=reconciled)
+                           reconciled=reconciled, draft_because=draft_because)
         if omitted:
             indeterminate = (
                 f"indeterminate: {omitted} of {len(reqs)} requests contributed nothing "
@@ -1359,7 +1411,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
                        delta_pct_relocation_optimistic=None,
-                       reconciled=reconciled)
+                       reconciled=reconciled, draft_because=draft_because)
         # Neither a subset nor an unknown scale. Every request reached every
         # arm and the sizes agree with the bill -- what is missing is the
         # evidence that the numbers those arms were built from mean anything.
@@ -1411,7 +1463,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                        delta_pct=None, delta_pct_relocation=None,
                        delta_pct_optimistic=None,
                        delta_pct_relocation_optimistic=None,
-                       reconciled=reconciled)
+                       reconciled=reconciled, draft_because=draft_because)
 
     return BakeOff(group=group, n_requests=len(reqs), window_days=window,
                    arms=pess, optimistic=opt, moves=moves, unstructured=skipped,
@@ -1421,7 +1473,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                    delta_pct=d_place, delta_pct_relocation=d_reloc,
                    delta_pct_optimistic=delta(opt, "allocator-lite"),
                    delta_pct_relocation_optimistic=delta(opt, "relocation-lite"),
-                   reconciled=reconciled)
+                   reconciled=reconciled, draft_because=draft_because)
 
 
 def _verdict(arm: str, delta: float | None, eval_gated: bool = False) -> str:
@@ -1573,9 +1625,15 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
     # So coverage is derived from `trace.requests`: an excluded row is somebody's
     # problem only if that somebody is being reported. Anything else has no
     # output to qualify and becomes a blocker on every group.
-    kept = [(g, rs) for g, rs in sorted(groups.items()) if len(rs) >= 3]
+    kept = [(g, rs) for g, rs in sorted(groups.items())
+            if len(rs) >= MIN_GROUP_REQUESTS]
     kept_names = {g for g, _ in kept}
-    orphaned = _unreported_exclusions(trace, kept_names)
+    # Rows belonging to agents too small to report. They get a result of their
+    # own below, so for the purpose of "whose exclusions has nobody reported"
+    # they count as reported.
+    dropped_rows = [r for r in reqs if r.agent not in kept_names]
+    dropped_names = {r.agent for r in dropped_rows}
+    orphaned = _unreported_exclusions(trace, kept_names | dropped_names)
     # Merged rather than chosen between. A bare `excluded_billed` argument
     # carries no agent, so a caller who supplies one is telling every group about
     # it; the derivation adds whatever the trace can attribute to nobody.
@@ -1592,30 +1650,25 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
     # "indeterminate: 1 of 7 requests contributed nothing" and the by-agent run
     # printed alpha at 20.0% with draft dollars beside it.
     #
-    # Asked of the rows themselves rather than inferred from `whole`. A group
-    # diagnoses its own misscaled sizes, omissions and unprovable lifetimes, and
-    # inheriting those from the whole run would blank a clean group for a defect
-    # in a different one -- which is the scoping this function spent three rounds
-    # learning. What a group cannot see is a row it does not have, so that is
-    # exactly what is asked here and nothing more.
-    unreported = [r for r in reqs if r.agent not in kept_names]
-    if unreported and not inherited:
-        _sub_trace = trace
-        if trace is not None and getattr(trace, "requests", None) is not None:
-            try:
-                _sub_trace = _dc_replace(trace, requests=[
-                    r for r in trace.requests if r.agent not in kept_names])
-            except (TypeError, ValueError):
-                _sub_trace = trace
-        dropped = bake_off(unreported, group="(unreported)", on_date=on_date,
-                           effective_rate=effective_rate,
-                           allow_unreconciled=True, trace=_sub_trace)
-        if dropped.blocked_because:
-            inherited = (
-                f"{len(unreported)} request(s) belong to agent(s) with too few "
-                f"requests to report, so no group above describes them, and they "
-                f"are not clean: {dropped.blocked_because.removeprefix('indeterminate: ')}"
-                f" Those requests cost money and no figure here covers them")
+    # Reported rather than reduced to a blocker. The previous version ran the
+    # dropped rows through `bake_off` and inherited `dropped.blocked_because`,
+    # which is empty for a *determinate* result -- so a sub-threshold agent that
+    # was perfectly clean and simply expensive vanished without trace. Measured:
+    # six clean alpha requests plus one clean single-request agent sending an
+    # unmarked million-token prompt. The whole workload comes to -16.7%, that one
+    # row on its own to -25.0%, and the by-agent output printed alpha at +20.0%
+    # and nothing else. The sign of the answer flips, the row responsible moves
+    # the workload by 37 points, and it is not mentioned.
+    #
+    # That is the second time inheritance here read one attribute instead of
+    # asking the result a question, and the lesson generalises: a blocker is a
+    # lossy summary of a whole comparison, so anything worth inheriting is worth
+    # showing. Silence about a row is the failure; the label on it is not.
+    #
+    # The group is deliberately not an agent name. It spans every agent below
+    # the threshold, which is the one place this function blends agents together
+    # -- acceptable only because the alternative is not mentioning them, and the
+    # label says so.
     # Only once the whole result is otherwise determinate. `reconciled` is one
     # field of that result and reading it alone stated things the result had
     # refused: a run can reconcile against an invoice that matched a subtotal
@@ -1652,12 +1705,28 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
             f"whole-workload comparison it would settle is itself indeterminate, "
             f"so it settles nothing for this group either. The percentage below "
             f"does not depend on it")
-    out = [bake_off(rs, group=g, on_date=on_date, effective_rate=effective_rate,
-                    allow_unreconciled=allow_unreconciled,
-                    excluded_billed=global_blockers or None,
-                    trace=_agent_trace(trace, g),
-                    inherited_blocker=inherited, spend_scope_note=scope_note)
-           for g, rs in kept]
+    def _run(label, rows, names):
+        return bake_off(rows, group=label, on_date=on_date,
+                        effective_rate=effective_rate,
+                        allow_unreconciled=allow_unreconciled,
+                        excluded_billed=global_blockers or None,
+                        trace=_agent_trace(trace, names),
+                        inherited_blocker=inherited, spend_scope_note=scope_note)
+
+    out = [_run(g, rs, {g}) for g, rs in kept]
+    if dropped_rows:
+        # Named so it cannot be mistaken for an agent, and carrying the counts
+        # that say why it exists. Its comparison is over fewer than
+        # MIN_GROUP_REQUESTS requests by construction -- that is what put these
+        # rows here -- so the label states the sample rather than leaving a
+        # reader to infer it from a percentage.
+        _named = sorted(dropped_names)
+        _who = ", ".join(_named[:3]) + (
+            f" and {len(_named) - 3} more" if len(_named) > 3 else "")
+        out.append(_run(
+            f"(unreported: {len(dropped_rows)} request(s) from {_who}, below "
+            f"the {MIN_GROUP_REQUESTS}-request minimum)",
+            dropped_rows, dropped_names))
     # Ranking, which is the other thing `raw()` is for: ordering groups by size
     # has to work before anyone decides whether the sizes may be printed.
     out.sort(key=lambda b: -(b.arms["litellm-auto"]["spend"].raw()))

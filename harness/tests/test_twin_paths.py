@@ -1303,6 +1303,84 @@ class TestAnAssumedPricingInputCapsTheLabel(unittest.TestCase):
             self.assertEqual(b.arms["as-shipped"]["spend"].released_as,
                              money.DRAFT, b.group)
 
+    def _arm_line(self, b, arm="as-shipped"):
+        return next(l for l in str(b).splitlines()
+                    if l.strip().startswith(arm))
+
+    def test_the_render_marks_an_assumed_input_run_as_draft(self):
+        """Against the string, because the object was already right.
+
+        `Figure.released_as` exists because "a figure released by
+        `--allow-unreconciled` was byte-identical to one an invoice had checked
+        -- same value, same basis, same string -- and no renderer *could* mark
+        one and not the other". `BakeOff.__str__` then did not read it, so the
+        state was correct and the output was unchanged: measured, an
+        assumed-surface run and a reconciled one produced byte-identical arm
+        lines and the word "draft" appeared nowhere in the block.
+
+        That is the shape this repo has shipped before -- a DRAFT banner
+        inserted into `<head>`, rendering nowhere, with a test asserting its
+        offset and passing. So this asserts what a user reads.
+        """
+        clean = self._clean()
+        invoice = self._invoice(clean)
+        plain = simulate.bake_off(clean.analysable, trace=clean,
+                                  invoice_usd=invoice)
+        ts = assumed_for(clean)
+        capped = simulate.bake_off(ts.analysable, trace=ts,
+                                   invoice_usd=invoice)
+        self.assertNotEqual(self._arm_line(plain), self._arm_line(capped),
+                            "an assumed-input run renders identically to a "
+                            "reconciled one")
+        self.assertIn("DRAFT", self._arm_line(capped),
+                      "the dollar cell carries no provenance, so a line copied "
+                      "out of this block reads as reconciled")
+        self.assertNotIn("DRAFT", self._arm_line(plain))
+        text = str(capped)
+        self.assertIn("per-arm spend is DRAFT", text)
+        self.assertIn("provider surface", text,
+                      "the reader is told it is draft but not why")
+        self.assertIn("Not for external use", text)
+
+    def test_the_render_marks_an_unreconciled_run_as_draft_too(self):
+        """The other route to DRAFT, so the marker is not specific to one
+        cause. No invoice plus the override releases figures nothing checked."""
+        ts = self._clean()
+        b = simulate.bake_off(ts.analysable, trace=ts, allow_unreconciled=True)
+        self.assertIn("DRAFT", self._arm_line(b))
+        self.assertIn("not been tied to a provider invoice", str(b))
+
+    def test_a_reconciled_render_carries_no_draft_marker(self):
+        """So the marker cannot pass by being unconditional."""
+        ts = self._clean()
+        b = simulate.bake_off(ts.analysable, trace=ts,
+                              invoice_usd=self._invoice(ts))
+        self.assertNotIn("DRAFT", str(b))
+        self.assertIn("$", self._arm_line(b))
+
+    def test_the_cli_shows_the_draft_marker(self):
+        """End to end, because the object field was right for a whole round
+        while the command printed no sign of it."""
+        import io
+        import os
+        from contextlib import redirect_stdout
+
+        from cacheeconomics import cli
+
+        fixture = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "fixtures", "demo-traces.jsonl")
+        args = cli.build_parser().parse_args(
+            ["bakeoff", fixture, "--allow-unreconciled"])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(args.func(args), 0)
+        text = out.getvalue()
+        self.assertIn("$", text)
+        self.assertIn("DRAFT", text,
+                      "the shipped command prints draft dollars with nothing "
+                      "marking them as draft")
+
     def test_a_traceset_without_the_field_reads_as_no_assumption(self):
         """Forward and backward compatibility, asserted rather than assumed.
 
@@ -2083,6 +2161,12 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         Measured before: the whole-workload run returned "indeterminate: 1 of 7
         requests contributed nothing" and the by-agent run printed alpha at
         20.0% with draft dollars beside it.
+
+        The rows are now *reported* rather than turned into a blocker on
+        everyone else, which is the stronger fix and the one that survives a
+        determinate-but-bad dropped row. Alpha's answer about alpha stands --
+        blanking it would be the round-2 finding again -- and the dropped row
+        appears as its own result with its own verdict and its own spend.
         """
         reqs = self._agents({"alpha": 6})
         reqs.append(Request(
@@ -2103,14 +2187,70 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
                                   allow_unreconciled=True)
         self.assertIsNone(whole.delta_pct,
                           "the whole workload must be indeterminate here")
-        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
-                                         allow_unreconciled=True)
-        self.assertTrue(out, "no groups came back, so nothing was checked")
-        self.assertEqual({b.group for b in out}, {"alpha"})
-        for b in out:
-            self.assertIsNone(b.delta_pct, b.group)
-            self.assertFalse(b.arms["as-shipped"]["spend"].released, b.group)
-            self.assertIn("too few requests to report", b.verdict)
+        out = {b.group: b for b in simulate.bake_off_by_agent(
+            ts.analysable, trace=ts, allow_unreconciled=True)}
+        dropped = [g for g in out if g.startswith("(unreported")]
+        self.assertEqual(len(dropped), 1,
+                         f"the dropped row is not reported anywhere: {list(out)}")
+        label = dropped[0]
+        self.assertIn("solo", label, "the label does not name the agent")
+        self.assertIn("1 request(s)", label)
+        # Its own verdict, not a summary of it: this row contributed to no arm
+        # and the result says so where a reader will see it.
+        self.assertIn("contributed nothing", out[label].verdict)
+        # And the clean group is not blanked by it.
+        alpha = out["alpha"]
+        self.assertIsNotNone(alpha.delta_pct)
+        self.assertTrue(alpha.arms["as-shipped"]["spend"].released)
+
+    def test_a_dropped_row_that_is_clean_and_bad_is_still_reported(self):
+        """The case a blocker could never have caught.
+
+        The previous fix inherited `dropped.blocked_because`, which is empty for
+        a *determinate* result -- so a sub-threshold agent that was perfectly
+        clean and simply expensive vanished. Measured: six clean alpha requests
+        plus one clean single-request agent sending an unmarked million-token
+        prompt. The whole workload comes to -16.7%, that row on its own to
+        -25.0%, and the by-agent output printed alpha at +20.0% and nothing
+        else. The sign of the answer flips and the row moving it by 37 points is
+        not mentioned.
+
+        Reading a lossy summary of a comparison is what failed twice here. The
+        row is reported now, so there is nothing to summarise.
+        """
+        reqs = self._agents({"alpha": 6})
+        reqs.append(Request(
+            request_id="solo0", sent_at=T0 + timedelta(seconds=999),
+            model="claude-opus-5", agent="solo", tenant="t", session="ssolo",
+            target_id="anthropic/direct", ttl_requested="5m",
+            usage={"input_tokens": 1_000_000,
+                   "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id="hsolo", role="system", tokens=1_000_000,
+                              index=0)]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        whole = simulate.bake_off(ts.analysable, trace=ts,
+                                  allow_unreconciled=True)
+        self.assertEqual(whole.blocked_because, "",
+                         "the whole run must be DETERMINATE, or a blocker "
+                         "would have caught this and the test proves nothing")
+        self.assertLess(whole.delta_pct, 0,
+                        "the workload must come out negative, or the sign does "
+                        "not flip and there is nothing to hide")
+        out = {b.group: b for b in simulate.bake_off_by_agent(
+            ts.analysable, trace=ts, allow_unreconciled=True)}
+        dropped = [g for g in out if g.startswith("(unreported")]
+        self.assertEqual(len(dropped), 1,
+                         f"a clean but expensive dropped row vanished: "
+                         f"{list(out)}")
+        label = dropped[0]
+        self.assertIn("solo", label)
+        self.assertLess(out[label].delta_pct, 0,
+                        "the dropped row's own verdict is not reported")
+        self.assertTrue(out[label].arms["as-shipped"]["spend"].released,
+                        "the dropped row's spend is not reported either")
+        # And it reaches the render, not just the object.
+        self.assertIn("solo", str(out[label]))
 
     def test_the_invoice_note_is_not_stated_over_an_indeterminate_whole(self):
         """The worst part of that finding: a sentence asserting something the
@@ -2196,7 +2336,10 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         for b in out:
             self.assertIsNone(b.delta_pct, b.group)
             self.assertFalse(b.arms["as-shipped"]["spend"].released, b.group)
-            self.assertIn("not the trace's analysable set", b.verdict)
+            # The kept groups carry the inherited breach and the dropped-rows
+            # group carries its own, in slightly different words. Both name the
+            # analysable set, which is the fact that matters.
+            self.assertIn("analysable set", b.verdict, b.group)
 
     def test_a_defect_inside_one_kept_group_does_not_blank_another(self):
         """The scoping this function spent three rounds learning, guarded
