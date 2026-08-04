@@ -352,9 +352,28 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
         parts.append(f"<p class=note>{e(n)}</p>")
     parts.append("</section>")
 
-    parts.append("<footer>Analysis ran locally. No prompt content left the environment; "
-                 "segments are identified by keyed hash, not content. "
-                 "KCG Consulting LLC</footer></main></body></html>")
+    # Conditional, because the unconditional version was false on the workflow
+    # this project recommends. `run_diagnostic.py` calls `count_tokens.py`
+    # unless `--estimate-only` is passed, and counting sends prompt prefixes to
+    # a tokenizer -- that is the whole point of it, and it is what takes the
+    # segment split from 19.2% median error to 0.2%. A client reading only this
+    # report was told nothing left, in a report produced by a run that sent
+    # their prompts to a provider.
+    #
+    # The analysis half stays true either way and is still worth saying: this
+    # package imports no network library and a test asserts it. What changes is
+    # that the report no longer speaks for a step it did not perform.
+    if a.tokens_counted:
+        privacy = ("Analysis ran locally and this package opens no sockets. "
+                   "Segment sizes here were counted rather than estimated, and "
+                   "counting is a separate step that sends prompt prefixes to a "
+                   "tokenizer endpoint. Segments are identified by keyed hash, "
+                   "not content.")
+    else:
+        privacy = ("Analysis ran locally. No prompt content left the "
+                   "environment; segments are identified by keyed hash, not "
+                   "content.")
+    parts.append(f"<footer>{privacy} KCG Consulting LLC</footer></main></body></html>")
     return "\n".join(parts)
 
 
@@ -705,7 +724,7 @@ def _next_steps(a: Analysis) -> list:
                      "bodies from your gateway and re-run with --from bodies, "
                      "or point the agent at tier-b/capture_proxy.py if you "
                      "cannot export.")
-    elif a.tier is Tier.INFERRED and not getattr(a, "_tokens_counted", True):
+    elif a.tier is Tier.INFERRED and not a.tokens_counted:
         steps.append("Put dollar figures on the structural findings: run "
                      "tier-b/run_diagnostic.py instead, which counts tokens "
                      "first. Segment sizes are estimated here and the estimate "

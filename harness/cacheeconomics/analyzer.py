@@ -131,6 +131,14 @@ class Analysis:
     # The subset of `notes` that qualifies a published figure. Recorded when the
     # note is raised, not recovered from its wording afterwards.
     blocking_notes: list[str] = field(default_factory=list)
+    # Whether segment sizes came from a tokenizer rather than a byte estimate.
+    # Carried because the report makes a claim that depends on it: counting is a
+    # separate step that sends prompt prefixes to a provider, and a report that
+    # says "no prompt content left the environment" is false on the workflow
+    # `run_diagnostic.py` recommends. `report._next_steps` already read
+    # `_tokens_counted` off this object, which nothing ever set, so the branch
+    # that offers counting as a next step could never fire either.
+    tokens_counted: bool = False
 
     @property
     def total_avoidable_month(self) -> money.Figure:
@@ -2014,4 +2022,5 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
                 if _note_blocks_spend(n) or n in set(ts.blocking_notes)]
     return Analysis(ratios=ratios, coverage=ts.coverage, tier=ts.tier,
                     findings=findings, spend=spend, reconciliation=recon,
-                    window_days=window, notes=notes, blocking_notes=blocking)
+                    window_days=window, notes=notes, blocking_notes=blocking,
+                    tokens_counted=bool(tokens_counted))

@@ -966,3 +966,62 @@ class TestRoundFourteen(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheReportDoesNotSpeakForStepsItDidNotRun(unittest.TestCase):
+    """The HTML footer asserted "No prompt content left the environment" on
+    every report, unconditionally.
+
+    That is false on the workflow this project recommends. `run_diagnostic.py`
+    calls `count_tokens.py` unless `--estimate-only` is passed, and counting
+    sends prompt prefixes to a tokenizer -- that is the point of it, and it is
+    what takes the segment split from 19.2% median error to 0.2%. A client
+    reading only the report was told nothing left, in a report produced by a run
+    that had just sent their prompts to a provider.
+
+    The analysis half stays true and is still said: this package imports no
+    network library and `test_cli` asserts it. What changed is that the report
+    stopped speaking for a step it did not perform.
+    """
+
+    def _analysis(self, counted):
+        from dataclasses import replace
+        from cacheeconomics.analyzer import analyze
+        from cacheeconomics.trace import load_jsonl
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "fixtures", "demo-traces.jsonl")
+        a = analyze(load_jsonl(os.path.normpath(path)), invoice_usd=17.45)
+        return replace(a, tokens_counted=counted)
+
+    def _html(self, counted):
+        from cacheeconomics.report import render_html
+        return render_html(self._analysis(counted))
+
+    NOTHING_LEFT = "No prompt content left the environment"
+
+    def test_a_counted_trace_does_not_claim_nothing_left(self):
+        self.assertNotIn(self.NOTHING_LEFT, self._html(True))
+
+    def test_a_counted_trace_says_where_the_prompts_went(self):
+        self.assertIn("counting is a separate step", self._html(True))
+
+    def test_an_estimated_trace_still_makes_the_claim(self):
+        """The other direction. Nothing was sent on this path, and saying so is
+        the honest answer -- a fix that removed the claim everywhere would
+        understate a real property of the tool."""
+        html = self._html(False)
+        self.assertIn(self.NOTHING_LEFT, html)
+        self.assertNotIn("counting is a separate step", html)
+
+    def test_the_counting_flag_is_actually_set_by_the_analyzer(self):
+        """`report._next_steps` read `_tokens_counted` off the Analysis, which
+        nothing ever set, so `getattr(..., True)` always won and the branch
+        offering counting as a next step could never fire. A flag no producer
+        writes is not a flag."""
+        from cacheeconomics.analyzer import analyze
+        from cacheeconomics.trace import load_jsonl
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "fixtures", "demo-traces.jsonl")
+        a = analyze(load_jsonl(os.path.normpath(path)), invoice_usd=17.45)
+        self.assertTrue(hasattr(a, "tokens_counted"))
+        self.assertTrue(a.tokens_counted, "the demo fixture states counted rows")
