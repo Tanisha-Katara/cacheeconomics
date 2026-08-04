@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -593,17 +594,117 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
         self.assertIn("surface was assumed", reason)
         self.assertIn("--target-id", reason)
 
-    def test_a_script_reading_the_json_sees_draft(self):
+    def _payload(self, tmp):
+        a = cli._draft_because_the_surface_was_assumed(
+            self._analysis(tmp, "anthropic/direct"))
+        return json.loads(cli.analysis_json(a, tier_name="USAGE_ONLY",
+                                            coverage=1.0))
+
+    @staticmethod
+    def _money_paths(node, path=""):
+        """Every path in the decoded JSON whose value looks like money.
+
+        A Figure serialises through `str`, so it is either "$..." or
+        "[withheld: ...]", and both count: a withheld figure still has to be
+        identifiable as withheld rather than absent. Plain floats are
+        deliberately not money-like -- `window_days` sits in the same dict.
+
+        Written here rather than imported from `test_invariants`, which owns the
+        general form of this walk. Two copies of a walk is a cost; importing
+        across test modules to share a fixture is a worse one, and that file is
+        another track's.
+        """
+        out = []
+        if isinstance(node, str):
+            if node.startswith("[withheld") or re.fullmatch(
+                    r"\$-?[\d,]+(?:\.\d+)?", node.strip()):
+                out.append(path)
+        elif isinstance(node, dict):
+            for k, v in node.items():
+                if k == "release_state":
+                    continue
+                out.extend(TestAnAssumedSurfaceCannotBePublishedAsReconciled
+                           ._money_paths(v, f"{path}.{k}" if path else k))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                out.extend(TestAnAssumedSurfaceCannotBePublishedAsReconciled
+                           ._money_paths(v, f"{path}[{i}]"))
+        return out
+
+    @staticmethod
+    def _state_for(payload, path):
+        """The release state recorded for the money at `path`, or None.
+
+        Accepts either a sibling `release_state` map keyed by field name or an
+        inline state beside the value; which one a section uses is that
+        section's business, and having neither is the defect.
+        """
+        parts = path.split(".")
+        leaf = parts[-1]
+        top = payload.get("release_state", {})
+        if leaf in top:
+            return top[leaf]
+        node = payload
+        for p in parts[:-1]:
+            if "[" in p:
+                name, idx = p.split("[")
+                node = node.get(name, [])[int(idx.rstrip("]"))]
+            else:
+                node = node.get(p, {})
+            if not isinstance(node, (dict, list)):
+                return None
+        if isinstance(node, dict):
+            local = node.get("release_state", {})
+            if isinstance(local, dict) and leaf in local:
+                return local[leaf]
+            if f"{leaf}_state" in node:
+                return node[f"{leaf}_state"]
+        return None
+
+    def test_the_json_walk_finds_money_outside_the_spend_section(self):
+        """Guard the guard. The previous version of this test read
+        `payload["release_state"]`, which is built from `a.spend` -- so it
+        checked the one section it happened to touch and passed while
+        `reconciliation.computed_usd` and `delta_usd` shipped as bare dollar
+        strings beside it. If the walk only ever found `spend.*`, the assertions
+        below would be the same weak test wearing a stronger name."""
         with tempfile.TemporaryDirectory() as tmp:
-            a = cli._draft_because_the_surface_was_assumed(
-                self._analysis(tmp, "anthropic/direct"))
-        payload = json.loads(cli.analysis_json(a, tier_name="USAGE_ONLY",
-                                               coverage=1.0))
-        states = payload["release_state"]
-        self.assertTrue(states)
-        self.assertNotIn("reconciled", set(states.values()),
-                         "a script cannot tell this from an invoice-checked figure")
-        self.assertIn("draft", set(states.values()))
+            found = self._money_paths(self._payload(tmp))
+        self.assertTrue(found, "no money-like fields found; the walk is vacuous")
+        self.assertTrue([p for p in found if not p.startswith("spend.")],
+                        f"the walk only reached the spend section: {sorted(found)}")
+
+    def test_no_money_field_in_the_json_claims_to_be_reconciled(self):
+        """What this track's fix is responsible for, over the whole payload."""
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._payload(tmp)
+        claimed = sorted(p for p in self._money_paths(payload)
+                         if self._state_for(payload, p) == "reconciled")
+        self.assertEqual(
+            [], claimed,
+            "these say an invoice checked them, over an assumed rate table: "
+            + ", ".join(claimed))
+
+    # KNOWN-FAILING here only: this is finding M2 (`analysis_json` builds
+    # `release_state` from `a.spend` alone), which Track A has already fixed on
+    # main with one `_release_state` helper covering spend, reconciliation and
+    # findings. This worktree predates that fix, so `reconciliation.computed_usd`
+    # and `reconciliation.delta_usd` come back with no state at all. The
+    # underlying Figures *are* draft -- `test_and_the_reconciliation_figures_too`
+    # pins that on the Analysis -- so this asserts the serialiser carries it.
+    # Delete this marker once Track A's `analysis_json` is merged in.
+    @unittest.expectedFailure
+    def test_every_money_field_in_the_json_carries_release_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._payload(tmp)
+        found = self._money_paths(payload)
+        self.assertTrue(found, "no money-like fields found; the check is vacuous")
+        missing = sorted(p for p in found
+                         if self._state_for(payload, p) is None)
+        self.assertEqual(
+            [], missing,
+            "dollar fields a script cannot tell published from withheld: "
+            + ", ".join(missing))
 
     def _exact_invoice(self, root):
         """The invoice this fixture actually reconciles against.

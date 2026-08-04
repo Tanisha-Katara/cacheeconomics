@@ -2022,3 +2022,97 @@ class TestRelocationWillNotRecommendAMechanismForAnUnnamedSurface(unittest.TestC
         """And the guard it was walking around still works when named."""
         m = self._move(model="claude-opus-5", target_id="amazon-bedrock/converse")
         self.assertEqual("blocked", m.risk)
+
+
+class TestAnAssumedSurfaceMustNotReconcileWithoutTheCLI(unittest.TestCase):
+    """The assumed-surface downgrade is a CLI patch, not a property of the analysis.
+
+    `cmd_claude_code` re-releases the figures as DRAFT *after* `analyze` returns,
+    so the protection exists only on that one path. A library caller, a script,
+    or anything emitting JSON without going through the command gets
+    `released_as='reconciled'` over dollars whose rate table was assumed.
+
+    Reproduced with no CLI code in the call at all -- adapter, then analyzer,
+    then an invoice equal to computed spend:
+
+        ts = load_sessions(..., target_id='anthropic/direct',
+                           surface_assumed=True)
+        analyze(ts, invoice_usd=<matching>)
+        -> input_usd released_as='reconciled'
+           if_uncached_usd released_as='reconciled'
+           caching_saved_usd released_as='reconciled'
+
+    The evidence is present and unused: `ts.blocking_notes` already carries
+    "Provider surface assumed to be anthropic/direct", and `analyze` copies it
+    into `Analysis.blocking_notes` -- at analyzer.py:2123, which is 154 lines
+    *after* the release label is decided at analyzer.py:1969.
+    """
+
+    def _fixture(self, tmp):
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "s.jsonl"), "w") as f:
+            for i in range(12):
+                f.write(json.dumps({
+                    "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
+                    "requestId": f"r{i}",
+                    "timestamp": f"2026-07-29T09:{i:02d}:00.000Z",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 100, "output_tokens": 10,
+                        "cache_read_input_tokens": 20_000,
+                        "cache_creation_input_tokens": 1_000,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 1_000,
+                            "ephemeral_1h_input_tokens": 0}}}}) + "\n")
+        return tmp
+
+    def _analyse(self, tmp):
+        """Adapter then analyzer. Deliberately no `cli` import anywhere."""
+        from cacheeconomics.adapters.claude_code import load_sessions
+        ts = load_sessions(root=self._fixture(tmp),
+                           target_id="anthropic/direct", surface_assumed=True)
+        spend = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return ts, analyze(ts, invoice_usd=spend)
+
+    def test_the_evidence_reaches_the_analysis(self):
+        """Not xfail: the adapter's half works, and the fix needs no new input.
+
+        This is the part worth pinning now, because it establishes that the
+        analyzer is not missing information -- only using it too late."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts, a = self._analyse(tmp)
+        self.assertTrue(any("surface assumed" in n.lower()
+                            for n in ts.blocking_notes))
+        self.assertTrue(any("surface assumed" in n.lower()
+                            for n in a.blocking_notes))
+
+    def test_the_gate_really_passes_so_reconciled_is_the_alternative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _ts, a = self._analyse(tmp)
+        self.assertEqual(0.0, a.reconciliation["delta_pct"])
+        self.assertTrue(any(getattr(v, "released", False)
+                            for v in a.spend.values()))
+
+    # KNOWN-FAILING: assigned to Track A. `analyze` decides `released_as` at
+    # analyzer.py:1969 and does not read `ts.blocking_notes` until 2123, so an
+    # assumed pricing input cannot reach the release decision. Track B closed
+    # this on the CLI path only (`cli._draft_because_the_surface_was_assumed`),
+    # which leaves every library caller unprotected. See the spec in Track B's
+    # report for exactly what `analyze` should read and where.
+    #
+    # expectedFailure rather than a red board, matching the convention already
+    # used for the cross-track invariants: a still-broken expectation exits 0 so
+    # CI stays meaningful for other tracks, and the moment it is fixed this
+    # reports "Unexpected success" and forces this marker to be deleted.
+    @unittest.expectedFailure
+    def test_an_assumed_surface_is_never_labelled_reconciled(self):
+        from cacheeconomics.money import RECONCILED, Figure
+        with tempfile.TemporaryDirectory() as tmp:
+            _ts, a = self._analyse(tmp)
+        wrong = sorted(k for k, v in a.spend.items()
+                       if isinstance(v, Figure) and v.released
+                       and v.released_as == RECONCILED)
+        self.assertEqual(
+            [], wrong,
+            "these were published as invoice-checked over an assumed rate "
+            "table, without the CLI in the call: " + ", ".join(wrong))
