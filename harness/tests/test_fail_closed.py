@@ -2244,20 +2244,23 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
                         "cache_creation_input_tokens": 1_000}}}) + "\n")
         return tmp
 
-    def _load(self, tmp, **kw):
+    def _cc(self, tmp, **kw):
+        """The Claude Code loader specifically. Named apart from `_load`, which
+        takes a loader name, because the survey below covers three loaders and a
+        shared one-argument helper is how the inverse check came to cover one."""
         from cacheeconomics.adapters.claude_code import load_sessions
         return load_sessions(root=self._root(tmp),
                              target_id="anthropic/direct", **kw)
 
     def test_an_assumed_surface_names_itself_in_the_field(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ts = self._load(tmp, surface_assumed=True)
+            ts = self._cc(tmp, surface_assumed=True)
         self.assertTrue(ts.requests, "fixture produced no requests")
         self.assertEqual(("provider surface",), tuple(ts.assumed_inputs))
 
     def test_a_stated_surface_assumes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ts = self._load(tmp)
+            ts = self._cc(tmp)
         self.assertTrue(ts.requests, "fixture produced no requests")
         self.assertEqual((), tuple(ts.assumed_inputs))
 
@@ -2266,7 +2269,7 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
         sees in the caveats; the field is what the release gate reads. Replacing
         the note with the field would have moved the disclosure off the page."""
         with tempfile.TemporaryDirectory() as tmp:
-            ts = self._load(tmp, surface_assumed=True)
+            ts = self._cc(tmp, surface_assumed=True)
         self.assertTrue(any("surface assumed" in n.lower()
                             for n in ts.blocking_notes),
                         "the human-readable caveat was dropped")
@@ -2277,7 +2280,7 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
         -- needs no new field and the note downstream can say which one it was.
         A bool could not distinguish two assumptions with different remedies."""
         with tempfile.TemporaryDirectory() as tmp:
-            ts = self._load(tmp, surface_assumed=True)
+            ts = self._cc(tmp, surface_assumed=True)
         self.assertIsInstance(tuple(ts.assumed_inputs), tuple)
         self.assertNotIsInstance(ts.assumed_inputs, bool)
         self.assertTrue(all(isinstance(x, str) for x in ts.assumed_inputs))
@@ -2306,36 +2309,81 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
     # `claude_code` is absent deliberately and is covered by the tests above:
     # its transcripts *structurally* cannot carry a provider field, which is why
     # it is the one loader that may assume -- and it says so.
-    def _every_loader(self, tmp):
-        """`{name: (TraceSet, may_assume)}` over a providerless fixture."""
+    # The exact string a loader records when it supplied the surface itself.
+    # Asserted rather than "non-empty" now that a consumer reads it: `analyze`
+    # names the assumed input in the DRAFT banner, so admitting the wrong one
+    # prints the wrong remedy, and admitting *any* input would let a fabricated
+    # surface satisfy the rule under an unrelated name.
+    SURFACE = "provider surface"
+
+    def _rows(self):
+        """One priceable row per loader, in each loader's own payload shape.
+
+        Priceable is the whole point and the first version was not. Its LiteLLM
+        row carried a top-level `usage` dict, which that adapter does not read
+        -- it prices from `prompt_tokens_details`, `metadata.usage_object` or
+        `response.usage` -- and no `startTime`. Measured: `usage` loaded as
+        `{}`, `has_usage` False, `sent_at` None, 0 of 1 analysable, and the
+        withheld reason came back "no invoice was supplied". So the consequence
+        check passed for that loader without the surface having anything to do
+        with it, and a regression on real StandardLoggingPayload rows would have
+        gone straight through.
+
+        Each row now reaches coverage 1.0 with cache reads and no writes, so the
+        *only* thing standing between it and a published figure is the surface.
+        No writes on purpose: an unprovable write lifetime is its own blocker
+        and would mask the one being tested.
+        """
+        usage = {"input_tokens": 5_000, "output_tokens": 200,
+                 "cache_read_input_tokens": 20_000,
+                 "cache_creation_input_tokens": 0}
+        return {
+            # LiteLLM's own normalised counters, plus the epoch stamp it writes.
+            "load_litellm": {
+                "model": "claude-opus-5",
+                "startTime": 1785312000.0, "endTime": 1785312002.0,
+                "prompt_tokens": 25_000, "completion_tokens": 200,
+                "prompt_tokens_details": {"cached_tokens": 20_000,
+                                          "text_tokens": 5_000}},
+            "load_jsonl": {
+                "request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
+                "model": "claude-opus-5", "segments": [],
+                "usage": dict(usage)},
+            "load_bodies": {
+                "request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
+                "body": {"model": "claude-opus-5",
+                         "messages": [{"role": "user",
+                                       "content": "hello there"}]},
+                "usage": dict(usage)},
+        }
+
+    def _load(self, tmp, name, **surface):
+        """Run one loader over its own row. `surface` is how a caller states one,
+        spelled differently per loader on purpose -- `default_target` for two of
+        them and `target_id` for the third -- which is exactly the variation
+        that let the inverse check cover one loader and miss two."""
         from cacheeconomics.adapters.bodies import load_bodies
         from cacheeconomics.adapters.litellm import load_litellm
         from cacheeconomics.trace import load_jsonl
-        usage = {"input_tokens": 10, "output_tokens": 2,
-                 "cache_read_input_tokens": 0,
-                 "cache_creation_input_tokens": 0}
+        row = dict(self._rows()[name])
+        row.update(surface.pop("row_extra", {}))
+        path = os.path.join(tmp, f"{name}.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps(row) + "\n")
+        if name == "load_litellm":
+            return load_litellm(path, **surface)
+        if name == "load_jsonl":
+            return load_jsonl(path, **surface)
+        return load_bodies(path, key=b"k" * 32, **surface)
 
-        def write(name, row):
-            path = os.path.join(tmp, name)
-            with open(path, "w") as f:
-                f.write(json.dumps(row) + "\n")
-            return path
+    # How each loader is told a surface by its caller. Two spellings, which is
+    # why this is a table rather than a repeated keyword.
+    CALLER_ARG = {"load_litellm": "default_target",
+                  "load_jsonl": "default_target",
+                  "load_bodies": "target_id"}
 
-        litellm_row = {"model": "claude-opus-5", "usage": dict(usage)}
-        jsonl_row = {"request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
-                     "model": "claude-opus-5", "usage": dict(usage),
-                     "segments": []}
-        bodies_row = {"request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
-                      "body": {"model": "claude-opus-5",
-                               "messages": [{"role": "user",
-                                             "content": "hello"}]},
-                      "usage": dict(usage)}
-        return {
-            "load_litellm": load_litellm(write("l.jsonl", litellm_row)),
-            "load_jsonl": load_jsonl(write("j.jsonl", jsonl_row)),
-            "load_bodies": load_bodies(write("b.jsonl", bodies_row),
-                                       key=b"k" * 32),
-        }
+    def _every_loader(self, tmp):
+        return {name: self._load(tmp, name) for name in self._rows()}
 
     def test_every_loader_leaves_a_providerless_row_unattributed(self):
         """The property, not its symptom.
@@ -2362,10 +2410,38 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
                     {UNATTRIBUTED}, surfaces,
                     f"{name} supplied a surface nobody read or stated: {surfaces}")
 
-    def test_and_therefore_publishes_no_dollars_for_it(self):
-        """The consequence that matters. An unattributed surface is registered
-        unpriceable, so the figures stay withheld rather than being priced
-        against a table nobody chose."""
+    def test_each_survey_row_is_priceable_but_for_the_surface(self):
+        """Guard the guard, and this one had already gone wrong.
+
+        "No dollars were published" is true of a row nobody could price for any
+        reason -- a missing timestamp, an unreadable usage shape, an unprovable
+        write lifetime. The claim being made is narrower: this row could have
+        been priced, and the surface is what stopped it. So every row has to
+        reach the analyser intact first.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            loaders = self._every_loader(tmp)
+        for name, ts in loaders.items():
+            with self.subTest(loader=name):
+                a = analyze(ts, allow_unreconciled=True)
+                self.assertTrue(ts.requests, f"{name}: no requests parsed")
+                self.assertEqual(
+                    len(ts.requests), len(ts.analysable),
+                    f"{name}: the row never reached the analyser, so anything "
+                    f"below it holds for a reason unrelated to the surface")
+                self.assertEqual(1.0, a.coverage["fraction"], f"{name} coverage")
+                self.assertTrue(all(r.sent_at for r in ts.requests),
+                                f"{name}: undated rows are unpriceable anyway")
+
+    def test_and_withholds_dollars_because_of_the_surface(self):
+        """The consequence, attributed to the right cause.
+
+        Asserting only that nothing was released let the LiteLLM row pass while
+        it was in fact unreadable: `usage` came back `{}`, `sent_at` None, 0 of
+        1 analysable, and the stated reason was "no invoice was supplied". The
+        reason is now part of the assertion, so the check cannot be satisfied by
+        a row that failed for some other reason entirely.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             loaders = self._every_loader(tmp)
         for name, ts in loaders.items():
@@ -2377,6 +2453,11 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
                     [], released,
                     f"{name} published dollars over an unattributed surface: "
                     + ", ".join(released))
+                why = getattr(a.spend["input_usd"], "withheld_because", "")
+                self.assertIn(
+                    "surface is not stated", why,
+                    f"{name} withheld for some other reason, so this proves "
+                    f"nothing about the surface: {why[:160]!r}")
 
     def test_a_loader_that_supplies_a_surface_has_to_admit_it(self):
         """The rule stated positively, over the same fixture.
@@ -2399,29 +2480,61 @@ class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
             with self.subTest(loader=name):
                 supplied = {r.target_id for r in ts.requests} - {UNATTRIBUTED}
                 if supplied:
-                    self.assertTrue(
+                    # The exact name, not merely a non-empty tuple. A consumer
+                    # prints it as the remedy, so admitting a fabricated surface
+                    # under some other input's name would satisfy a truthiness
+                    # check and still tell the reader the wrong thing to fix.
+                    self.assertIn(
+                        self.SURFACE,
                         tuple(getattr(ts, "assumed_inputs", ()) or ()),
                         f"{name} supplied {sorted(supplied)} for a row that "
-                        f"named no provider, and did not record it as assumed")
+                        f"named no provider, and did not record it as an "
+                        f"assumed {self.SURFACE!r}")
 
-    def test_a_caller_supplied_surface_is_not_an_assumption(self):
-        """The other direction, so the rule above cannot be satisfied by making
-        every loader claim to assume. A surface the caller states is stated."""
-        from cacheeconomics.trace import load_jsonl
+    def test_a_caller_stated_surface_is_not_an_assumption_in_any_loader(self):
+        """The inverse, over every loader that accepts one.
+
+        It ran through `load_jsonl` alone, so `load_litellm(default_target=...)`
+        and `load_bodies(target_id=...)` were free to mark a caller-stated
+        surface as assumed -- and once a consumer gates on this field, that
+        downgrades a legitimate report to DRAFT. The two spellings of the
+        argument are exactly why one loader got checked and two did not, so the
+        spelling now comes from a table.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "j.jsonl")
-            with open(path, "w") as f:
-                f.write(json.dumps({
-                    "request_id": "r0", "sent_at": "2026-07-29T09:00:00Z",
-                    "model": "claude-opus-5", "segments": [],
-                    "usage": {"input_tokens": 10, "output_tokens": 2,
-                              "cache_read_input_tokens": 0,
-                              "cache_creation_input_tokens": 0}}) + "\n")
-            ts = load_jsonl(path, default_target="anthropic/direct")
+            for name, arg in self.CALLER_ARG.items():
+                with self.subTest(loader=name, arg=arg):
+                    ts = self._load(tmp, name, **{arg: "anthropic/direct"})
+                    self.assertEqual({"anthropic/direct"},
+                                     {r.target_id for r in ts.requests},
+                                     f"{name} ignored a caller-stated surface")
+                    self.assertEqual(
+                        (), tuple(getattr(ts, "assumed_inputs", ()) or ()),
+                        f"{name} recorded a caller-stated surface as assumed, "
+                        f"which would downgrade a correct report to DRAFT")
+
+    def test_a_row_stated_surface_is_not_an_assumption_either(self):
+        """The third way a surface arrives: read from the row itself. LiteLLM is
+        the loader that can do this, through `custom_llm_provider`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._load(tmp, "load_litellm",
+                            row_extra={"custom_llm_provider": "anthropic"})
         self.assertEqual({"anthropic/direct"},
-                         {r.target_id for r in ts.requests})
+                         {r.target_id for r in ts.requests},
+                         "the row's own provider field was not read")
         self.assertEqual((), tuple(getattr(ts, "assumed_inputs", ()) or ()),
-                         "a surface the caller stated is not an assumption")
+                         "a surface read from the row is not an assumption")
+
+    def test_the_admission_names_the_surface_and_only_the_surface(self):
+        """The exact contract, on the one loader that legitimately assumes.
+
+        `analyze` renders this into "the <input> used to price this trace was
+        assumed", so the string is user-visible and a consumer keys on it. A
+        second entry appearing here would be a second assumption nobody made.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._cc(tmp, surface_assumed=True)
+        self.assertEqual((self.SURFACE,), tuple(ts.assumed_inputs))
 
     def test_the_default_survives_a_field_written_with_a_factory(self):
         """Why `assumed_inputs` is a plain default and not `default_factory`.
