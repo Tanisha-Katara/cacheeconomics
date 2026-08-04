@@ -65,12 +65,14 @@ class Figure:
     and those are how a withheld number actually escaped in practice.
     """
 
-    __slots__ = ("_usd", "basis", "released", "withheld_because", "released_as")
+    __slots__ = ("_usd", "basis", "released", "withheld_because", "released_as",
+                 "projected")
 
     def __init__(self, usd: float, basis: str = MODELED, *,
                  released: bool = False,
                  withheld_because: str = "not released",
-                 released_as: str = ""):
+                 released_as: str = "",
+                 projected: bool = False):
         if basis not in BASES:
             raise ValueError(f"basis must be one of {BASES}, got {basis!r}")
         if released_as and released_as not in RELEASES:
@@ -80,6 +82,20 @@ class Figure:
         object.__setattr__(self, "basis", basis)
         object.__setattr__(self, "released", bool(released))
         object.__setattr__(self, "withheld_because", withheld_because)
+        # Whether this number was extrapolated past the observed window.
+        #
+        # It exists to make a class *enumerable*. The projection floor was
+        # written as a check one caller performed, so "every monthly figure is
+        # gated" was a sentence in a commit message with nothing able to
+        # contradict it -- and it was false: the headline monthly spend was
+        # gated while six per-finding monthly figures were not. A flag set at
+        # the single extrapolation site turns that claim into something a test
+        # can walk the object graph and check, which is the only reason to
+        # widen this class.
+        #
+        # Set by `_monthly`, never by hand at a call site. A caller that has to
+        # remember is the thing being replaced.
+        object.__setattr__(self, "projected", bool(projected))
         # How it earned release, not merely that it did. `released` was a bare
         # bool, so a figure released by `--allow-unreconciled` was byte-identical
         # to one an invoice had checked -- same value, same basis, same string --
@@ -100,22 +116,26 @@ class Figure:
         return (self._usd == other._usd and self.basis == other.basis
                 and self.released == other.released
                 and self.withheld_because == other.withheld_because
-                and self.released_as == other.released_as)
+                and self.released_as == other.released_as
+                and self.projected == other.projected)
 
     def __hash__(self):
-        return hash((self._usd, self.basis, self.released, self.released_as))
+        return hash((self._usd, self.basis, self.released, self.released_as,
+                     self.projected))
 
     def __reduce__(self):
         """Pickle through the constructor, not through a state dict."""
         return (Figure, (self._usd, self.basis),
                 {"released": self.released,
                  "withheld_because": self.withheld_because,
-                 "released_as": self.released_as})
+                 "released_as": self.released_as,
+                 "projected": self.projected})
 
     def __setstate__(self, state):
         object.__setattr__(self, "released", state["released"])
         object.__setattr__(self, "withheld_because", state["withheld_because"])
         object.__setattr__(self, "released_as", state.get("released_as", ""))
+        object.__setattr__(self, "projected", state.get("projected", False))
 
     def raw(self) -> float:
         """The underlying number, gate or no gate.
@@ -145,7 +165,8 @@ class Figure:
         return Figure(self._usd, self.basis, released=bool(ok),
                       withheld_because=("" if ok
                                         else (because or self.withheld_because)),
-                      released_as=(as_ or RECONCILED) if ok else "")
+                      released_as=(as_ or RECONCILED) if ok else "",
+                      projected=self.projected)
 
     def __float__(self) -> float:
         return self.amount
@@ -186,9 +207,20 @@ class Figure:
         Needed because the sign is often carried by the surrounding words: a
         report says "caching COST $0.83", not "caching COST $-0.83". Dropping
         abs() during a refactor produced exactly that sentence.
+
+        Carries `released_as` and `projected`, which it did not. Measured
+        before this line changed: `abs(Figure(-12.34).release(True,
+        as_=DRAFT))` came back `released_as='reconciled'`, so taking the
+        magnitude of a draft figure laundered it into one an invoice had
+        checked. It did not surface a wrong banner today only because
+        `_is_draft` reads `a.spend` rather than this transient copy -- the
+        defect was one caller away from mattering, and "a `Figure` method
+        silently drops provenance" is the same shape as everything else in
+        this file's history.
         """
         return Figure(abs(self._usd), self.basis, released=self.released,
-                      withheld_because=self.withheld_because)
+                      withheld_because=self.withheld_because,
+                      released_as=self.released_as, projected=self.projected)
 
 
 def measured(usd: float) -> Figure:

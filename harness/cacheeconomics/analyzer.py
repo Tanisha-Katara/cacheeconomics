@@ -172,8 +172,13 @@ class Analysis:
         # as checked as its weakest input.
         as_ = (money.DRAFT if any(p.released_as == money.DRAFT for p in parts)
                else money.RECONCILED)
+        # Projected if any part is, discovered rather than asserted. Every part
+        # comes from `_monthly` today so this is always True in practice, but
+        # reading it off the parts means a future non-extrapolated contributor
+        # does not silently mark the total as a projection, and vice versa.
         return money.Figure(total, money.MODELED, released=ok,
-                            withheld_because=why, released_as=as_ if ok else "")
+                            withheld_because=why, released_as=as_ if ok else "",
+                            projected=any(p.projected for p in parts))
 
 
 def _when(r: Request) -> str | None:
@@ -317,8 +322,13 @@ def _monthly(amount: float, window_days: float | None) -> money.Figure | None:
     """
     if not window_days or window_days <= 0:
         return None
+    # `projected=True` is set here and nowhere else. This is the single site in
+    # the package that multiplies a measured amount by a window ratio, so
+    # tagging it here means every extrapolated figure carries the mark without
+    # any caller having to know it should, and a test can find them all.
     return money.Figure(amount * (30.0 / window_days), money.MODELED,
-                        released=False, withheld_because="not yet reconciled")
+                        released=False, withheld_because="not yet reconciled",
+                        projected=True)
 
 
 # --- diagnosis rules -------------------------------------------------------
