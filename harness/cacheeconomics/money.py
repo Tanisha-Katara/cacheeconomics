@@ -27,6 +27,11 @@ VERIFIED = "verified"    # observed in production after a change shipped
 
 BASES = (MEASURED, MODELED, VERIFIED)
 
+# How a released figure earned its release. Withheld figures carry "".
+RECONCILED = "reconciled"   # checked against an invoice the client supplied
+DRAFT = "draft"             # released by --allow-unreconciled; not for forwarding
+RELEASES = (RECONCILED, DRAFT)
+
 
 class WithheldFigure(Exception):
     """Raised when an unreleased figure is used as a number."""
@@ -60,17 +65,28 @@ class Figure:
     and those are how a withheld number actually escaped in practice.
     """
 
-    __slots__ = ("_usd", "basis", "released", "withheld_because")
+    __slots__ = ("_usd", "basis", "released", "withheld_because", "released_as")
 
     def __init__(self, usd: float, basis: str = MODELED, *,
                  released: bool = False,
-                 withheld_because: str = "not released"):
+                 withheld_because: str = "not released",
+                 released_as: str = ""):
         if basis not in BASES:
             raise ValueError(f"basis must be one of {BASES}, got {basis!r}")
+        if released_as and released_as not in RELEASES:
+            raise ValueError(f"released_as must be one of {RELEASES}, "
+                             f"got {released_as!r}")
         object.__setattr__(self, "_usd", usd)
         object.__setattr__(self, "basis", basis)
         object.__setattr__(self, "released", bool(released))
         object.__setattr__(self, "withheld_because", withheld_because)
+        # How it earned release, not merely that it did. `released` was a bare
+        # bool, so a figure released by `--allow-unreconciled` was byte-identical
+        # to one an invoice had checked -- same value, same basis, same string --
+        # and no renderer *could* mark one and not the other. Measured on the
+        # demo trace: both rendered "$229" with nothing to tell them apart.
+        object.__setattr__(self, "released_as",
+                           (released_as or RECONCILED) if released else "")
 
     def __setattr__(self, name, value):
         raise AttributeError(
@@ -83,20 +99,23 @@ class Figure:
             return NotImplemented
         return (self._usd == other._usd and self.basis == other.basis
                 and self.released == other.released
-                and self.withheld_because == other.withheld_because)
+                and self.withheld_because == other.withheld_because
+                and self.released_as == other.released_as)
 
     def __hash__(self):
-        return hash((self._usd, self.basis, self.released))
+        return hash((self._usd, self.basis, self.released, self.released_as))
 
     def __reduce__(self):
         """Pickle through the constructor, not through a state dict."""
         return (Figure, (self._usd, self.basis),
                 {"released": self.released,
-                 "withheld_because": self.withheld_because})
+                 "withheld_because": self.withheld_because,
+                 "released_as": self.released_as})
 
     def __setstate__(self, state):
         object.__setattr__(self, "released", state["released"])
         object.__setattr__(self, "withheld_because", state["withheld_because"])
+        object.__setattr__(self, "released_as", state.get("released_as", ""))
 
     def raw(self) -> float:
         """The underlying number, gate or no gate.
@@ -116,11 +135,17 @@ class Figure:
                 f"arithmetic.")
         return self._usd
 
-    def release(self, ok: bool, because: str = "") -> "Figure":
-        """The only way to change release state, and it makes a new Figure."""
+    def release(self, ok: bool, because: str = "", *, as_: str = "") -> "Figure":
+        """The only way to change release state, and it makes a new Figure.
+
+        `as_` records *how* it was released. Defaults to RECONCILED, because
+        that is what every caller meant before the distinction existed and a
+        silent default of DRAFT would relabel every honest figure.
+        """
         return Figure(self._usd, self.basis, released=bool(ok),
                       withheld_because=("" if ok
-                                        else (because or self.withheld_because)))
+                                        else (because or self.withheld_because)),
+                      released_as=(as_ or RECONCILED) if ok else "")
 
     def __float__(self) -> float:
         return self.amount
@@ -193,11 +218,12 @@ def draft_override_applies(invoice_supplied: bool, allow_unreconciled: bool) -> 
     return allow_unreconciled and not invoice_supplied
 
 
-def release_map(mapping: dict, ok: bool, because: str = "") -> dict:
+def release_map(mapping: dict, ok: bool, because: str = "", *,
+                as_: str = "") -> dict:
     """Release every Figure in a dict, leaving non-Figures alone.
 
     Release is one decision applied to everything at once. Doing it per output
     is what produced two renderers that disagreed about the same gate.
     """
-    return {k: (v.release(ok, because) if isinstance(v, Figure) else v)
+    return {k: (v.release(ok, because, as_=as_) if isinstance(v, Figure) else v)
             for k, v in mapping.items()}

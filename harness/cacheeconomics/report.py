@@ -131,6 +131,23 @@ def _usd(v):
     return f"${v:,.2f}"
 
 
+def _is_draft(a: Analysis) -> bool:
+    """Does this analysis carry figures released without an invoice?
+
+    Read off the figures rather than off the notes. Matching a note by its text
+    is how the HTML and text renderers came to disagree: one searched the notes
+    and the other rendered them wherever they happened to sit.
+    """
+    from .money import DRAFT, Figure
+    return any(isinstance(v, Figure) and v.released_as == DRAFT
+               for v in a.spend.values())
+
+
+def _draft_reason(a: Analysis) -> str:
+    return next((n for n in a.notes if n.startswith("DRAFT")),
+                "Figures were released without invoice reconciliation.")
+
+
 def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
     e = html.escape
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -251,6 +268,22 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
         f"<div><span>Ingest tier</span><span>{e(str(a.tier))}</span></div>",
         "</div></header>",
     ]
+    # Before the hero, and therefore before any dollar figure. This used to
+    # arrive with the ordinary notes in the Standing section: measured on the
+    # demo trace, the first "$" was at character 6,554 and the first "DRAFT" at
+    # 14,510, so a forwarded report read as client-ready for eight thousand
+    # characters. The text renderer already led with it; only HTML did not,
+    # which is the twin-path shape one more time.
+    #
+    # Inserted rather than rendered as an empty string when absent, so a
+    # reconciled report is byte-identical to what it was.
+    if _is_draft(a):
+        # Index 4: immediately after `</head><body><main class=report>` and
+        # before `<header class=hero>`. Index 1 put a div inside <head>, which
+        # renders nowhere -- a stamp that is present in the source and invisible
+        # on the page is worse than no stamp, because it passes a substring test.
+        parts.insert(4, f"<div class=gate><strong>DRAFT — not for external "
+                        f"use.</strong> {e(_draft_reason(a))}</div>")
 
     parts.append("<section class=verdict><div>")
     parts.append("<div class=label>Executive readout</div>")

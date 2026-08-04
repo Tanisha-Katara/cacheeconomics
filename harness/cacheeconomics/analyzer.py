@@ -112,10 +112,16 @@ class Finding:
     def __str__(self):
         return self.describe()
 
-    def released(self, ok: bool, because: str = "") -> "Finding":
+    def released(self, ok: bool, because: str = "", *, as_: str = "") -> "Finding":
+        """`as_` threads release provenance through, so a finding's dollar
+        figure is marked the same way the totals are. Releasing the spend map
+        as DRAFT and leaving every finding saying RECONCILED would put both
+        states in one report -- the same fix-one-site-leave-the-rest shape this
+        distinction exists to expose."""
         if self.avoidable_usd_month is None:
             return self
-        return replace(self, avoidable_usd_month=self.avoidable_usd_month.release(ok, because))
+        return replace(self, avoidable_usd_month=self.avoidable_usd_month.release(
+            ok, because, as_=as_))
 
 
 @dataclass
@@ -158,7 +164,16 @@ class Analysis:
         why = "" if ok else next((p.withheld_because for p in parts
                                   if not p.released and p.withheld_because),
                                  "no priceable findings" if not parts else "not released")
-        return money.Figure(total, money.MODELED, released=ok, withheld_because=why)
+        # And its release *provenance*, on the same reasoning: a total built
+        # from draft parts is a draft. Constructing this Figure fresh made it
+        # default to RECONCILED, so a --allow-unreconciled run put a
+        # draft-marked spend map and findings beside a reconciled-looking
+        # headline. DRAFT wins if any part is a draft, because a total is only
+        # as checked as its weakest input.
+        as_ = (money.DRAFT if any(p.released_as == money.DRAFT for p in parts)
+               else money.RECONCILED)
+        return money.Figure(total, money.MODELED, released=ok,
+                            withheld_because=why, released_as=as_ if ok else "")
 
 
 def _when(r: Request) -> str | None:
@@ -1889,11 +1904,15 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     # over a trace that had dropped a row or could not see one's cost. Fixing a
     # gate and not its override is the same defect as fixing a guard and not its
     # twin, which is this branch's most-repeated shape.
+    # Reconciled unless the override below says otherwise. A silent default of
+    # DRAFT would relabel every invoice-checked figure in the product.
+    released_as = money.RECONCILED
     if (not gate_ok and money.draft_override_applies(recon is not None, allow_unreconciled)
             and not unprovable and not unpriceable_models
             and not unpriceable_surfaces and not undated
             and not skipped_rows and not blind_rows and not failed_billed):
         gate_ok = True
+        released_as = money.DRAFT
         notes.insert(0, "DRAFT — figures released without invoice reconciliation. "
                         "Not for external use: these numbers have not been tied to a "
                         "provider invoice and may not survive one.")
@@ -1994,10 +2013,10 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     released = []
     for f in findings:
         if f.structural and not structure_trusted:
-            released.append(replace(f.released(False, struct_why),
+            released.append(replace(f.released(False, struct_why, as_=released_as),
                                     confidence="low", severity="medium"))
         else:
-            released.append(f.released(gate_ok, why))
+            released.append(f.released(gate_ok, why, as_=released_as))
     findings = released
     if not structure_trusted and any(f.structural for f in findings):
         notes.append(
@@ -2011,7 +2030,7 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         "caching_saved_usd": money.Figure(uncached_total - spend_total, money.MEASURED),
         "monthly_input_usd": _monthly(spend_total, window),
         "window_days": window,
-    }, gate_ok, why)
+    }, gate_ok, why, as_=released_as)
 
     # Classified once, here, where every note has been collected and the code
     # still knows why each was raised. Renderers read the field; none of them

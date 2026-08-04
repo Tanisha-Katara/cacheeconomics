@@ -1025,3 +1025,75 @@ class TestTheReportDoesNotSpeakForStepsItDidNotRun(unittest.TestCase):
         a = analyze(load_jsonl(os.path.normpath(path)), invoice_usd=17.45)
         self.assertTrue(hasattr(a, "tokens_counted"))
         self.assertTrue(a.tokens_counted, "the demo fixture states counted rows")
+
+
+class TestADraftFigureIsNotADollarFigureThatWasChecked(unittest.TestCase):
+    """`Figure.release(True)` recorded only that a figure was released, so one
+    released by `--allow-unreconciled` was byte-identical to one an invoice had
+    checked: same value, same basis, same string.
+
+    Measured on the demo trace, both rendered "$229" with nothing to tell them
+    apart, so no renderer *could* mark one and not the other. And HTML put the
+    first "$" at character 6,554 with the first "DRAFT" at 14,510 -- a forwarded
+    report read as client-ready for eight thousand characters. The text renderer
+    already led with the stamp; only HTML did not.
+    """
+
+    def _a(self, **kw):
+        from cacheeconomics.analyzer import analyze
+        from cacheeconomics.trace import load_jsonl
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "fixtures", "demo-traces.jsonl")
+        return analyze(load_jsonl(os.path.normpath(path)), **kw)
+
+    def test_the_two_release_states_are_distinguishable(self):
+        from cacheeconomics.money import DRAFT, RECONCILED
+        d = self._a(allow_unreconciled=True).spend["input_usd"]
+        r = self._a(invoice_usd=17.45).spend["input_usd"]
+        self.assertEqual(d.released_as, DRAFT)
+        self.assertEqual(r.released_as, RECONCILED)
+        self.assertTrue(d.released and r.released)
+        self.assertNotEqual(d, r)
+
+    def test_every_figure_in_a_draft_run_agrees(self):
+        """Releasing the spend map as draft while findings said reconciled
+        would put both states in one report -- the fix-one-site-leave-the-rest
+        shape this distinction exists to expose."""
+        from cacheeconomics.money import DRAFT
+        a = self._a(allow_unreconciled=True)
+        states = {v.released_as for v in a.spend.values()
+                  if hasattr(v, "released_as") and v.released}
+        states |= {f.avoidable_usd_month.released_as for f in a.findings
+                   if f.avoidable_usd_month and f.avoidable_usd_month.released}
+        states.add(a.total_avoidable_month.released_as)
+        self.assertEqual(states, {DRAFT})
+
+    def test_html_stamps_the_draft_before_any_dollar(self):
+        """Inside <body>, not merely earlier in the file.
+
+        The first version of this test asserted only that DRAFT preceded the
+        first "$", and passed while the banner sat inside <head> -- present in
+        the source, rendered nowhere. A stamp that satisfies a substring test
+        and is invisible on the page is worse than no stamp.
+        """
+        from cacheeconomics.report import render_html
+        h = render_html(self._a(allow_unreconciled=True))
+        stamp, dollar, body = h.find("DRAFT"), h.find("$"), h.find("<body")
+        self.assertGreater(stamp, body, "the banner is not inside <body>")
+        self.assertLess(stamp, dollar)
+        self.assertIn("not for external use", h.lower())
+
+    def test_a_reconciled_report_carries_no_draft_banner(self):
+        """The other direction: stamping everything would make the stamp
+        meaningless."""
+        from cacheeconomics.report import render_html
+        self.assertNotIn("DRAFT", render_html(self._a(invoice_usd=17.45)))
+
+    def test_the_json_output_carries_the_state_for_machines(self):
+        """A script reading --format json saw only strings and could not tell a
+        draft figure from an invoice-checked one."""
+        from cacheeconomics.money import DRAFT
+        a = self._a(allow_unreconciled=True)
+        states = {k: v.released_as for k, v in a.spend.items()
+                  if hasattr(v, "released_as")}
+        self.assertIn(DRAFT, states.values())

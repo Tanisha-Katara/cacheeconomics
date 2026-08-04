@@ -173,6 +173,12 @@ def cmd_analyze(args) -> int:
             "coverage": ts.coverage,
             "window_days": a.window_days,
             "spend": {k: str(v) for k, v in a.spend.items()},
+            # A script reading this saw only strings and could not tell a
+            # draft figure from an invoice-checked one. The state is the
+            # machine-readable half of the DRAFT banner.
+            "release_state": {k: getattr(v, "released_as", "")
+                              for k, v in a.spend.items()
+                              if hasattr(v, "released_as")},
             "reconciliation": _json_safe(a.reconciliation),
             "findings": [{"code": f.code, "severity": f.severity,
                           "title": f.title, "confidence": f.confidence,

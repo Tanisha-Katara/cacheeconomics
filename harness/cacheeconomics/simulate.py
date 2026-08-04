@@ -785,6 +785,11 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     spend_ok = not misscaled and not omitted and not excluded_billed and (
         reconciled is True
         or money.draft_override_applies(reconciled is not None, allow_unreconciled))
+    # Which of those two released it. `bakeoff --allow-unreconciled` printed
+    # per-arm dollar amounts with no draft marker anywhere, so the one surface
+    # that puts several dollar figures side by side was also the one that never
+    # said they were unchecked.
+    spend_as = (money.RECONCILED if reconciled is True else money.DRAFT)
     if excluded_billed:
         spend_why = (
             "the trace carries billed rows that no arm could model ("
@@ -810,7 +815,8 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                      f"this is a subtotal and not the workload's spend")
     for arms_ in (pess, opt):
         for _p, _a in arms_.items():
-            arms_[_p] = money.release_map(_a, spend_ok, spend_why)
+            arms_[_p] = money.release_map(_a, spend_ok, spend_why,
+                                          as_=spend_as)
 
     # Rows excluded before the arms ever ran belong in this branch for exactly
     # the reason stated above it: the comparison describes whatever was left,
