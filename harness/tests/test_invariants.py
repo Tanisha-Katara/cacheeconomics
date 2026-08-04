@@ -238,7 +238,19 @@ def short_window_analysis():
                     usage={"input_tokens": 0,
                            "cache_creation_input_tokens": 100_000,
                            "cache_read_input_tokens": 0},
-                    segments=[], agent="a", ttl_requested="5m")
+                    segments=[], agent="a", ttl_requested="5m",
+                    # Named explicitly, not inherited from a default. Once
+                    # `Request.target_id` stopped defaulting to a real surface,
+                    # these requests became unpriceable and the fixture's spend
+                    # fell to $0.00 with `delta_pct` None -- so every figure was
+                    # withheld for the wrong reason and INV-1 reported
+                    # "unexpected success" while checking nothing.
+                    #
+                    # `test_the_fixture_is_actually_below_the_floor` caught it
+                    # by failing on `None != 0.0`, which is the entire reason
+                    # that guard exists: it fails loudly instead of letting the
+                    # invariant above it go quietly green.
+                    target_id="anthropic/direct")
             for i in range(2)]
     ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY)
     spend = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()

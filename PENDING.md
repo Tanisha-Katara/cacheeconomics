@@ -83,7 +83,8 @@ this file exists to record, occurring in the file that records it. Caught by
 external review, not by me.
 
 **Measured, current:** INV-4 walks the package recursively via
-`pkgutil.walk_packages` and inspects 164 callables. Eight default `target_id`
+`pkgutil.walk_packages`, unwraps classmethod/staticmethod/functools
+descriptors, and inspects 165 callables. Eight default `target_id`
 to the named surface `'anthropic/direct'`:
 
     adapters.claude_code.load_sessions
@@ -119,8 +120,58 @@ worst overestimate.
 be 214 at the measured worst overestimate, well below 512. The ±10% band spans
 540–660 and never straddles 512, so it does not even abstain.
 
-**Status: IN FLIGHT for `check_minimum`** (Track C, finding L3). MIN-1 and
+**Status: IN FLIGHT for `check_minimum`** (Track B, finding L3 — the track
+split moved `checks.py` to B when the surface-default class widened). MIN-1 and
 RT-MIN inherit the same thinness and are **not** covered by that fix.
 
 **Caveat carried forward:** `ESTIMATOR_WORST_OVERESTIMATE = 2.81` rests on 26
 prefixes over six bodies. It is a floor on the error, not a proof of its bound.
+
+---
+
+## 7. `sweep_report.py` derives `-counted.jsonl` with a naive `str.replace`
+
+`counted()` at `tier-b/sweep_report.py:37` is `path.replace(".jsonl",
+"-counted.jsonl")`, which rewrites EVERY occurrence. `run_diagnostic._counted_path`
+had the identical bug and was fixed; this copy was not.
+
+**Measured:** input `run.jsonl.bak/trace.jsonl` becomes
+`run-counted.jsonl.bak/trace-counted.jsonl` — the directory component is
+corrupted, so the tool reads from or writes to a path that is not the one
+intended.
+
+**Why not fixed now:** outside Track D's assigned files, and this is a
+twin-path defect whose whole lesson is that fixing one copy silently is what
+created it. The two derivations should become ONE function both scripts call,
+which is a change to two files and needs its own reproduction.
+
+**Contained, not urgent:** the new `.gitignore` rule `*-counted.*` covers the
+output wherever it lands, so this is a correctness bug, not an egress one.
+
+---
+
+## 8. Five shipped registry surfaces record no breakpoint budget or lookback
+
+**Measured** against `harness/cacheeconomics/data/providers.json`, 8 surfaces:
+
+    amazon-bedrock/converse      lookback_blocks = null
+    openai/direct                max_breakpoints = null, lookback_blocks = null
+    openai/bedrock               both NOT RECORDED
+    deepseek/direct              lookback_blocks NOT RECORDED
+    google/gemini-explicit       both NOT RECORDED
+
+Until Track C's fix these gaps disabled live checks **in silence** — the
+operator saw a quiet dashboard and read it as healthy. After it, they emit a
+low-severity `RT-NOSURFACE` naming the missing key. That is the correct
+behaviour and it is still not the same as knowing the values.
+
+**Deliberately NOT fixed by inventing values.** This repo's rule is that a
+registry row carries a dated source and a contested row is never published as
+fact. Filling five rows with plausible numbers to silence an alert is precisely
+the failure this project exists to avoid, and it would be undetectable
+afterwards.
+
+**What picking this up looks like:** find each value in the provider's own
+documentation, record it with the source and the date observed, and only then
+does the alert go quiet — because the answer exists, not because the question
+was suppressed.
