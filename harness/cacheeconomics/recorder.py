@@ -130,6 +130,23 @@ class Recorder:
         self.target_id = target_id
         self._lock = threading.Lock()
         self._n = 0
+        # A previous process killed between `write` and `flush` leaves the last
+        # row without its newline. Appending onto that joins this run's first
+        # row to the broken one, so ingest drops a single unparseable line and
+        # loses both. Each row is fsynced, so the window is small -- but this
+        # appends across restarts, which is exactly when it is not zero.
+        #
+        # Terminated rather than refused: the half-row is already unrecoverable,
+        # and a newline costs nothing while keeping every row of this run.
+        try:
+            if os.path.exists(path) and os.path.getsize(path):
+                with open(path, "rb") as f:
+                    f.seek(-1, 2)
+                    if f.read(1) != b"\n":
+                        with open(path, "a") as fix:
+                            fix.write("\n")
+        except OSError:
+            pass
 
     def capture(self, request: dict, *, agent: str = "unknown",
                 session: str | None = None) -> Capture:

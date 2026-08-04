@@ -1177,3 +1177,86 @@ class TestTheDiagnosticCannotOverwriteItsOwnInput(unittest.TestCase):
             env=dict(os.environ, ANTHROPIC_API_KEY="test"))
         self.assertIn("ORIGINAL-CAPTURE", open(src).read(),
                       "the diagnostic overwrote the capture it was given")
+
+
+class TestAppendingOntoATruncatedTailLosesNothingExtra(unittest.TestCase):
+    """A capture killed mid-write leaves its last row without a newline.
+
+    Appending straight onto that joins the new run's first row to the broken
+    one, so ingest drops a single unparseable line and *both* rows are lost --
+    and `capture_run` cannot help, because the row carrying it never parses.
+    Measured before the fix: one parseable row out of three written.
+
+    Terminated rather than refused. The stale half-row is already
+    unrecoverable, so refusing makes an operator hand-repair a file to get back
+    a row that no longer exists, while a newline costs nothing and keeps every
+    row of the resumed run. Ingest already tolerates and counts one unparseable
+    line.
+    """
+
+    def _truncated(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "cap.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"request_id": "r1", "capture_run": "aaa"}) + "\n")
+            f.write('{"request_id": "r2", "capt')      # killed here
+        return p
+
+    @staticmethod
+    def _counts(path):
+        good = bad = 0
+        for line in open(path):
+            try:
+                json.loads(line)
+                good += 1
+            except ValueError:
+                bad += 1
+        return good, bad
+
+    def test_the_recorder_repairs_the_tail_on_construction(self):
+        from cacheeconomics.recorder import Recorder
+        p = self._truncated()
+        Recorder(p, key=b"k" * 32)
+        with open(p, "a") as f:
+            f.write(json.dumps({"request_id": "r3"}) + "\n")
+        good, bad = self._counts(p)
+        self.assertEqual((good, bad), (2, 1),
+                         "the resumed run's row was swallowed by the broken one")
+
+    def test_the_recorder_leaves_a_clean_file_alone(self):
+        """The other direction: no spurious blank line on a healthy file."""
+        from cacheeconomics.recorder import Recorder
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "clean.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"request_id": "r1"}) + "\n")
+        before = open(p).read()
+        Recorder(p, key=b"k" * 32)
+        self.assertEqual(open(p).read(), before)
+
+    def test_a_missing_file_is_not_created_by_the_check(self):
+        from cacheeconomics.recorder import Recorder
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "nope.jsonl")
+        Recorder(p, key=b"k" * 32)
+        self.assertFalse(os.path.exists(p))
+
+    def test_the_proxy_does_the_same_before_appending(self):
+        """Same class, other member. Driven through the real command."""
+        p = self._truncated()
+        # Popen, not run(): the proxy serves forever, so a timeout on run()
+        # kills the test rather than the server.
+        proc = subprocess.Popen(
+            [sys.executable, "-B", os.path.join(TIER_B, "capture_proxy.py"),
+             "--out", p, "--append", "--port", str(_ProxyCase._free_port()),
+             "--upstream", "http://127.0.0.1:1"],
+            stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        self.addCleanup(proc.terminate)
+        seen, deadline = "", time.time() + 15
+        while time.time() < deadline and "ended mid-row" not in seen:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            seen += line
+        self.assertIn("ended mid-row", seen)

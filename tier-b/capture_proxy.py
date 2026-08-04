@@ -322,6 +322,29 @@ def main() -> int:
               f"deliberately.", file=sys.stderr)
         return 2
     if args.append:
+        # A crashed capture leaves its last row half-written and without a
+        # trailing newline. Appending straight onto that concatenates the new
+        # run's first row onto the broken one, so ingest drops a single
+        # unparseable line and *both* rows are lost -- and `capture_run` cannot
+        # help, because the row carrying it never parses.
+        #
+        # Terminated rather than refused. The stale half-row is already
+        # unrecoverable; refusing makes the operator repair a file by hand to
+        # get back a row that no longer exists, while a newline costs nothing
+        # and keeps every row of the resumed run. Ingest already tolerates one
+        # unparseable line and counts it.
+        try:
+            with open(args.out, "rb") as f:
+                if f.seek(0, 2) and (f.seek(-1, 2), f.read(1))[1] != b"\n":
+                    with open(args.out, "a") as fix:
+                        fix.write("\n")
+                    print(f"  --append: {args.out} ended mid-row, so its last "
+                          f"line is truncated and will not parse. Terminated it "
+                          f"so this run's rows are not appended onto it; that "
+                          f"one row was already lost when the previous capture "
+                          f"stopped.", file=sys.stderr)
+        except OSError:
+            pass
         print(f"  --append: adding to an existing {args.out}. Rows carry "
               f"`capture_run` so this run can be told from the others.",
               file=sys.stderr)
