@@ -80,7 +80,8 @@ jobs:
           /tmp/venv/bin/cacheeconomics registry
           /tmp/venv/bin/python -c "
           from cacheeconomics.cost import Usage, price
-          assert price(Usage(uncached_input=1_000_000), 'claude-opus-5').usd == 5.0
+          assert price(Usage(uncached_input=1_000_000), 'claude-opus-5',
+                       'anthropic/direct').usd == 5.0
           print('registry resolved and priced from site-packages')
           "
 
