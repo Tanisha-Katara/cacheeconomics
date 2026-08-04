@@ -1013,6 +1013,40 @@ class TestTheReportDoesNotSpeakForStepsItDidNotRun(unittest.TestCase):
         self.assertIn(self.NOTHING_LEFT, html)
         self.assertNotIn("counting is a separate step", html)
 
+    def test_the_text_report_makes_the_same_claim_conditionally(self):
+        """The footer was made conditional and `render_text` was not: it said
+        "Nothing was sent anywhere", the same false claim in different words.
+
+        Different words is why it survived — the sweep that fixed the footer
+        searched for the footer's sentence, matching by string rather than by
+        claim. Both renderers read one helper now.
+        """
+        from cacheeconomics.report import render_text
+        counted = render_text(self._analysis(True))
+        self.assertNotIn("Nothing was sent anywhere", counted)
+        self.assertIn("counting sent prompt prefixes", counted)
+
+    def test_the_text_report_still_says_it_when_nothing_was_sent(self):
+        from cacheeconomics.report import render_text
+        estimated = render_text(self._analysis(False))
+        self.assertIn("Nothing was sent anywhere", estimated)
+        self.assertNotIn("counting sent prompt prefixes", estimated)
+
+    def test_no_renderer_asserts_transmission_the_others_deny(self):
+        """The class, not the two call sites. Any renderer claiming nothing was
+        transmitted must agree with `tokens_counted`, whatever words it uses."""
+        from cacheeconomics.report import render_html, render_text
+        DENIALS = ("Nothing was sent anywhere",
+                   "No prompt content left the environment")
+        for counted in (True, False):
+            a = self._analysis(counted)
+            for name, out in (("text", render_text(a)), ("html", render_html(a))):
+                with self.subTest(renderer=name, counted=counted):
+                    denies = any(d in out for d in DENIALS)
+                    self.assertEqual(denies, not counted,
+                                     f"{name} denies transmission on a "
+                                     f"tokens_counted={counted} run")
+
     def test_the_counting_flag_is_actually_set_by_the_analyzer(self):
         """`report._next_steps` read `_tokens_counted` off the Analysis, which
         nothing ever set, so `getattr(..., True)` always won and the branch

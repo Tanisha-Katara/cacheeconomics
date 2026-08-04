@@ -148,6 +148,34 @@ def _draft_reason(a: Analysis) -> str:
                 "Figures were released without invoice reconciliation.")
 
 
+def _privacy(a, *, short: bool) -> str:
+    """What this run can honestly say about where prompt content went.
+
+    One function for both renderers. The HTML footer was made conditional on
+    `tokens_counted` and the text report was not -- it says "Nothing was sent
+    anywhere", which is the same false claim in different words, on a run whose
+    recommended workflow sends prompt prefixes to a tokenizer.
+
+    Different words is why it survived: the sweep that fixed the footer searched
+    for the footer's sentence, so it matched by string rather than by claim.
+    Both callers read this now, so a third renderer cannot phrase it a third way
+    and drift again.
+    """
+    if a.tokens_counted:
+        if short:
+            return ("read on this machine; counting sent prompt prefixes to a "
+                    "tokenizer")
+        return ("Analysis ran locally and this package opens no sockets. "
+                "Segment sizes here were counted rather than estimated, and "
+                "counting is a separate step that sends prompt prefixes to a "
+                "tokenizer endpoint. Segments are identified by keyed hash, "
+                "not content.")
+    if short:
+        return "read on this machine. Nothing was sent anywhere"
+    return ("Analysis ran locally. No prompt content left the environment; "
+            "segments are identified by keyed hash, not content.")
+
+
 def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
     e = html.escape
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -396,16 +424,7 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
     # The analysis half stays true either way and is still worth saying: this
     # package imports no network library and a test asserts it. What changes is
     # that the report no longer speaks for a step it did not perform.
-    if a.tokens_counted:
-        privacy = ("Analysis ran locally and this package opens no sockets. "
-                   "Segment sizes here were counted rather than estimated, and "
-                   "counting is a separate step that sends prompt prefixes to a "
-                   "tokenizer endpoint. Segments are identified by keyed hash, "
-                   "not content.")
-    else:
-        privacy = ("Analysis ran locally. No prompt content left the "
-                   "environment; segments are identified by keyed hash, not "
-                   "content.")
+    privacy = _privacy(a, short=False)
     parts.append(f"<footer>{privacy} KCG Consulting LLC</footer></main></body></html>")
     return "\n".join(parts)
 
@@ -554,7 +573,7 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
                    }.get(a.tier, f"{a.tier} — prompt structure is available, so "
                                  f"findings can name the part of the prompt at "
                                  f"fault")),
-        ("privacy", "read on this machine. Nothing was sent anywhere"),
+        ("privacy", _privacy(a, short=True)),
     ], [16, _WIDTH - 18])
 
     out += _rule(2, "how your caching is doing")
