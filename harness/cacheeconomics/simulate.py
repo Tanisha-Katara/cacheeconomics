@@ -1145,7 +1145,27 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # per-arm dollar amounts with no draft marker anywhere, so the one surface
     # that puts several dollar figures side by side was also the one that never
     # said they were unchecked.
-    spend_as = (money.RECONCILED if reconciled is True else money.DRAFT)
+    #
+    # An assumed pricing input caps the label at DRAFT. A figure is RECONCILED
+    # when an invoice checked it; an invoice cannot check a rate that was
+    # guessed, because the guess is upstream of the number the invoice was
+    # compared against. Today the one assumed input is the provider surface --
+    # `load_sessions(..., surface_assumed=True)` on the claude_code adapter,
+    # which already raises a blocking note about it and had nothing reading the
+    # structured field beside it.
+    #
+    # This caps the label and touches nothing else: `spend_as` reaches only
+    # `Figure.release(..., as_=)`, which sets `released_as`, so an assumed
+    # surface with a reconciling invoice still publishes -- as DRAFT. It cannot
+    # turn a released figure into a withheld one and it cannot lift a withhold,
+    # both of which are `spend_ok` above and are not touched here.
+    #
+    # Read through `getattr` because the field is arriving on another track and
+    # this branch predates it; an object without it reads `()`, which is the
+    # honest default -- nothing was assumed unless something says so.
+    assumed = tuple(getattr(trace, "assumed_inputs", ()) or ())
+    spend_as = (money.RECONCILED if (reconciled is True and not assumed)
+                else money.DRAFT)
     # Reordered so each blocker states itself. The size and omission branches
     # used to sit below the invoice ones and were reached only because those
     # carried `not misscaled and not omitted` guards; spelling the precedence

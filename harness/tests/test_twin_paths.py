@@ -32,6 +32,7 @@ imports. These tests are the cheaper half of that: they do not prevent the
 duplication, they make drift fail loudly the moment it happens.
 """
 
+import dataclasses
 import os
 import tempfile
 import json
@@ -42,8 +43,8 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cacheeconomics import (analyzer, checks, cost, monitor, trace,  # noqa: E402
-                            plugin, registry, segment, simulate, tiers)
+from cacheeconomics import (analyzer, checks, cost, money, monitor,  # noqa: E402
+                            trace, plugin, registry, segment, simulate, tiers)
 from cacheeconomics.allocate import (observed_change_rates_by_chain,  # noqa: E402
                                      reuse_chain_of)
 from cacheeconomics.analyzer import analyze  # noqa: E402
@@ -1146,6 +1147,204 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
         self.assertNotIn("$17.1443", text)
         self.assertIn("[withheld]", text)
         self.assertNotIn("beats the automatic baseline", text)
+
+
+@dataclasses.dataclass
+class _TraceSetWithAssumedInputs(TraceSet):
+    """Stand-in for `TraceSet.assumed_inputs` while it lands on another track.
+
+    Declared as a real dataclass field rather than set as an instance attribute,
+    and that is load-bearing rather than tidiness: `_agent_trace` narrows the
+    trace with `dataclasses.replace`, which copies *fields* and not stray
+    attributes. An attribute-only stand-in would silently vanish on the by-agent
+    path, and the test asserting the narrowed trace still carries the assumption
+    would pass for the wrong reason -- or fail for one.
+
+    Redeclaring the field once the real one exists is harmless, and
+    `assumed_for` below prefers the real one as soon as it is there.
+    """
+    assumed_inputs: tuple = ()
+
+
+def assumed_for(ts, inputs=("provider surface",)):
+    """`ts` with its pricing inputs marked assumed, on either schema."""
+    names = {f.name for f in dataclasses.fields(ts)}
+    if "assumed_inputs" in names:
+        return replace(ts, assumed_inputs=tuple(inputs))
+    return _TraceSetWithAssumedInputs(
+        assumed_inputs=tuple(inputs),
+        **{f.name: getattr(ts, f.name) for f in dataclasses.fields(ts)})
+
+
+class TestAnAssumedPricingInputCapsTheLabel(unittest.TestCase):
+    """A figure is RECONCILED when an invoice checked it. An invoice cannot
+    check a rate that was guessed.
+
+    The assumption sits upstream of the number the invoice was compared
+    against, so agreement proves the arithmetic and not the input. Today the one
+    assumed input is the provider surface -- `load_sessions(...,
+    surface_assumed=True)` on the claude_code adapter, which already raised a
+    blocking note and had a structured field beside it that nothing read.
+
+    This caps the *label* and nothing else. `spend_as` reaches only
+    `Figure.release(..., as_=)`, which sets `released_as`; whether a figure is
+    released at all is `spend_ok`, which this does not touch. An assumed surface
+    with a reconciling invoice still publishes -- as DRAFT. Both halves are
+    asserted, because a cap that quietly became a withhold would be the same
+    class of defect in the other direction.
+    """
+
+    def _reqs(self, per_agent=6):
+        out = []
+        for agent in ("alpha", "beta"):
+            for i in range(per_agent):
+                out.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[Segment(id=f"h{agent}{i}", role="system",
+                                      tokens=300, index=0),
+                              Segment(id="body", role="system", tokens=30_000,
+                                      index=1, cache_marked=True, ttl="5m")]))
+        return out
+
+    def _clean(self):
+        return TraceSet(requests=self._reqs(), tier=Tier.INSTRUMENTED,
+                        source="x")
+
+    def _invoice(self, ts):
+        return simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+
+    def test_a_trace_that_says_nothing_still_reconciles(self):
+        """The control, and the guard against the cap being unconditional."""
+        ts = self._clean()
+        b = simulate.bake_off(ts.analysable, trace=ts,
+                              invoice_usd=self._invoice(ts))
+        for _end, p, fig in [(e, p, a["spend"])
+                             for e, d in (("pess", b.arms), ("opt", b.optimistic))
+                             for p, a in d.items()]:
+            self.assertTrue(fig.released, p)
+            self.assertEqual(fig.released_as, money.RECONCILED, p)
+
+    def test_an_assumed_input_caps_every_arm_at_draft(self):
+        ts = assumed_for(self._clean())
+        b = simulate.bake_off(ts.analysable, trace=ts,
+                              invoice_usd=self._invoice(ts))
+        for end, d in (("pessimistic", b.arms), ("optimistic", b.optimistic)):
+            for p, a in d.items():
+                self.assertEqual(a["spend"].released_as, money.DRAFT,
+                                 f"{end}/{p} published as reconciled over an "
+                                 f"assumed pricing input")
+
+    def test_the_cap_does_not_withhold_anything(self):
+        """The half that is easy to get wrong in the other direction. Same
+        trace, same invoice, same release decision -- only the label moves."""
+        clean = self._clean()
+        invoice = self._invoice(clean)
+        plain = simulate.bake_off(clean.analysable, trace=clean,
+                                  invoice_usd=invoice)
+        ts = assumed_for(clean)
+        capped = simulate.bake_off(ts.analysable, trace=ts,
+                                   invoice_usd=invoice)
+        for p in simulate.ARMS:
+            self.assertTrue(capped.arms[p]["spend"].released,
+                            f"{p} was withheld by a label cap")
+            self.assertEqual(capped.arms[p]["spend"].raw(),
+                             plain.arms[p]["spend"].raw(), p)
+        self.assertEqual(capped.delta_pct, plain.delta_pct)
+        self.assertEqual(capped.verdict, plain.verdict)
+
+    def test_the_cap_does_not_lift_a_withhold(self):
+        """An assumed input is not an excuse to release. A trace that would be
+        withheld stays withheld, and does not acquire a DRAFT label as a way
+        through."""
+        ts = assumed_for(self._clean())
+        b = simulate.bake_off(ts.analysable, trace=ts, invoice_usd=999_999.0)
+        for p in simulate.ARMS:
+            self.assertFalse(b.arms[p]["spend"].released, p)
+
+    def test_the_by_agent_path_inherits_the_assumption(self):
+        """Structural, and deliberately not asserted through the output.
+
+        Per-agent figures are DRAFT already, for a reason that has nothing to do
+        with this: `bake_off_by_agent` never hands a group the invoice, so no
+        group can ever be RECONCILED. Asserting "the groups came back DRAFT"
+        would therefore pass with this cap deleted, which is a test of nothing.
+
+        What can be asserted is that the assumption survives the narrowing, so
+        the cap is in place if the by-agent path ever does release a reconciled
+        figure. That it lands once and travels is the whole point of reading the
+        decision off `bake_off` rather than restating it here.
+        """
+        ts = assumed_for(self._clean())
+        narrowed = simulate._agent_trace(ts, "alpha")
+        self.assertEqual(getattr(narrowed, "assumed_inputs", ()),
+                         ("provider surface",),
+                         "the narrowed trace lost the assumption, so a group "
+                         "could publish provenance the file cannot support")
+        self.assertTrue(all(r.agent == "alpha" for r in narrowed.requests),
+                        "the narrowing itself stopped working")
+
+    def test_the_by_agent_path_still_releases_over_an_assumed_input(self):
+        """And the cap does not turn into a withhold there either."""
+        ts = assumed_for(self._clean())
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         allow_unreconciled=True)
+        self.assertTrue(out, "no groups came back, so nothing was checked")
+        for b in out:
+            self.assertTrue(b.arms["as-shipped"]["spend"].released, b.group)
+            self.assertEqual(b.arms["as-shipped"]["spend"].released_as,
+                             money.DRAFT, b.group)
+
+    def test_a_traceset_without_the_field_reads_as_no_assumption(self):
+        """Forward and backward compatibility, asserted rather than assumed.
+
+        The field is arriving on another track. Until it does, and for any
+        object that predates it, the read has to mean "nothing was assumed" --
+        not "unknown, therefore withhold", because that would relabel every
+        honest figure in the product on a merge-order accident.
+        """
+        ts = self._clean()
+        self.assertEqual(getattr(ts, "assumed_inputs", ()), ())
+        b = simulate.bake_off(ts.analysable, trace=ts,
+                              invoice_usd=self._invoice(ts))
+        self.assertEqual(b.arms["as-shipped"]["spend"].released_as,
+                         money.RECONCILED)
+
+    def test_the_simulator_reads_the_field_the_analyzer_gates_on(self):
+        """The parity this branch exists to hold, at the level it can be held
+        at today.
+
+        The analyzer's own cap is landing on another track, so there is no
+        behavioural twin to compare against on this branch and asserting one
+        would be asserting my own stub. What is checkable now is that the
+        simulator consults the field by the name the schema gives it -- which is
+        what the drift alarm elsewhere in this file does for the structural
+        gates, and is what makes the two agree once both halves are in.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(simulate.bake_off)))
+        names = set()
+        for n in ast.walk(tree):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "getattr" and len(n.args) >= 2
+                    and isinstance(n.args[0], ast.Name)
+                    and n.args[0].id == "trace"
+                    and isinstance(n.args[1], ast.Constant)):
+                names.add(n.args[1].value)
+        self.assertIn("assumed_inputs", names,
+                      "bake_off does not read assumed_inputs off the trace, so "
+                      "an assumed pricing input can publish as reconciled")
 
 
 class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
