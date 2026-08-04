@@ -994,12 +994,14 @@ class TestClaudeCodeSaysTheSurfaceIsAssumed(unittest.TestCase):
         from cacheeconomics.adapters.claude_code import load_sessions
         from cacheeconomics.report import render_text
         with tempfile.TemporaryDirectory() as tmp:
-            # Stated, which is what makes it an assumption to disclose. The
-            # parameter used to default to this value, so every library caller
-            # made the assumption whether or not they had considered it; now the
-            # CLI states it and this test states it too.
+            # `surface_assumed=True` is what makes this an assumption to
+            # disclose, and it is passed rather than inferred from the surface
+            # id. The note used to key on `target_id == "anthropic/direct"` --
+            # the same string whether somebody assumed it or knew it -- so a
+            # caller who stated the surface was told it had been guessed.
             ts = load_sessions(root=self._fixture(tmp),
-                               target_id="anthropic/direct")
+                               target_id="anthropic/direct",
+                               surface_assumed=True)
         self.assertTrue(ts.requests, "fixture produced no requests")
         self.assertTrue(any("surface assumed" in n for n in ts.blocking_notes))
         flat = " ".join(render_text(analyze(ts, allow_unreconciled=True)).split())

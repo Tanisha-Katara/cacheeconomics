@@ -605,24 +605,67 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
                          "a script cannot tell this from an invoice-checked figure")
         self.assertIn("draft", set(states.values()))
 
+    def _exact_invoice(self, root):
+        """The invoice this fixture actually reconciles against.
+
+        Both tests below hardcoded "1.16", which stopped reconciling once the
+        fixture gained its write-lifetime split: 82.7% out, so every figure was
+        withheld. `test_stating_the_surface_from_knowledge_still_reconciles`
+        went on passing anyway, because "no DRAFT stamp" is also true of a report
+        that published nothing at all -- it was asserting the right thing about
+        the wrong state. That is the same trap that once made a real defect in
+        this project read as unreproducible, so the invoice is computed and the
+        reconciliation is asserted rather than assumed.
+        """
+        from cacheeconomics.adapters.claude_code import load_sessions
+        from cacheeconomics.analyzer import analyze
+        ts = load_sessions(root=root, target_id="anthropic/direct")
+        spend = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        # `repr`, not a fixed number of decimal places. `f"{spend:.10f}"` was
+        # close enough to look right and left delta_pct at 2.8e-14 rather than
+        # 0.0, so the guard below failed on the rounding rather than on anything
+        # this class is about.
+        return repr(spend)
+
+    def test_the_fixture_reconciles_against_the_computed_invoice(self):
+        """Guard the guard for the two tests below: both are about the release
+        *label*, and both are meaningless if the gate withheld everything."""
+        from cacheeconomics.adapters.claude_code import load_sessions
+        from cacheeconomics.analyzer import analyze
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._fixture(tmp)
+            ts = load_sessions(root=root, target_id="anthropic/direct")
+            a = analyze(ts, invoice_usd=float(self._exact_invoice(root)))
+        self.assertEqual(0.0, a.reconciliation["delta_pct"])
+        self.assertTrue(any(getattr(v, "released", False) for v in a.spend.values()))
+
     def test_stating_the_surface_from_knowledge_still_reconciles(self):
         """The other direction, so this does not become an over-block.
         `--target-id anthropic/direct` is the same string arrived at by
         knowledge, and nothing about it is assumed."""
         with tempfile.TemporaryDirectory() as tmp:
-            code, out, _err = run("claude-code", "--root", self._fixture(tmp),
+            root = self._fixture(tmp)
+            code, out, _err = run("claude-code", "--root", root,
                                   "--target-id", "anthropic/direct",
-                                  "--invoice-usd", "1.16")
+                                  "--invoice-usd", self._exact_invoice(root))
         self.assertEqual(code, 0)
+        # The short report carries no "$" even when it publishes -- the only
+        # finding here is "not costed" -- so the probe for "something was
+        # actually released" is the absence of the withheld banner.
+        self.assertNotIn("FIGURES WITHHELD", out,
+                         "nothing was published, so 'no DRAFT stamp' proves nothing")
         self.assertNotIn("DRAFT", out)
 
     def test_the_flag_goes_through_the_command_end_to_end(self):
         """The helper is only a floor if `cmd_claude_code` actually applies it."""
         with tempfile.TemporaryDirectory() as tmp:
-            code, out, _err = run("claude-code", "--root", self._fixture(tmp),
+            root = self._fixture(tmp)
+            code, out, _err = run("claude-code", "--root", root,
                                   "--assume-anthropic-direct",
-                                  "--invoice-usd", "1.16")
+                                  "--invoice-usd", self._exact_invoice(root))
         self.assertEqual(code, 0)
+        self.assertNotIn("FIGURES WITHHELD", out,
+                         "nothing was published, so the stamp is moot")
         self.assertIn("DRAFT", out)
         self.assertIn("surface was assumed", out)
 
@@ -662,3 +705,193 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
             a = cli._draft_because_the_surface_was_assumed(
                 self._analysis(tmp, "anthropic/direct"))
         self.assertTrue(any("surface was assumed" in n for n in a.blocking_notes))
+
+
+class TestTheDraftBannerFollowsTheFiguresNotTheFlag(unittest.TestCase):
+    """The assumed-surface banner used to be prepended unconditionally.
+
+    Two defects came out of that, and they pull in opposite directions, so both
+    are asserted here.
+
+    A report whose reconciliation *failed* has every figure withheld -- there is
+    no draft to announce. The note went in anyway, and because `render_text`
+    looks for a note beginning "DRAFT" while `render_html` calls `_is_draft`
+    (which reads release state off the figures), the two renderers reached
+    opposite verdicts about the same report. Measured on a $999 invoice against
+    $1.16 of computed spend: `_is_draft` False, HTML gate div absent, text
+    banner present.
+
+    And with `--allow-unreconciled` and no invoice, the analyzer's own "figures
+    released without invoice reconciliation" sat at notes[0] until this
+    prepended in front of it. `report._draft_reason` takes the first DRAFT note,
+    so the reader was told instead that passing `--target-id` would make these
+    reconciled figures -- which, with no invoice supplied, is false. A true
+    explanation had been replaced by a false one.
+    """
+
+    def _fixture(self, tmp):
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "s.jsonl"), "w") as f:
+            for i in range(12):
+                f.write(json.dumps({
+                    "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
+                    "requestId": f"r{i}",
+                    "timestamp": f"2026-07-29T09:{i:02d}:00.000Z",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 100, "output_tokens": 10,
+                        "cache_read_input_tokens": 20_000,
+                        "cache_creation_input_tokens": 1_000,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 1_000,
+                            "ephemeral_1h_input_tokens": 0}}}}) + "\n")
+        return tmp
+
+    def _analysis(self, tmp, **kw):
+        from cacheeconomics.adapters.claude_code import load_sessions
+        from cacheeconomics.analyzer import analyze
+        ts = load_sessions(root=self._fixture(tmp), target_id="anthropic/direct",
+                           surface_assumed=True)
+        if kw.get("invoice_usd") == "exact":
+            kw["invoice_usd"] = analyze(ts, allow_unreconciled=True).spend[
+                "input_usd"].raw()
+        return cli._draft_because_the_surface_was_assumed(analyze(ts, **kw))
+
+    def _verdicts(self, a):
+        """What each renderer concludes, by the route each actually uses."""
+        from cacheeconomics import report
+        return {
+            "figures": report._is_draft(a),
+            "text": any(n.startswith("DRAFT") for n in a.notes),
+            "html": "DRAFT — not for external" in report.render_html(a),
+        }
+
+    def test_a_failed_reconciliation_withholds_everything(self):
+        """Guard the guard: if this fixture released anything, the case below
+        would not be the one it is named for."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._analysis(tmp, invoice_usd=999.0)
+        released = [k for k, v in a.spend.items() if getattr(v, "released", False)]
+        self.assertEqual([], released)
+
+    def test_and_then_no_renderer_claims_it_is_a_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._analysis(tmp, invoice_usd=999.0)
+        v = self._verdicts(a)
+        self.assertEqual({False}, set(v.values()),
+                         f"renderers disagree about the draft verdict: {v}")
+
+    def test_the_renderers_agree_on_every_reachable_release_state(self):
+        """The general form, over all three ways this command reaches the
+        renderers. Two paths deciding one verdict from two different signals is
+        the defect this repo has the longest history with."""
+        cases = {
+            "reconciles": dict(invoice_usd="exact"),
+            "fails to reconcile": dict(invoice_usd=999.0),
+            "no invoice, override": dict(allow_unreconciled=True),
+            "no invoice, no override": {},
+        }
+        for label, kw in cases.items():
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory() as tmp:
+                    a = self._analysis(tmp, **kw)
+                v = self._verdicts(a)
+                self.assertEqual(
+                    1, len(set(v.values())),
+                    f"{label}: renderers disagree about the draft verdict: {v}")
+
+    def test_the_true_reason_is_not_replaced_by_the_surface_one(self):
+        from cacheeconomics import report
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._analysis(tmp, allow_unreconciled=True)
+        reason = report._draft_reason(a)
+        self.assertIn("without invoice reconciliation", reason,
+                      "the analyzer's own reason was displaced")
+        self.assertIn("surface was assumed", reason,
+                      "the surface assumption went unmentioned")
+
+    def test_and_does_not_promise_reconciliation_that_cannot_happen(self):
+        """With no invoice supplied, "pass --target-id and these become
+        reconciled figures" is false: they would still be drafts."""
+        from cacheeconomics import report
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._analysis(tmp, allow_unreconciled=True)
+        self.assertNotIn("become reconciled figures", report._draft_reason(a))
+
+    def test_there_is_exactly_one_draft_banner(self):
+        """Composed into the existing reason, not stacked beside it. Two DRAFT
+        notes means `_draft_reason` silently picks one and drops the other."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._analysis(tmp, allow_unreconciled=True)
+        self.assertEqual(1, sum(1 for n in a.notes if n.startswith("DRAFT")))
+
+    def test_a_reconciling_invoice_still_gets_the_surface_reason(self):
+        """The path with no competing reason still has to state this one."""
+        from cacheeconomics import report
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._analysis(tmp, invoice_usd="exact")
+        self.assertTrue(report._is_draft(a))
+        self.assertIn("surface was assumed", report._draft_reason(a))
+
+
+class TestTheAssumedSurfaceNoteKeysOnProvenanceNotOnTheString(unittest.TestCase):
+    """`--target-id anthropic/direct` is the same string as an assumed one.
+
+    The adapter emitted its "Provider surface assumed to be anthropic/direct"
+    blocking note on `target_id == "anthropic/direct"`, so a user who stated the
+    surface from knowledge was told it was an assumption. The figures were
+    correctly reconciled; only the prose was wrong -- which is the same defect as
+    the one this round is about, in the half nobody was looking at.
+    """
+
+    def _ts(self, tmp, **kw):
+        from cacheeconomics.adapters.claude_code import load_sessions
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "s.jsonl"), "w") as f:
+            for i in range(4):
+                f.write(json.dumps({
+                    "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
+                    "requestId": f"r{i}",
+                    "timestamp": f"2026-07-29T09:0{i}:00.000Z",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 100, "output_tokens": 10,
+                        "cache_read_input_tokens": 20_000,
+                        "cache_creation_input_tokens": 1_000}}}) + "\n")
+        return load_sessions(root=tmp, target_id="anthropic/direct", **kw)
+
+    def test_a_stated_surface_is_not_reported_as_assumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._ts(tmp)
+        self.assertTrue(ts.requests, "fixture produced no requests")
+        self.assertEqual([], [n for n in ts.blocking_notes if "assumed" in n])
+
+    def test_an_assumed_surface_still_is(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._ts(tmp, surface_assumed=True)
+        self.assertTrue(any("assumed" in n for n in ts.blocking_notes))
+
+    def test_the_two_differ_only_in_how_the_surface_was_arrived_at(self):
+        """Same root, same target_id, same rows -- only the provenance differs,
+        which is precisely what cannot be recovered from the value."""
+        with tempfile.TemporaryDirectory() as tmp:
+            stated = self._ts(tmp, surface_assumed=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            assumed = self._ts(tmp, surface_assumed=True)
+        self.assertEqual([r.target_id for r in stated.requests],
+                         [r.target_id for r in assumed.requests])
+        self.assertNotEqual(stated.blocking_notes, assumed.blocking_notes)
+
+    def test_the_command_states_it_only_for_the_flag(self):
+        """End to end, both ways round."""
+        import tempfile as tf
+        with tf.TemporaryDirectory() as tmp:
+            self._ts(tmp)          # writes the transcript
+            _c, stated, _e = run("claude-code", "--root", tmp,
+                                 "--target-id", "anthropic/direct",
+                                 "--allow-unreconciled")
+            _c, assumed, _e = run("claude-code", "--root", tmp,
+                                  "--assume-anthropic-direct",
+                                  "--allow-unreconciled")
+        self.assertNotIn("surface assumed", " ".join(stated.split()))
+        self.assertIn("surface assumed", " ".join(assumed.split()))

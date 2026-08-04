@@ -80,7 +80,8 @@ def _usage_only(u: dict) -> dict:
 
 def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
                   limit: int | None = None,
-                  target_id: str = UNATTRIBUTED) -> TraceSet:
+                  target_id: str = UNATTRIBUTED,
+                  surface_assumed: bool = False) -> TraceSet:
     """Every assistant turn across the transcripts under `root`.
 
     One assistant record is one billed request. User records, attachments,
@@ -100,8 +101,15 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
     which is registered unpriceable, so the report withholds dollars and says
     why instead of quoting Anthropic's rate table at somebody on Bedrock.
 
-    The note below still fires whenever the assumption is made, because an
-    assumption that decides which rate table applies has to be visible.
+    `surface_assumed` says *how* `target_id` was arrived at, and it is a separate
+    argument because it cannot be recovered from the value. The note below used
+    to fire on `target_id == "anthropic/direct"`, which is the same string
+    whether somebody assumed it or knew it -- so a user who passed `--target-id
+    anthropic/direct` from knowledge was told their surface was an assumption,
+    on a report whose figures were correctly reconciled. Guessing a fact about
+    provenance out of the value is the defect this whole round is about; doing it
+    to the *disclosure* while the figures got it right is the same mistake in the
+    half nobody was looking at.
     """
     # Recursive: subagent transcripts live in per-session subdirectories, and a
     # flat glob silently missed 73 of 122 files here — which would have dropped
@@ -223,21 +231,18 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
             "is withheld until one is named. Pass --target-id (most likely "
             "anthropic/direct, unless CLAUDE_CODE_USE_BEDROCK or "
             "CLAUDE_CODE_USE_VERTEX is set on the machine that produced these).")
-    if requests and target_id == "anthropic/direct":
-        # A transcript records the conversation, not the wire request, and
-        # carries no provider field anywhere -- checked across 190 of them.
-        # So this surface is an assumption, not something read. Left as the
-        # default because Claude Code talks to Anthropic directly unless
-        # CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set, and failing
-        # closed for everyone to catch that minority would cost more than it
-        # saves. But an assumption that decides which rate table applies has to
-        # be visible, not buried in a constructor argument.
+    if requests and surface_assumed:
+        # Keyed on how the caller got here, not on where they ended up. A
+        # transcript carries no provider field, so `anthropic/direct` is a
+        # perfectly good thing to *know* and an assumption only when nobody
+        # checked -- and the string is identical either way.
         #
-        # Both backstops still hold if it is wrong: with an invoice the rates
-        # disagree and reconciliation fails, and without one the report is
-        # stamped DRAFT.
+        # Both backstops still hold if the assumption is wrong: with an invoice
+        # the rates disagree and reconciliation fails, and the CLI holds these
+        # figures to DRAFT whatever the invoice says, because reconciling a
+        # total cannot check the rate table it was computed from.
         blocking.append(
-            "Provider surface assumed to be anthropic/direct. Claude Code "
+            f"Provider surface assumed to be {target_id}. Claude Code "
             "transcripts record the conversation rather than the wire request "
             "and carry no provider field, so this was not read from the data. "
             "If this deployment routes through Bedrock or Vertex, pass "

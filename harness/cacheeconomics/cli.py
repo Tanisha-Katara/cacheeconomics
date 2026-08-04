@@ -340,14 +340,21 @@ def _claude_code_target(args) -> str:
         "amazon-bedrock/converse or google-cloud/vertex.")
 
 
-ASSUMED_SURFACE_DRAFT_NOTE = (
-    "DRAFT — the provider surface was assumed, not measured. "
+# The surface half of a DRAFT reason, written to be *appended* to whatever else
+# already made this a draft rather than to stand alone. It deliberately does not
+# open with "DRAFT" or promise that naming the surface reconciles anything: with
+# no invoice supplied it would not, and an earlier version of this string said so
+# anyway while sitting in front of the analyzer's true "no invoice was supplied".
+ASSUMED_SURFACE_CLAUSE = (
+    "The provider surface was assumed rather than measured: "
     "--assume-anthropic-direct supplied anthropic/direct, and every dollar "
     "figure here is priced from that surface's rate table. An invoice can check "
     "that the total adds up; it cannot check that the rate table it was added up "
     "from is the right one, because a Claude Code transcript carries no provider "
     "field to compare against. Pass --target-id to state the surface from "
-    "knowledge instead, and these become reconciled figures.")
+    "knowledge instead.")
+
+ASSUMED_SURFACE_DRAFT_NOTE = "DRAFT — " + ASSUMED_SURFACE_CLAUSE
 
 
 def _draft_because_the_surface_was_assumed(a):
@@ -400,22 +407,53 @@ def _draft_because_the_surface_was_assumed(a):
     findings = [dataclasses.replace(f, avoidable_usd_month=draft(f.avoidable_usd_month))
                 if f.avoidable_usd_month is not None else f
                 for f in a.findings]
-    notes = a.notes
-    if ASSUMED_SURFACE_DRAFT_NOTE not in notes:
-        # At the front, where the analyzer puts its own DRAFT banner, so
-        # `report._draft_reason` finds this one and says which assumption.
-        notes = [ASSUMED_SURFACE_DRAFT_NOTE] + list(notes)
+    spend = {k: draft(v) for k, v in a.spend.items()}
+
+    # The banner is driven by the same evidence `report._is_draft` reads -- a
+    # figure actually released as DRAFT -- and not by the fact that this function
+    # ran. Two failures came out of prepending it unconditionally:
+    #
+    # A report whose reconciliation *failed* has every figure withheld, so there
+    # is no draft to announce. The note went in anyway, and because `render_text`
+    # looks for a note beginning "DRAFT" while `render_html` calls `_is_draft`,
+    # the text report stamped a draft banner and the HTML did not. Measured on a
+    # $999 invoice against $1.16 of spend: `_is_draft` False, HTML gate div
+    # absent, text banner present. Two renderers disagreeing about the same
+    # verdict is the defect this repo has the longest history with, and it had
+    # just been reintroduced by a fix written to close a provenance hole.
+    #
+    # So: derive from the figures, exactly as the renderers' own predicate does.
+    released_draft = any(isinstance(v, money.Figure) and v.released
+                         and v.released_as == money.DRAFT for v in spend.values())
+
+    notes = list(a.notes)
+    if released_draft:
+        # Composed with whatever else already made this a draft, rather than
+        # winning by being first. With `--allow-unreconciled` and no invoice the
+        # analyzer inserts its own "figures released without invoice
+        # reconciliation" at notes[0]; prepending in front of it made
+        # `_draft_reason` return the surface note instead -- which told the
+        # reader that passing --target-id would make these reconciled figures.
+        # With no invoice supplied that is simply false, and it had replaced a
+        # true explanation with it. Both reasons are real here and the reader
+        # needs both.
+        existing = next((n for n in notes if n.startswith("DRAFT")), None)
+        if existing is None:
+            notes.insert(0, ASSUMED_SURFACE_DRAFT_NOTE)
+        elif ASSUMED_SURFACE_CLAUSE not in existing:
+            notes[notes.index(existing)] = existing.rstrip() + " " + ASSUMED_SURFACE_CLAUSE
     return dataclasses.replace(
         a,
-        spend={k: draft(v) for k, v in a.spend.items()},
+        spend=spend,
         reconciliation=({k: draft(v) for k, v in a.reconciliation.items()}
                         if a.reconciliation else a.reconciliation),
         findings=findings,
         notes=notes,
-        # The assumption qualifies a published figure, which is what this list
-        # is for. The adapter already records it; this states that it is now
-        # holding the release label down as well.
-        blocking_notes=list(a.blocking_notes) + [ASSUMED_SURFACE_DRAFT_NOTE])
+        # Unconditional, unlike the banner: the assumption qualifies these
+        # figures whether or not any of them cleared the gate, and that is what
+        # this list is for. The clause without the "DRAFT — " prefix, so the word
+        # never appears on a report where nothing was released as a draft.
+        blocking_notes=list(a.blocking_notes) + [ASSUMED_SURFACE_CLAUSE])
 
 
 def cmd_claude_code(args) -> int:
@@ -430,7 +468,13 @@ def cmd_claude_code(args) -> int:
     from .adapters.claude_code import load_sessions
     target_id = _claude_code_target(args)
     ts = load_sessions(root=args.root, project=args.project, limit=args.limit,
-                       target_id=target_id)
+                       target_id=target_id,
+                       # Passed, not re-derived from `target_id`. The adapter
+                       # cannot tell an assumed anthropic/direct from a stated
+                       # one -- it is the same string -- and it used to guess
+                       # from the value, so `--target-id anthropic/direct` was
+                       # told its own surface was an assumption.
+                       surface_assumed=bool(args.assume_anthropic_direct))
     a = analyze(ts, invoice_usd=args.invoice_usd,
                 effective_rate=args.effective_rate, on_date=args.on_date,
                 allow_unreconciled=args.allow_unreconciled)
