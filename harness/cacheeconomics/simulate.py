@@ -648,6 +648,35 @@ def _agent_trace(trace, agent: str):
         return trace
 
 
+def _unreported_exclusions(trace, reported: set) -> dict:
+    """Excluded billed rows belonging to nobody who gets a result.
+
+    `_agent_trace` hands each reported agent its own excluded rows, which is the
+    right answer for an agent that appears in the output. It is the wrong answer
+    for everyone else: an agent whose only traffic failed, or who has one
+    request where three are needed, gets no group, so its excluded rows are
+    narrowed out of every other group's trace and are never reported at all.
+
+    Coverage therefore comes from `trace.requests` rather than from the requests
+    the caller handed over. Anything owned by an agent not in `reported` has no
+    output of its own to qualify, so it qualifies all of them -- which is the
+    same treatment the loader's placeholder agent and `skipped_rows` already get,
+    for the same reason.
+    """
+    if trace is None:
+        return {}
+    rows = getattr(trace, "requests", None)
+    if rows is None:
+        return dict(getattr(trace, "excluded_billed", None) or {})
+    orphan = [r for r in rows if r.agent not in reported]
+    try:
+        # `skipped_rows` rides along on the narrowed copy, which is correct: a
+        # line that never became a `Request` belongs to no group by definition.
+        return dict(_dc_replace(trace, requests=orphan).excluded_billed or {})
+    except (TypeError, ValueError):
+        return dict(getattr(trace, "excluded_billed", None) or {})
+
+
 def _trace_exclusions(trace, reqs) -> tuple[dict, str]:
     """The trace's billed-but-unmodellable rows, and any breach of the contract.
 
@@ -678,6 +707,16 @@ def _trace_exclusions(trace, reqs) -> tuple[dict, str]:
 
     So the exclusions are read from the trace whole, and a breach of the subset
     invariant is itself a blocker rather than a reason to recompute anything.
+
+    Checked against the rows, not their names. The first version of this reduced
+    both sides to sets of `request_id`, which is a statement about what requests
+    are *called* and not about what they are. Three ways past it, all measured
+    on a clean twelve-row trace that released at 20.0%: a status-500 row reusing
+    an allowed id (sizes still reconciling, so `misscaled` had nothing to say);
+    the same with `usage={}`; and simply passing fourteen rows built from twelve
+    by repeating one. Matching consumes from a multiset, so an id may be used
+    exactly as many times as the trace actually contains it, and the row
+    presented under it has to be that row.
     """
     declared = dict(getattr(trace, "excluded_billed", None) or {})
     analysable = getattr(trace, "analysable", None)
@@ -685,16 +724,34 @@ def _trace_exclusions(trace, reqs) -> tuple[dict, str]:
         # Not a TraceSet, or one that cannot answer. Take its exclusions at face
         # value and claim nothing about the subset.
         return declared, ""
-    allowed = {r.request_id for r in analysable}
-    stray = sorted({r.request_id for r in reqs} - allowed)
+    # Bucketed by id so this stays linear -- `Request` is an unfrozen dataclass
+    # and therefore unhashable, and scanning the whole analysable list per
+    # request would be quadratic on a trace with thousands of rows.
+    pool: dict = {}
+    for r in analysable:
+        pool.setdefault(r.request_id, []).append(r)
+    stray = []
+    for r in reqs:
+        bucket = pool.get(r.request_id) or []
+        # Identity first, then equality: a caller may hand over the very objects
+        # from `trace.analysable`, or equal ones rebuilt by a second load of the
+        # same file. Neither is a breach; a different row wearing the same name
+        # is.
+        for k, cand in enumerate(bucket):
+            if cand is r or cand == r:
+                bucket.pop(k)
+                break
+        else:
+            stray.append(r.request_id)
     if not stray:
         return declared, ""
     return declared, (
         f"{len(stray)} of {len(reqs)} requests handed to the arms are not in the "
-        f"trace's analysable set (first: {stray[0]!r}), so the arms have modelled "
-        f"cache behaviour for rows the trace says cannot be modelled -- a failed "
-        f"call populated no cache entry, and a row with no usage counters has "
-        f"nothing to reconcile against. Pass `trace.analysable`")
+        f"trace's analysable set (first: {stray[0]!r}), counting a row presented "
+        f"more often than the trace contains it. The arms have modelled cache "
+        f"behaviour for rows the trace says cannot be modelled -- a failed call "
+        f"populated no cache entry, and a row with no usage counters has nothing "
+        f"to reconcile against. Pass `trace.analysable`")
 
 
 def structural_evidence(trace) -> tuple[bool, str]:
@@ -1141,7 +1198,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # This is the correction to a judgement I recorded as deliberate and got
     # wrong, on a defect the reviewer reproduced rather than one I found.
     if (omitted or misscaled or excluded_billed or unprovable
-            or not structure_ok or not_a_subset):
+            or not structure_ok or not_a_subset or reconciled is False):
         # Per-reason counts are reported alongside, never summed: they overlap,
         # and a request omitted for two reasons is still one request.
         reasons = ", ".join(f"{len(ids)} {name}"
@@ -1227,17 +1284,43 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
         # evidence that the numbers those arms were built from mean anything.
         # The arms' dollars are already withheld above; this is the claim they
         # support, refused for the same reason and in the same breath.
-        unproven = (
-            "indeterminate: "
-            + (f"{len(unprovable)} of {len(reqs)} requests recorded cache writes "
-               f"whose lifetime the trace never established, so every arm priced "
-               f"them at a guess between 1.25x and 2.0x. The arms do not share "
-               f"that guess equally, so the comparison moves with it and cannot "
-               f"answer the gate"
-               if unprovable else
-               f"{structure_why}. Every arm above is computed from those "
-               f"boundaries, so the comparison between them inherits the doubt "
-               f"and cannot answer the gate"))
+        if unprovable:
+            why_ = (f"{len(unprovable)} of {len(reqs)} requests recorded cache "
+                    f"writes whose lifetime the trace never established, so "
+                    f"every arm priced them at a guess between 1.25x and 2.0x. "
+                    f"The arms do not share that guess equally, so the "
+                    f"comparison moves with it and cannot answer the gate")
+        elif not structure_ok:
+            why_ = (f"{structure_why}. Every arm above is computed from those "
+                    f"boundaries, so the comparison between them inherits the "
+                    f"doubt and cannot answer the gate")
+        else:
+            # A failed reconciliation, which I argued last round did not reach
+            # the percentage and was wrong to.
+            #
+            # The measurement I defended it with asked whether the invoice is an
+            # *input* to the comparison. It is not: across six invoice states the
+            # arms' raw spend is bit-identical, and that still holds. But a
+            # failed reconciliation is not the invoice acting as an input, it is
+            # evidence about something else entirely -- that the export and the
+            # bill may not describe the same workload. That means rows are
+            # missing from one of them, and missing rows are the one thing this
+            # module already agrees moves the arms differentially, because the
+            # traffic that is absent could behave any way at all. `excluded_billed`
+            # and `omitted` block the percentage for exactly that reason; a
+            # reconciliation that fails by more than the gate is the same fact
+            # arriving without a list of which rows.
+            #
+            # So the carve-out is now what it should always have been: a
+            # *missing* invoice keeps the percentage, because absence of a bill
+            # says nothing about the trace. A failed one does not.
+            why_ = (f"computed spend does not reconcile against the "
+                    f"${invoice_usd:,.2f} invoice within 5%, so the export and "
+                    f"the bill may not describe the same workload. Rows missing "
+                    f"from one of them could behave differently from the rows "
+                    f"that are here, which is the same reason a subset cannot "
+                    f"answer the gate")
+        unproven = "indeterminate: " + why_
         return BakeOff(group=group, n_requests=len(reqs), window_days=window,
                        arms=pess, optimistic=opt, moves=moves, unstructured=skipped,
                        untimed=untimed, unpriceable=unpriceable, unmodelled_ttl=unmodelled,
@@ -1309,17 +1392,34 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
     # and whether the sizes were counted are properties of the capture, not of
     # one agent's slice, and a slice cannot be better evidenced than the file it
     # came out of.
+    #
+    # Which agents actually get a result is not the same question as which
+    # agents exist, and scoping to the former lost rows belonging to the latter.
+    # Groups are built from `reqs` and only survive at three rows, so a failed
+    # billed row attributed to an agent with no analysable traffic was filtered
+    # out of every other agent's narrowed trace and given no group of its own:
+    # measured on six clean requests each for alpha and beta plus one failed
+    # billed row belonging to gamma, `trace.excluded_billed` was non-empty and
+    # both groups released at 20.0% with no gamma result anywhere. Narrowing
+    # using the set I was handed rather than the set that exists is the same
+    # mistake as checking the subset invariant by name.
+    #
+    # So coverage is derived from `trace.requests`: an excluded row is somebody's
+    # problem only if that somebody is being reported. Anything else has no
+    # output to qualify and becomes a blocker on every group.
+    kept = [(g, rs) for g, rs in sorted(groups.items()) if len(rs) >= 3]
+    orphaned = _unreported_exclusions(trace, {g for g, _ in kept})
+    # Merged rather than chosen between. A bare `excluded_billed` argument
+    # carries no agent, so a caller who supplies one is telling every group about
+    # it; the derivation adds whatever the trace can attribute to nobody.
+    global_blockers = dict(excluded_billed or {})
+    for _reason, _n in orphaned.items():
+        global_blockers[_reason] = max(global_blockers.get(_reason, 0), int(_n))
     out = [bake_off(rs, group=g, on_date=on_date, effective_rate=effective_rate,
                     allow_unreconciled=allow_unreconciled,
-                    # Dropped in favour of the group-scoped derivation when a
-                    # trace is available, because forwarding it would put the
-                    # whole file's exclusions back on every group and defeat the
-                    # scoping. With no trace there is nothing to attribute with,
-                    # so the caller's set applies to everyone -- fail-closed, and
-                    # what this function did for every caller before.
-                    excluded_billed=None if trace is not None else excluded_billed,
+                    excluded_billed=global_blockers or None,
                     trace=_agent_trace(trace, g))
-           for g, rs in sorted(groups.items()) if len(rs) >= 3]
+           for g, rs in kept]
     # Ranking, which is the other thing `raw()` is for: ordering groups by size
     # has to work before anyone decides whether the sizes may be printed.
     out.sort(key=lambda b: -(b.arms["litellm-auto"]["spend"].raw()))

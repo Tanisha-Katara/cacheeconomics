@@ -935,40 +935,87 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
         self.assertNotIn("indeterminate", b.verdict)
 
     def test_the_cli_hands_the_exclusions_over(self):
-        """Structural. The parity above holds only if the caller passes them,
-        and the caller not passing them is precisely what shipped."""
-        import ast
-        import inspect
+        """Behavioural now, because the route changed and the requirement did not.
+
+        This used to assert that `cmd_bakeoff` passes `excluded_billed=`. The
+        simulator derives that from the trace now, and the CLI passing both was
+        the exact call shape that hid the original defect -- every test of the
+        parity supplied the argument *and* the trace, so the derivation was
+        never the thing under test. Asserting the argument is still there would
+        pin the shape that concealed the bug.
+
+        So this asserts the requirement instead: rows the loader dropped reach
+        the spend gate through the real command. An implementation that stops
+        deriving them, or a CLI that stops handing the trace over, fails here
+        whichever way the plumbing is arranged.
+        """
+        import hashlib
+        import io
+        import json
+        import os
+        import tempfile
+        from contextlib import redirect_stdout
 
         from cacheeconomics import cli
-        tree = ast.parse(inspect.getsource(cli.cmd_bakeoff))
-        calls = [n for n in ast.walk(tree)
-                 if isinstance(n, ast.Call)
-                 and isinstance(n.func, ast.Attribute)
-                 and n.func.attr.startswith("bake_off")]
-        self.assertTrue(calls, "no bake-off call found in cmd_bakeoff")
-        for c in calls:
-            self.assertIn(
-                "excluded_billed", {k.arg for k in c.keywords},
-                f"{c.func.attr} is called without excluded_billed, so rows the "
-                f"loader dropped cannot reach the spend gate")
+        from cacheeconomics.trace import load_jsonl
 
-    # PENDING MERGE, not a defect in this branch. `simulate.bake_off` grew a
-    # `trace=` argument and fails closed without it, so the parity below holds
-    # for any caller that passes it and the dollars are withheld for any caller
-    # that does not -- which is the safe direction and is why this is xfail and
-    # not red. What is missing is the one line of wiring in a file this track
-    # does not own:
-    #
-    #   harness/cacheeconomics/cli.py, cmd_bakeoff
-    #     - the `simulate.bake_off_by_agent(...)` call: add `trace=ts`
-    #     - the `simulate.bake_off(...)` call:          add `trace=ts`
-    #
-    # `ts` is already in scope on the first line of the function. Once both are
-    # added this test passes, reports "unexpected success", and the decorator
-    # must be deleted -- the same forcing function `test_invariants.py` uses, so
-    # the marker cannot outlive the gap it documents.
-    @unittest.expectedFailure
+        # Shaped like `segment_id()` output: the loader rejects short ids, and
+        # an unrecognised id would make this trace INFERRED and block for a
+        # different reason than the one under test.
+        def hid(name):
+            return "hmac:" + hashlib.sha256(name.encode()).hexdigest()
+
+        HMAC_A, HMAC_B = hid("head"), hid("body")
+        rows = []
+        for i in range(8):
+            rows.append({
+                "request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i:02d}:00Z",
+                "model": "claude-opus-5", "agent": "main", "session": "s1",
+                "target_id": "anthropic/direct", "tokens_counted": True,
+                "usage": {"input_tokens": 300, "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 30_000,
+                          "cache_creation": {
+                              "ephemeral_5m_input_tokens": 30_000,
+                              "ephemeral_1h_input_tokens": 0}},
+                "segments": [
+                    {"id": HMAC_A + str(i % 10), "role": "system",
+                     "tokens": 300, "index": 0, "cache_marked": False,
+                     "ttl": None},
+                    {"id": HMAC_B, "role": "system", "tokens": 30_000,
+                     "index": 1, "cache_marked": True, "ttl": "5m"}]})
+        # One row that failed and billed anyway: not analysable, so no arm can
+        # model it, and every figure computed without it describes a subset.
+        rows.append({
+            "request_id": "failed", "sent_at": "2026-07-29T09:30:00Z",
+            "model": "claude-opus-5", "agent": "main", "session": "s1",
+            "target_id": "anthropic/direct", "status": 500,
+            "tokens_counted": True,
+            "usage": {"input_tokens": 5_000_000, "cache_read_input_tokens": 0,
+                      "cache_creation_input_tokens": 0},
+            "segments": [{"id": HMAC_B, "role": "system", "tokens": 5_000_000,
+                          "index": 0, "cache_marked": False, "ttl": None}]})
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        try:
+            with open(path, "w") as f:
+                f.write("\n".join(json.dumps(r) for r in rows))
+            ts = load_jsonl(path)
+            self.assertEqual(ts.excluded_billed, {"failed but billed": 1},
+                             "the fixture stopped reproducing the condition")
+            args = cli.build_parser().parse_args(
+                ["bakeoff", path, "--allow-unreconciled"])
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(args.func(args), 0)
+            text = out.getvalue()
+        finally:
+            os.unlink(path)
+        self.assertIn("[withheld]", text,
+                      "the command published arm spend over a trace carrying a "
+                      "billed row no arm could model")
+        self.assertIn("failed but billed", text)
+        self.assertNotIn("beats the automatic baseline", text)
+
     def test_the_cli_hands_the_trace_over(self):
         """The structural half of the same parity, and the same failure mode.
 
@@ -978,6 +1025,14 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
         on the `TraceSet` and on nothing the arms receive, so `cmd_bakeoff`
         handing over `ts.analysable` alone leaves them unreachable rather than
         merely unsupplied.
+
+        This was an expected failure for two rounds on the grounds that cli.py
+        belonged to another track and the wiring would land at merge. That was
+        wrong: with the simulator's gate in place and the CLI on the no-trace
+        path, the shipped command withheld for every input including a clean
+        instrumented capture with a reconciling invoice. An xfail describes a
+        defect; it does not ship a fix, and the product was broken in the
+        meantime.
         """
         import ast
         import inspect
@@ -996,25 +1051,10 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
                 f"decide whether a figure priced from segment boundaries may be "
                 f"published cannot reach the spend gate")
 
-    # PENDING MERGE, same two lines. Kept separate from the structural check
-    # above because it fails for a different reason and would otherwise hide
-    # behind it: that one asserts the argument is passed, this one asserts the
-    # command still works once it is.
-    @unittest.expectedFailure
-    def test_the_cli_still_prints_dollars_when_the_evidence_is_there(self):
-        """The regression the argument-passing check cannot catch.
-
-        A fail-closed gate that nothing opens is indistinguishable from a broken
-        command, and `cmd_bakeoff` is currently on the no-trace path
-        permanently: the shipped `cacheeconomics bakeoff` cannot release a
-        dollar figure for any input at all, including a clean instrumented
-        capture with a reconciling invoice. Asserting only that `trace=` appears
-        in the source would go green on wiring that passed the wrong object.
-
-        This drives the real command over the real fixture and asserts the
-        positive direction -- $17.14 against a $17.45 invoice, which is what it
-        printed before this branch touched it.
-        """
+    # Kept separate from the structural check above because it fails for a
+    # different reason and would otherwise hide behind it: that one asserts the
+    # argument is passed, this one asserts the command still works once it is.
+    def _run_bakeoff(self, *extra):
         import io
         import os
         from contextlib import redirect_stdout
@@ -1024,17 +1064,55 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
         fixture = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "fixtures", "demo-traces.jsonl")
-        args = cli.build_parser().parse_args(
-            ["bakeoff", fixture, "--invoice-usd", "17.45"])
+        args = cli.build_parser().parse_args(["bakeoff", fixture, *extra])
         out = io.StringIO()
         with redirect_stdout(out):
-            self.assertEqual(args.func(args), 0)
-        text = out.getvalue()
+            rc = args.func(args)
+        return rc, out.getvalue()
+
+    def test_the_cli_still_prints_dollars_when_the_evidence_is_there(self):
+        """The regression the argument-passing check cannot catch.
+
+        A fail-closed gate that nothing opens is indistinguishable from a broken
+        command. For two rounds `cmd_bakeoff` was on the no-trace path
+        permanently and the shipped `cacheeconomics bakeoff` could not release a
+        dollar figure for any input at all. Asserting only that `trace=` appears
+        in the source would also go green on wiring that passed the wrong
+        object, so this drives the real command over the real fixture.
+
+        $17.1443 against a $17.45 invoice is what it printed before this branch
+        touched it.
+        """
+        rc, text = self._run_bakeoff("--invoice-usd", "17.45")
+        self.assertEqual(rc, 0)
         self.assertIn("$17.1443", text,
                       "the shipped bakeoff cannot print a dollar figure for a "
                       "clean instrumented trace with a reconciling invoice")
         self.assertNotIn("[withheld]", text)
         self.assertNotIn("no trace was supplied", text)
+        self.assertIn("beats the automatic baseline", text)
+
+    def test_the_cli_by_agent_path_is_wired_the_same_way(self):
+        """Two call sites, and only one of them was ever exercised by a test.
+
+        `--by-agent` is the path where the per-agent exclusion scoping lives, so
+        wiring one call and not the other would leave the scoped derivation
+        unreachable from the product while every unit test of it passed.
+        """
+        rc, text = self._run_bakeoff("--by-agent", "--allow-unreconciled")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("no trace was supplied", text)
+        self.assertIn("$", text, "no group released a figure")
+
+    def test_the_cli_withholds_when_the_evidence_is_not_there(self):
+        """The other direction, so the test above cannot pass by the gate having
+        been removed. Same command, same fixture, an invoice that does not
+        reconcile: dollars withheld and no Gate 1 pass printed."""
+        rc, text = self._run_bakeoff("--invoice-usd", "999999")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("$17.1443", text)
+        self.assertIn("[withheld]", text)
+        self.assertNotIn("beats the automatic baseline", text)
 
 
 class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
@@ -1328,22 +1406,25 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         self.assertIsNotNone(b.delta_pct)
         self.assertNotIn("indeterminate", b.verdict)
 
-    def test_the_invoice_is_not_an_input_to_the_comparison(self):
-        """Why the exception above is an exception, asserted rather than argued.
+    def test_the_invoice_is_not_an_input_to_what_the_arms_compute(self):
+        """The measurement, separated from the conclusion I wrongly drew from it.
 
-        "No Gate 1 pass may print when the evidence behind it is withheld" is a
-        proxy. The sharp rule is that a percentage dies when the missing
-        evidence moves the arms *differentially*, and every blocker added to
-        this gate was measured doing exactly that: an unprovable lifetime took
-        the same twelve requests from 20.0% to 50.0%, and an estimated split
-        moved the relocation headline 11.4 points on real bodies.
+        I used this to defend keeping the percentage for *any* invoice state,
+        including a failed reconciliation. The measurement was right and the
+        inference was not, and the two are worth keeping apart:
 
-        An invoice cannot, because it is not an input. It is compared against
-        the as-shipped arm after the fact and never enters a spend calculation,
-        so it can be absent, exact, a thousand times too large, a cent, or
-        negative, and the arms are bit-identical. That is what this asserts --
-        if the invoice ever becomes an input, this fails and the carve-out has
-        to be re-argued rather than quietly inherited.
+        What is true, and what this asserts -- the invoice is not an input. It
+        is compared against the as-shipped arm after every arm has been priced
+        and never enters a spend calculation, so the arms' raw numbers are
+        bit-identical whether it is absent, exact, a thousand times too large, a
+        cent, or negative.
+
+        What does not follow -- that a failed reconciliation is therefore
+        harmless to the comparison. A failed reconciliation is not the invoice
+        acting as an input; it is evidence that the export and the bill may not
+        describe the same workload, which means rows are missing from one of
+        them, and missing rows are precisely what this module already treats as
+        moving the arms differentially. That case is asserted below.
         """
         ts = self._clean()
         exact = simulate.bake_off(ts.analysable, trace=ts,
@@ -1358,15 +1439,50 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
                           ("negative", {"invoice_usd": -5.0})):
             with self.subTest(label):
                 b = simulate.bake_off(ts.analysable, trace=ts, **kw)
-                self.assertIsNotNone(b.delta_pct, label)
-                seen.add((b.delta_pct, b.delta_pct_relocation,
-                          b.delta_pct_optimistic,
-                          b.delta_pct_relocation_optimistic))
+                # `raw()` reads through a withheld figure, which is what makes
+                # this measurable at all: the question is what the arms computed,
+                # not what they were allowed to print.
+                seen.add(tuple(round(a["spend"].raw(), 10)
+                               for _, a in sorted(b.arms.items())))
         self.assertEqual(
             len(seen), 1,
-            f"the invoice moved the comparison across {len(seen)} distinct "
-            f"outcomes, so it is an input after all and the missing-invoice "
-            f"carve-out is not defensible: {sorted(seen)}")
+            f"the invoice moved what the arms computed across {len(seen)} "
+            f"distinct outcomes, so it is an input after all: {sorted(seen)}")
+
+    def test_only_a_missing_invoice_keeps_the_percentage(self):
+        """The carve-out, narrowed to what the evidence actually supports.
+
+        Absence of a bill says nothing about the trace, so the comparison
+        stands. A bill that was supplied and disagrees says the export and the
+        bill may not describe the same workload -- rows missing from one of
+        them, which could behave any way at all. That is the same fact
+        `excluded_billed` and `omitted` block the percentage for, arriving
+        without a list of which rows.
+        """
+        ts = self._clean()
+        keeps = simulate.bake_off(ts.analysable, group="g", trace=ts)
+        self.assertIsNotNone(keeps.delta_pct)
+        self.assertFalse(keeps.arms["as-shipped"]["spend"].released)
+        for label, inv in (("wildly wrong", 999_999.0), ("zero", 0.0),
+                           ("negative", -5.0), ("not a number", float("nan"))):
+            with self.subTest(label):
+                b = simulate.bake_off(ts.analysable, group="g", trace=ts,
+                                      invoice_usd=inv)
+                self.assertIsNone(b.delta_pct, label)
+                self.assertIsNone(b.delta_pct_relocation, label)
+                self.assertIn("indeterminate", b.verdict)
+                self.assertNotIn("beats the automatic baseline", b.verdict)
+
+    def test_the_override_does_not_resurrect_a_failed_reconciliation(self):
+        """`allow_unreconciled` covers a missing invoice and nothing else, and
+        that has to hold for the percentage now that it holds for the dollars.
+        Otherwise the flag becomes a way to print a Gate 1 pass over a bill the
+        trace contradicts."""
+        ts = self._clean()
+        b = simulate.bake_off(ts.analysable, group="g", trace=ts,
+                              invoice_usd=999_999.0, allow_unreconciled=True)
+        self.assertIsNone(b.delta_pct)
+        self.assertIn("indeterminate", b.verdict)
 
     def test_the_verdict_still_names_the_specific_blocker(self):
         """Refusing is not enough if the refusal sends the reader nowhere. Each
@@ -1507,6 +1623,96 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
                     self.assertFalse(fig.released, f"{label}: {end}/{p}")
                 self.assertIsNone(b.delta_pct, label)
                 self.assertIn("indeterminate", b.verdict)
+
+    def test_the_subset_invariant_is_about_requests_not_their_names(self):
+        """It was checked by `request_id`, which is a statement about what a
+        request is called rather than what it is.
+
+        Three ways past it, all measured on the same clean twelve-row trace that
+        releases at 20.0%. The first two matter most: they carry usage that
+        still agrees with their segments, so `misscaled` has nothing to say and
+        the invariant is the only thing that could object.
+        """
+        ts = self._clean()
+        clean = list(ts.analysable)
+        cases = {
+            # A failed call populated no cache entry, so modelling it as if it
+            # had is the whole reason the invariant exists.
+            "status-500 wearing an allowed id":
+                [replace(clean[0], status=500)] + clean[1:],
+            "no-usage row wearing an allowed id":
+                [replace(clean[0], usage={})] + clean[1:],
+            # Cardinality, not membership: every id is allowed, one is used
+            # three times where the trace contains it once.
+            "one row presented three times":
+                clean + [clean[0], clean[0]],
+        }
+        for label, reqs in cases.items():
+            with self.subTest(label):
+                b = simulate.bake_off(reqs, group="g", allow_unreconciled=True,
+                                      trace=ts)
+                for end, p, fig in self._arms(b):
+                    self.assertFalse(fig.released, f"{label}: {end}/{p}")
+                self.assertIsNone(b.delta_pct, label)
+                self.assertIn("not in the trace's analysable set", b.verdict)
+
+    def test_the_invariant_accepts_equal_rows_from_a_second_load(self):
+        """And it must not be identity-only, or re-reading the same file makes
+        every row a stray. Equal-but-distinct objects are the same requests."""
+        ts = self._clean()
+        copies = [replace(r) for r in ts.analysable]
+        self.assertFalse(any(a is b for a, b in zip(copies, ts.analysable)))
+        b = simulate.bake_off(copies, group="g", allow_unreconciled=True,
+                              trace=ts)
+        self.assertIsNotNone(b.delta_pct)
+        self.assertTrue(b.arms["as-shipped"]["spend"].released)
+
+    def test_an_exclusion_owned_by_an_agent_with_no_group_still_blocks(self):
+        """Narrowing used the set I was handed rather than the set that exists.
+
+        Groups are built from `reqs` and only survive at three rows, so a failed
+        billed row belonging to an agent with no analysable traffic was filtered
+        out of every other agent's narrowed trace and given no group of its own.
+        Measured: alpha and beta clean with six requests each, one failed billed
+        row belonging to gamma, `trace.excluded_billed` non-empty -- and both
+        groups released at 20.0% with no gamma result anywhere.
+        """
+        reqs = []
+        for agent in ("alpha", "beta"):
+            for i in range(6):
+                reqs.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[Segment(id=f"hdr{agent}{i}", role="system",
+                                      tokens=300, index=0),
+                              Segment(id="body", role="system", tokens=30_000,
+                                      index=1, cache_marked=True, ttl="5m")]))
+        reqs.append(Request(
+            request_id="gamma-failed", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent="gamma", tenant="t", session="sg",
+            target_id="anthropic/direct", ttl_requested="5m", status=500,
+            usage={"input_tokens": 5_000_000, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id="hg", role="system", tokens=5_000_000,
+                              index=0)]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        self.assertEqual(ts.excluded_billed, {"failed but billed": 1})
+        out = {b.group: b for b in simulate.bake_off_by_agent(
+            ts.analysable, allow_unreconciled=True, trace=ts)}
+        self.assertEqual(set(out), {"alpha", "beta"},
+                         "gamma has no analysable rows, so it gets no group -- "
+                         "which is exactly why its excluded row has to land "
+                         "somewhere else")
+        for g, b in out.items():
+            self.assertFalse(b.arms["as-shipped"]["spend"].released,
+                             f"{g} released over a billed row nobody reports")
+            self.assertIsNone(b.delta_pct, g)
 
     def test_the_subset_invariant_is_what_says_so(self):
         """And it is an invariant, not a condition: every request handed to the

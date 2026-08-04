@@ -227,12 +227,26 @@ def cmd_bakeoff(args) -> int:
     if not reqs:
         raise Fail("no analysable requests: " + _coverage_line(ts))
     print(_coverage_line(ts), file=sys.stderr)
+    # The trace, not only the rows the arms replay. Whether a figure priced from
+    # segment boundaries may be published at all depends on tier, alignment,
+    # structural coverage, whether the sizes were counted, and which billed rows
+    # never became analysable -- none of which lives on a `Request`, so handing
+    # over `ts.analysable` alone left those gates unreachable rather than merely
+    # unsupplied, and this command published per-arm dollars the report withheld
+    # for the same trace.
+    #
+    # `excluded_billed` is deliberately not passed alongside it any more. The
+    # simulator derives that from the trace now, and passing both is the exact
+    # call shape the tests were using when they failed to catch the original
+    # defect: every one of them supplied the argument *and* the trace, so the
+    # derivation was never the thing under test. It also defeats per-agent
+    # scoping, since a bare dict carries no agent and so blocks every group.
     if args.by_agent:
         results = simulate.bake_off_by_agent(
             reqs, on_date=args.on_date, effective_rate=args.effective_rate,
             invoice_usd=args.invoice_usd,
             allow_unreconciled=args.allow_unreconciled,
-            excluded_billed=ts.excluded_billed)
+            trace=ts)
         if not results:
             raise Fail("no agent has the 3 requests a comparison needs")
         for b in results:
@@ -243,7 +257,7 @@ def cmd_bakeoff(args) -> int:
                                 effective_rate=args.effective_rate,
                                 invoice_usd=args.invoice_usd,
                                 allow_unreconciled=args.allow_unreconciled,
-                                excluded_billed=ts.excluded_billed))
+                                trace=ts))
     return 0
 
 
