@@ -2104,14 +2104,59 @@ class TestAnAssumedSurfaceMustNotReconcileWithoutTheCLI(unittest.TestCase):
     # used for the cross-track invariants: a still-broken expectation exits 0 so
     # CI stays meaningful for other tracks, and the moment it is fixed this
     # reports "Unexpected success" and forces this marker to be deleted.
-    @unittest.expectedFailure
-    def test_an_assumed_surface_is_never_labelled_reconciled(self):
-        from cacheeconomics.money import RECONCILED, Figure
+    @staticmethod
+    def _figures(a):
+        """Every Figure the analysis publishes, as `(path, Figure)`.
+
+        Every section, not `spend` alone. `a.reconciliation` carries
+        `computed_usd` and `delta_usd`, and those are exactly the two fields
+        this track's own CLI helper had to downgrade *separately* from spend --
+        so a marker that watched only `spend` would go green on a fix that
+        changed spend and forgot reconciliation, invite deletion, and leave
+        library output publishing RECONCILED reconciliation dollars over an
+        assumed surface. A handoff marker has to be at least as complete as the
+        fix it gates.
+
+        `total_avoidable_month` is a property rather than a field and is
+        included deliberately: it is the most client-facing number here, and a
+        `dataclasses.fields` walk skips it.
+        """
+        from cacheeconomics.money import Figure
+        out = []
+        for section, mapping in (("spend", a.spend),
+                                 ("reconciliation", a.reconciliation or {})):
+            for k, v in mapping.items():
+                if isinstance(v, Figure):
+                    out.append((f"{section}.{k}", v))
+        for f in a.findings:
+            if isinstance(f.avoidable_usd_month, Figure):
+                out.append((f"findings[{f.code}].avoidable_usd_month",
+                            f.avoidable_usd_month))
+        if isinstance(a.total_avoidable_month, Figure):
+            out.append(("total_avoidable_month", a.total_avoidable_month))
+        return out
+
+    def test_the_walk_reaches_past_the_spend_section(self):
+        """Guard the guard. If `_figures` only ever found `spend.*`, the marker
+        below would be the narrow check it was written to replace."""
         with tempfile.TemporaryDirectory() as tmp:
             _ts, a = self._analyse(tmp)
-        wrong = sorted(k for k, v in a.spend.items()
-                       if isinstance(v, Figure) and v.released
-                       and v.released_as == RECONCILED)
+        found = [p for p, _ in self._figures(a)]
+        self.assertTrue(found, "no figures discovered; the marker is vacuous")
+        self.assertTrue(
+            [p for p in found if not p.startswith("spend.")],
+            f"the walk never leaves the spend section: {sorted(found)}")
+        self.assertTrue(
+            [p for p, f in self._figures(a) if f.released],
+            "nothing was released, so 'nothing says reconciled' proves nothing")
+
+    @unittest.expectedFailure
+    def test_an_assumed_surface_is_never_labelled_reconciled(self):
+        from cacheeconomics.money import RECONCILED
+        with tempfile.TemporaryDirectory() as tmp:
+            _ts, a = self._analyse(tmp)
+        wrong = sorted(p for p, v in self._figures(a)
+                       if v.released and v.released_as == RECONCILED)
         self.assertEqual(
             [], wrong,
             "these were published as invoice-checked over an assumed rate "

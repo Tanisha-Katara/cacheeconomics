@@ -600,66 +600,138 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
         return json.loads(cli.analysis_json(a, tier_name="USAGE_ONLY",
                                             coverage=1.0))
 
-    @staticmethod
-    def _money_paths(node, path=""):
-        """Every path in the decoded JSON whose value looks like money.
+    # Money-shaped fields that are *inputs* rather than computed figures. The
+    # client's own invoice is a number they supplied; demanding release
+    # provenance for it would be an over-block. Full paths, not leaf names, for
+    # the same reason `_state_for` resolves by path.
+    _INPUT_ONLY_MONEY = frozenset({"reconciliation.invoice_usd"})
 
-        A Figure serialises through `str`, so it is either "$..." or
-        "[withheld: ...]", and both count: a withheld figure still has to be
-        identifiable as withheld rather than absent. Plain floats are
-        deliberately not money-like -- `window_days` sits in the same dict.
+    @classmethod
+    def _money_paths(cls, node, path="", key=""):
+        """Every path in the decoded JSON whose value is money.
 
-        Written here rather than imported from `test_invariants`, which owns the
-        general form of this walk. Two copies of a walk is a cost; importing
-        across test modules to share a fixture is a worse one, and that file is
-        another track's.
+        Detected two ways, because either alone has a hole:
+
+        By *rendering* -- a Figure serialises through `str`, so it is "$..." or
+        "[withheld: ...]", and both count, since a withheld figure still has to
+        be identifiable as withheld rather than absent.
+
+        And by *name*. Rendering alone missed any money serialised as a raw
+        number: `{"projected_usd": 12.5}` in a new or nested section was
+        invisible, so a section could publish unprovenanced dollars and this
+        walk would report the payload clean. Measured on a synthetic payload
+        before this was added.
+
+        Plain floats are still not money on their own -- `window_days` and
+        `delta_pct` sit in the same dicts -- which is why the name test is what
+        promotes a number, not the type.
+
+        Written out rather than imported from `test_invariants`, which owns the
+        general form. Both holes closed here were holes that file had already
+        found and fixed; reproducing them independently is the argument for
+        saying so in the comments rather than trusting the shape to be obvious.
         """
         out = []
-        if isinstance(node, str):
-            if node.startswith("[withheld") or re.fullmatch(
-                    r"\$-?[\d,]+(?:\.\d+)?", node.strip()):
-                out.append(path)
-        elif isinstance(node, dict):
+        if isinstance(node, dict):
             for k, v in node.items():
                 if k == "release_state":
                     continue
-                out.extend(TestAnAssumedSurfaceCannotBePublishedAsReconciled
-                           ._money_paths(v, f"{path}.{k}" if path else k))
-        elif isinstance(node, list):
+                out.extend(cls._money_paths(v, f"{path}.{k}" if path else k, k))
+            return out
+        if isinstance(node, list):
             for i, v in enumerate(node):
-                out.extend(TestAnAssumedSurfaceCannotBePublishedAsReconciled
-                           ._money_paths(v, f"{path}[{i}]"))
+                out.extend(cls._money_paths(v, f"{path}[{i}]", key))
+            return out
+        if path in cls._INPUT_ONLY_MONEY:
+            return out
+        by_name = ("_usd" in key
+                   and isinstance(node, (int, float, str))
+                   and not isinstance(node, bool))
+        by_render = isinstance(node, str) and (
+            node.startswith("[withheld")
+            or bool(re.fullmatch(r"\$-?[\d,]+(?:\.\d+)?", node.strip())))
+        if by_name or by_render:
+            out.append(path)
         return out
 
-    @staticmethod
-    def _state_for(payload, path):
+    @classmethod
+    def _state_for(cls, payload, path):
         """The release state recorded for the money at `path`, or None.
 
-        Accepts either a sibling `release_state` map keyed by field name or an
-        inline state beside the value; which one a section uses is that
-        section's business, and having neither is the defect.
+        Resolved by *full path*. Keying on the leaf name let any field called
+        `input_usd`, at any depth, borrow `spend.input_usd`'s state -- so a new
+        section carrying reconciled dollars and no provenance of its own read as
+        covered. Measured on a synthetic payload: `new_section.input_usd`
+        returned 'draft' with nothing local vouching for it.
+
+        The top-level `release_state` map is `analysis_json`'s spend map, so it
+        vouches for `spend.*` and nothing else. Anything deeper has to carry its
+        own state, either in a sibling `release_state` map or inline beside the
+        value; which of the two a section uses is that section's business, and
+        having neither is the defect.
         """
         parts = path.split(".")
         leaf = parts[-1]
-        top = payload.get("release_state", {})
-        if leaf in top:
-            return top[leaf]
+        if len(parts) == 2 and parts[0] == "spend":
+            top = payload.get("release_state") or {}
+            if leaf in top:
+                return top[leaf]
         node = payload
         for p in parts[:-1]:
             if "[" in p:
                 name, idx = p.split("[")
-                node = node.get(name, [])[int(idx.rstrip("]"))]
+                seq = node.get(name) or []
+                i = int(idx.rstrip("]"))
+                if i >= len(seq):
+                    return None
+                node = seq[i]
             else:
                 node = node.get(p, {})
             if not isinstance(node, (dict, list)):
                 return None
         if isinstance(node, dict):
-            local = node.get("release_state", {})
+            local = node.get("release_state")
             if isinstance(local, dict) and leaf in local:
                 return local[leaf]
             if f"{leaf}_state" in node:
                 return node[f"{leaf}_state"]
         return None
+
+    def test_the_walk_sees_money_that_is_a_number_and_not_a_rendered_string(self):
+        """Both holes this walk had, pinned on a synthetic payload.
+
+        Labelled synthetic: it is not output from the tool, it is the shape the
+        walk must not miss if a section starts serialising money as a number or
+        reuses a field name from `spend`.
+        """
+        synthetic = {
+            "release_state": {"input_usd": "draft"},
+            "spend": {"input_usd": "$1.00"},
+            "new_section": {"input_usd": "$99.00", "projected_usd": 12.5},
+        }
+        found = self._money_paths(synthetic)
+        self.assertIn("new_section.projected_usd", found,
+                      "money serialised as a raw number is invisible")
+        self.assertIn("new_section.input_usd", found)
+
+    def test_state_is_resolved_by_path_so_a_leaf_name_cannot_borrow_it(self):
+        synthetic = {
+            "release_state": {"input_usd": "draft"},
+            "spend": {"input_usd": "$1.00"},
+            "new_section": {"input_usd": "$99.00"},
+        }
+        self.assertEqual("draft", self._state_for(synthetic, "spend.input_usd"),
+                         "the top-level map must still vouch for spend")
+        self.assertIsNone(
+            self._state_for(synthetic, "new_section.input_usd"),
+            "a field borrowed provenance from a same-named field in spend")
+
+    def test_the_clients_own_invoice_is_not_demanded_to_carry_provenance(self):
+        """The other direction. `invoice_usd` is an input the client supplied,
+        not a figure this tool computed, so requiring release state for it would
+        be an over-block -- and name-based detection would otherwise catch it."""
+        self.assertEqual([], self._money_paths(
+            {"reconciliation": {"invoice_usd": 1.25}}))
 
     def test_the_json_walk_finds_money_outside_the_spend_section(self):
         """Guard the guard. The previous version of this test read
