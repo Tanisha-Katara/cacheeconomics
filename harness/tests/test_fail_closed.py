@@ -37,6 +37,23 @@ T0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
 UNKNOWN_MODEL = "nobody-has-ever-registered-this"
 UNKNOWN_TARGET = "nobody/registered-this-surface"
 
+# What a loader writes into `assumed_inputs` when it had to guess the surface.
+#
+# From `trace.py`, which owns the field, so a rewording moves both together --
+# and `trace` imports nothing from the package, so every loader and the analyzer
+# can reach it without a cycle. The `getattr` is only for this worktree, whose
+# copy of `trace.py` predates the constant.
+#
+# The value matters here in a way it does not in `analyzer.py`. The analyzer is
+# deliberately generic: it renders whatever `assumed_inputs` holds and never
+# compares against a literal, so there is nothing there to drift. These tests
+# do the comparing, and they were asserting on `"surface"` -- a string no loader
+# emits. They would have gone on passing while the adapter said something else
+# entirely, which is the drift the constant exists to prevent.
+SURFACE_ASSUMED = getattr(__import__(
+    "cacheeconomics.trace", fromlist=["trace"]),
+    "ASSUMED_PROVIDER_SURFACE", "provider surface")
+
 
 def _segments():
     return [Segment(id="tools", role="tools", tokens=9_000, index=0),
@@ -430,83 +447,291 @@ class TestARateFreeRuleIsSafeOnATraceNothingCanPrice(unittest.TestCase):
 
         poisoned = {"write_5m": True, "write_1h": 2.0, "read": 0.1}
 
-        class OnlyMultipliersPoisoned:
-            """The analyzer's view of the registry, and nothing else's.
+        self._assert_poison_is_refused(scope="analyzer")
 
-            Setting `registry.multipliers` on the module poisons `cost.price`
-            too, because both modules hold the same object -- and then EFF-1
-            lights up for delegating its pricing to `cost.price`, which is
-            correct delegation rather than an unvalidated read. The scope of
-            this audit is rules in `analyzer.py` that reach for a multiplier map
-            themselves, so the substitution is scoped the same way.
+    POISON = {"write_5m": True, "write_1h": 2.0, "read": 0.1}
 
-            (`cost.price` does index a multiplier map without validating it.
-            `cost.py` is not this track's file; reported rather than patched.)
-            """
-
-            def __getattr__(self, name):
-                return getattr(registry, name)
-
-            def multipliers(self, target_id):
-                return dict(poisoned)
-
-        real_registry = analyzer.registry
+    def _rule_figures(self, ts, ratios):
+        from cacheeconomics.analyzer import RULES
 
         def rate_for(model, when=None, target_id=None):
             return 5.0
 
-        def figures(ts, ratios):
-            out = {}
-            for rule in RULES:
-                f = rule(ts.analysable, ratios, 3.0, rate_for)
-                if f is None:
-                    continue
-                for name in ("avoidable_usd_month", "avoidable_usd_window"):
-                    fig = getattr(f, name)
-                    if fig is not None and fig.raw():
-                        out[f"{rule.__name__}.{name}"] = fig.raw()
-            return out
+        out = {}
+        for rule in RULES:
+            f = rule(ts.analysable, ratios, 3.0, rate_for)
+            if f is None:
+                continue
+            for name in ("avoidable_usd_month", "avoidable_usd_window"):
+                fig = getattr(f, name)
+                if fig is not None and fig.raw():
+                    out[f"{rule.__name__}.{name}"] = fig.raw()
+        return out
+
+    def _direct_multiplier_readers(self, ts, ratios):
+        """Which rules reach for a multiplier map themselves, observed.
+
+        Named nowhere: a spying shim records the calls, so the allow-list below
+        is what the code does rather than what I remember it doing. That
+        distinction has already been wrong in both directions in this file.
+        """
+        from cacheeconomics import analyzer, registry
+
+        def rate_for(model, when=None, target_id=None):
+            return 5.0
+
+        seen, real = set(), analyzer.registry
+
+        class Spy:
+            def __init__(self, name):
+                self.name = name
+
+            def __getattr__(self, attr):
+                return getattr(registry, attr)
+
+            def multipliers(self, target_id):
+                seen.add(self.name)
+                return registry.multipliers(target_id)
+
+        from cacheeconomics.analyzer import RULES
+        for rule in RULES:
+            analyzer.registry = Spy(rule.__name__)
+            try:
+                rule(ts.analysable, ratios, 3.0, rate_for)
+            except Exception:                                  # noqa: BLE001
+                pass
+            finally:
+                analyzer.registry = real
+        return seen
+
+    def _assert_poison_is_refused(self, scope):
+        """Every priced figure must be unchanged, or absent because the rule
+        that owns it validated and abstained. Nothing else.
+
+        Three outcomes are failures and the earlier version of this only looked
+        for one. It compared keys present in *both* runs, so a figure that
+        DISAPPEARED under poison was ignored -- and a rule that silently stops
+        pricing is exactly as wrong as one that prices wrongly. Measured: with
+        the shared registry poisoned, EFF-1's $72.30 vanishes on the segments
+        fixture, because a `write_5m` of 1.0 makes caching cost exactly what not
+        caching costs and the rule concludes there is nothing to report. That is
+        a mispricing wearing the shape of an abstention.
+
+        So disappearance is allowed only for rules observed to read a multiplier
+        map directly -- those validate and refuse, which is the designed
+        behaviour. Every other rule must come back with the number it had.
+        """
+        from cacheeconomics import analyzer, registry
+        from cacheeconomics.analyzer import analyze
+
+        poison = dict(self.POISON)
+
+        class Poisoned:
+            def __getattr__(self, attr):
+                return getattr(registry, attr)
+
+            def multipliers(self, target_id):
+                return dict(poison)
 
         fixtures = [("segments", self._trace("anthropic/direct", segments=True)),
                     ("one-hour writes", self._ttl2_trace())]
-        clean, poisoned_out = {}, {}
+        wrong, priced_clean, readers = [], set(), set()
         for label, ts in fixtures:
             ratios = analyze(ts, allow_unreconciled=True).ratios
-            clean[label] = figures(ts, ratios)
-            analyzer.registry = OnlyMultipliersPoisoned()
-            try:
-                poisoned_out[label] = figures(ts, ratios)
-            finally:
-                analyzer.registry = real_registry
+            clean = self._rule_figures(ts, ratios)
+            priced_clean |= set(clean)
+            readers |= self._direct_multiplier_readers(ts, ratios)
 
-        # Vacuity guard, and it is the one that matters: if no rule prices at
-        # all on these fixtures, "nothing priced under poison" is true and
-        # meaningless. Naming TTL-2 because it is the rule this test was written
-        # for, and the reason the first version passed was that it never fired.
-        priced_clean = {k for d in clean.values() for k in d}
+            real_analyzer, real_multipliers = analyzer.registry, registry.multipliers
+            if scope == "analyzer":
+                analyzer.registry = Poisoned()
+            else:
+                # The shared module, so `cost.price` -- which EFF-1 and spend
+                # pricing both delegate to -- sees it too. Scoping to the
+                # analyzer leaves the delegated path, which is the real one, out
+                # of the test entirely.
+                registry.multipliers = lambda target_id: dict(poison)
+            try:
+                dirty = self._rule_figures(ts, ratios)
+            finally:
+                analyzer.registry = real_analyzer
+                registry.multipliers = real_multipliers
+
+            for k in sorted(set(clean) | set(dirty)):
+                before, after = clean.get(k), dirty.get(k)
+                if before == after:
+                    continue
+                if after is None:
+                    # Abstention. Safe in every case, and deliberately not
+                    # policed further here: a rule that validates refuses, and a
+                    # rule whose pricing path raises also refuses, and the two
+                    # are indistinguishable from the figure alone. The
+                    # difference between refusing and being mispriced into
+                    # silence is asserted at the seam instead, by
+                    # `test_the_delegated_pricing_path_also_refuses_a_boolean`.
+                    continue
+                verdict = "appeared" if before is None else "changed"
+                wrong.append(f"{label}: {k} {verdict} {before!r} -> {after!r}")
+
         self.assertTrue(priced_clean, "no rule priced with a real registry")
         self.assertTrue(
             any(k.startswith("_f_ttl_premium_unearned") for k in priced_clean),
             f"TTL-2 does not price on these fixtures, so poisoning the "
             f"registry cannot reveal how it reads one: {sorted(priced_clean)}")
-
-        # Changed, not merely present. A rule that validates abstains and its
-        # figure disappears; a rule that never reads a multiplier map -- EFF-1
-        # delegates its pricing to `cost.price`, which keeps the real registry
-        # here -- produces exactly the number it produced before. Only a rule
-        # that consumed the poisoned map comes back with a *different* one.
-        # Flagging every figure instead made this fail on EFF-1 for pricing
-        # correctly, which is a test that cannot tell delegation from a defect.
-        leaked = sorted(
-            f"{label}: {k} {clean[label].get(k)!r} -> {v!r}"
-            for label, d in poisoned_out.items()
-            for k, v in d.items()
-            if k in clean[label] and v != clean[label][k])
+        self.assertTrue(readers, "no rule was observed reading a multiplier map")
         self.assertEqual(
-            [], leaked,
-            "these priced from a multiplier map they never validated, so a "
-            "boolean in the registry becomes a 1.0x rate:\n    "
-            + "\n    ".join(leaked))
+            [], sorted(wrong),
+            "a boolean multiplier changed what these published, so something on "
+            "the path accepted it as 1.0x:\n    " + "\n    ".join(sorted(wrong)))
+
+    def test_the_shared_registry_never_produces_a_wrong_number(self):
+        """The same audit against the registry every module shares.
+
+        The scoped version above leaves `cost.price` on the real registry, so it
+        proves something about the four rules that read multipliers themselves
+        and nothing about the path EFF-1 and spend actually price through -- a
+        test built so the known hole cannot be observed is a test that agrees
+        with itself. This one poisons the shared module, so the delegated path
+        is in scope.
+
+        It cannot, on its own, catch today's hole: a bool priced at 1.0x makes
+        caching cost exactly what not caching costs, so EFF-1 concludes there is
+        nothing to report and its figure vanishes -- which is shaped exactly
+        like the abstention it will make once `cost.py` refuses the bool. Same
+        observable, two different causes. That distinction is asserted at the
+        seam below instead of guessed at from a figure here.
+        """
+        self._assert_poison_is_refused(scope="shared")
+
+    # KNOWN-FAILING pending Track B: `cost.price` and `cost.ttl_crossover` guard
+    # with `isinstance(m.get(k), (int, float))`, and `bool` satisfies that -- so
+    # the delegated pricing path still takes True as 1.0x. Delete this marker
+    # when `cost.py` refuses booleans.
+    @unittest.expectedFailure
+    def test_the_delegated_pricing_path_also_refuses_a_boolean(self):
+        """At the seam, because the figure cannot tell the two cases apart.
+
+        `cost.price` is where EFF-1 and spend both get their numbers, and its
+        guard is `isinstance(m.get(k), (int, float))` -- which `bool` satisfies,
+        because `bool` subclasses `int`. So `write_5m=True` is accepted and the
+        five-minute write prices at 1.0x instead of 1.25x. The analyzer's own
+        `_lifetime_multipliers` refuses exactly this; the delegated path does
+        not, and `cost.py` is Track B's file.
+
+        Asserting the refusal rather than its downstream effect is what makes
+        this unambiguous: a wrong price and a refused price both end with EFF-1
+        publishing nothing, so only the seam distinguishes them.
+
+        Verified both directions before being written this way: it fails today,
+        and passes once `cost.py` rejects `bool` the way the analyzer does.
+        """
+        from cacheeconomics import cost, registry
+        real = registry.multipliers
+        registry.multipliers = lambda target_id: dict(self.POISON)
+        try:
+            with self.assertRaises(registry.RegistryError):
+                cost.price(cost.Usage(cache_write_5m=1_000),
+                           "claude-opus-5", target_id="anthropic/direct",
+                           on_date="2026-01-01")
+        finally:
+            registry.multipliers = real
+
+    def test_no_rule_sorts_on_anything_but_scalars(self):
+        """A sort key that can raise is a rule that cannot fail closed.
+
+        TTL-1 ordered its per-scope writes with a bare `.sort()`, which compared
+        whole tuples including the Request at the end. That was narrowed to
+        `w[:5]` -- and narrowing leaves whatever is left: index 3 is `spans`,
+        which carries segment ids inside tuples, so two writes at one instant
+        with the same token count and rate still fell through to comparing ids.
+        Measured on a directly-constructed trace with one string id and one
+        integer id: `TypeError: '<' not supported between instances of 'int' and
+        'str'`, raised out of `analyze` before any gate could refuse anything.
+
+        Directly-constructed Requests are supported input elsewhere in this
+        suite, so an id the loaders would never emit is reachable. The second
+        time a sort key has been narrowed rather than replaced.
+        """
+        from cacheeconomics.analyzer import analyze
+
+        def req(rid, when, seg_id):
+            return Request(request_id=rid, sent_at=when, model="claude-opus-5",
+                           target_id="anthropic/direct", tenant="t",
+                           session="s", agent="a", ttl_requested="5m",
+                           usage={"input_tokens": 0,
+                                  "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 100_000},
+                           segments=[Segment(id=seg_id, role="system",
+                                             tokens=50_000, index=0,
+                                             cache_marked=True, ttl="5m")])
+
+        # Same instant, same tokens, same rate: everything a chronological key
+        # should look at ties, so anything else in the key gets compared.
+        reqs = [req("r0", T0, "alpha"), req("r1", T0, 7)]
+        reqs += [req(f"r{i}", T0 + timedelta(seconds=600 * i), f"s{i}")
+                 for i in range(2, 12)]
+        a = analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"),
+                    allow_unreconciled=True)
+        self.assertIsNotNone(a, "the analysis raised instead of abstaining")
+
+    SHAPES = (
+        ("good", {"write_5m": 1.25, "write_1h": 2.0, "read": 0.1}, True),
+        ("missing write_5m", {"write_1h": 2.0, "read": 0.1}, False),
+        ("missing read", {"write_5m": 1.25, "write_1h": 2.0}, False),
+        ("null read", {"write_5m": 1.25, "write_1h": 2.0, "read": None}, False),
+        ("boolean read", {"write_5m": 1.25, "write_1h": 2.0, "read": True}, False),
+        ("boolean write", {"write_5m": True, "write_1h": 2.0, "read": 0.1}, False),
+        ("string", {"write_5m": 1.25, "write_1h": "2.0", "read": 0.1}, False),
+        ("openai shape", {"write_pre_5_6": 1.0, "write_5_6_plus": 1.25,
+                          "read": None}, False),
+    )
+
+    # KNOWN-FAILING until Track B's `cost.py` lands here: this worktree's copy
+    # predates `unusable_multipliers`, so `_lifetime_multipliers` is still
+    # running its own pre-merge branch. When the shared helper arrives this
+    # reports "Unexpected success" -- delete this marker AND the fallback branch
+    # in `_lifetime_multipliers` together.
+    @unittest.expectedFailure
+    def test_the_multiplier_validator_has_one_definition(self):
+        """Seven consumers of `registry.multipliers`, one decision.
+
+        The AST audit that produced `_lifetime_multipliers` found four analyzer
+        rules reading multiplier maps and three consumers elsewhere. Fixing the
+        four here while `cost.py` kept its own guard would leave two definitions
+        of "is this map usable", which is the shape the helper exists to close --
+        `cost.py` had already excluded `bool` for `effective_rate`, one branch
+        away from the multiplier reads, and simply had not applied the rule to
+        the values beside it. A rule known in a file and not applied there is
+        not a rule.
+
+        `analyzer` imports `cost` and not the reverse, so the shared definition
+        lives in `cost` and this delegates to it.
+        """
+        from cacheeconomics import cost
+        self.assertTrue(
+            hasattr(cost, "unusable_multipliers"),
+            "cost.unusable_multipliers is not present in this worktree, so "
+            "_lifetime_multipliers is still deciding for itself")
+
+    def test_the_validator_agrees_with_the_shared_one_wherever_it_exists(self):
+        """Identical verdicts across the shape table, so adopting the shared
+        definition cannot quietly change what this package refuses.
+
+        Runs against whichever definition is present, so it is meaningful before
+        the merge (against the fallback) and after it (against `cost`), and the
+        delegation is only safe because both answer the same on every row.
+        """
+        from cacheeconomics import cost
+        from cacheeconomics.analyzer import _lifetime_multipliers
+        shared = getattr(cost, "unusable_multipliers", None)
+        for label, mapping, usable in self.SHAPES:
+            with self.subTest(shape=label):
+                self.assertEqual(usable, _lifetime_multipliers(mapping) is not None)
+                if shared is not None:
+                    self.assertEqual(
+                        usable,
+                        not shared(mapping, ("write_5m", "write_1h", "read")),
+                        f"{label}: the shared validator and this one disagree")
 
     def test_the_validator_refuses_every_shape_it_cannot_price(self):
         """The helper itself, over the shapes that reach it.
@@ -613,7 +838,7 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
     NOTE = ("The surface was assumed to be anthropic/direct; the export names "
             "none. Rates and cache multipliers here are an assumption.")
 
-    def _trace(self, assumed=("surface",), blocking=False):
+    def _trace(self, assumed=None, blocking=False):
         reqs = [Request(request_id=f"r{i}",
                         sent_at=T0 + timedelta(hours=6 * i),
                         model="claude-opus-5", target_id="anthropic/direct",
@@ -622,6 +847,7 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
                                "cache_creation_input_tokens": 100_000},
                         segments=[])
                 for i in range(12)]
+        assumed = (SURFACE_ASSUMED,) if assumed is None else assumed
         ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY,
                       notes=[self.NOTE] if (assumed or blocking) else [],
                       blocking_notes=[self.NOTE] if blocking else [])
@@ -632,7 +858,7 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
             ts.assumed_inputs = tuple(assumed)
         return ts
 
-    def _analysis(self, assumed=("surface",), blocking=False):
+    def _analysis(self, assumed=None, blocking=False):
         ts = self._trace(assumed, blocking)
         invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
         return analyze(ts, invoice_usd=invoice)
@@ -690,7 +916,7 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
         banners = [n for n in a.notes if n.startswith("DRAFT")]
         self.assertEqual(1, len(banners),
                          "two DRAFT notes means the first one speaks for both")
-        self.assertIn("surface", banners[0])
+        self.assertIn(SURFACE_ASSUMED, banners[0])
         self.assertIn("assumed rather than read", banners[0])
         self.assertNotIn("without invoice reconciliation", banners[0])
 
@@ -728,7 +954,7 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
         the two halves are actually joined up, and it is the one that matters.
         """
         from cacheeconomics import money
-        ts = self._trace(assumed=("surface",))
+        ts = self._trace(assumed=(SURFACE_ASSUMED,))
         invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
         a = analyze(ts, invoice_usd=invoice)
         self.assertEqual(money.DRAFT, a.spend["input_usd"].released_as)
@@ -792,7 +1018,7 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
         a = self._analysis(assumed=("effective rate",))
         banner = next(n for n in a.notes if n.startswith("DRAFT"))
         self.assertIn("effective rate", banner)
-        self.assertNotIn("surface", banner)
+        self.assertNotIn(SURFACE_ASSUMED, banner)
 
 
 class TestARealAssumedSurfaceTraceIsNotInvoiceChecked(unittest.TestCase):

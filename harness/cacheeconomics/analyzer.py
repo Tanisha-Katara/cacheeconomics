@@ -565,8 +565,33 @@ def _lifetime_multipliers(mapping):
     Types are checked, not just presence. `read: None` passes a `"read" in m`
     test and then fails in arithmetic with a `TypeError`, one layer further from
     the cause. `bool` is excluded deliberately: it is a subclass of `int`, so a
-    `True` in a hand-edited registry would otherwise price as 1.0x.
+    `True` in a hand-edited registry would otherwise price as 1.0x. Measured by
+    Track B on the shared path: `write_5m: true` prices a write at $5.00 instead
+    of $6.25, and `read: true` prices reads at 1.0x instead of 0.1x, which makes
+    the allocator score every plan worse than uncached and place nothing.
+
+    The decision itself is `cost.unusable_multipliers`. `analyzer` imports `cost`
+    and not the reverse, so the one definition can live in the module the other
+    six consumers already go through -- which is what the audit that produced
+    this helper was actually about. Keeping a second copy here would be the
+    twin-path shape in the function written to close a twin-path defect.
+
+    The local branch below is a pre-merge fallback and nothing else: this
+    worktree's `cost.py` predates that helper.
+    `TestTheMultiplierValidatorHasOneDefinition` fails as soon as the shared one
+    exists, which is the signal to delete the branch and the marker together.
     """
+    keys = ("write_5m", "write_1h", "read")
+    shared = getattr(cost, "unusable_multipliers", None)
+    if shared is not None:
+        try:
+            if shared(mapping, keys):
+                return None
+            return tuple(mapping[k] for k in keys)
+        except (KeyError, TypeError, AttributeError):
+            # A mapping so malformed the shared validator could not read it is
+            # still a mapping this rule cannot price.
+            return None
     try:
         values = (mapping["write_5m"], mapping["write_1h"], mapping["read"])
     except (KeyError, TypeError):
@@ -1105,7 +1130,23 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
         contributed: list = []
         non_ttl_misses, in_band_rewrites = 0, 0
         for scope, writes in by_scope.items():
-            writes.sort(key=lambda w: w[:5])
+            # Chronology, and nothing else in the key.
+            #
+            # This was a bare `.sort()`, then narrowed to `w[:5]` to stop it
+            # reaching the Request at the end -- and narrowing leaves whatever
+            # is left. `w[3]` is `spans`, which carries segment ids inside
+            # tuples, so two writes at the same instant with the same token
+            # count and rate still fell through to comparing ids. Measured on a
+            # directly-constructed trace with one string id and one integer id:
+            # `TypeError: '<' not supported between instances of 'int' and
+            # 'str'`, raised before the rule could fail closed on anything.
+            #
+            # `sent_at` is the only ordering this walk needs. `list.sort` is
+            # stable, so writes sharing an instant keep the order they arrived
+            # in, which is deterministic without putting a second field in the
+            # key. Replaced rather than narrowed again: the failure mode of
+            # narrowing is that it looks fixed.
+            writes.sort(key=lambda w: w[0])
             # The scope's own surface. This read `r.target_id` -- `r` left over
             # from the loop that *built* by_scope, so on a mixed-surface agent
             # every scope was priced with whichever request happened to be last.
