@@ -1020,6 +1020,49 @@ class TestOneDigestServesBothSidesOfTheProvenanceGate(unittest.TestCase):
                          "canonicalisation is touched")
         self.assertNotIn("def row_sha256", src)
 
+    def test_a_record_the_package_builds_passes_the_packages_own_gate(self):
+        """The contract, as one property.
+
+        An earlier split had `counts_provenance()` emitting a "vouching record"
+        that `_counts_are_vouched` then rejected, because the two fields the
+        loader cannot recompute lived only in the writer's layer. Twelve fixtures
+        found it; a caller would have found it in production, as counts that were
+        written, paid for, and quietly estimated.
+
+        So: whatever the package says a vouching record is, the package's own
+        gate must accept it. Anything less is a contract that holds only by
+        agreement between two files.
+        """
+        from cacheeconomics.adapters.bodies import _counts_are_vouched
+        from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
+                                              counts_provenance)
+        for body in self.BODIES:
+            row = {"body": body}
+            row[COUNTS_PROVENANCE_KEY] = counts_provenance(
+                body, row, None, "https://endpoint", "tokenizer-1")
+            with self.subTest(body=body):
+                self.assertTrue(
+                    _counts_are_vouched(row, body, None),
+                    "the package built a record its own gate refuses")
+
+    def test_the_gate_still_refuses_a_record_missing_either_half(self):
+        """The other direction, so the property above cannot be satisfied by a
+        gate that accepts everything."""
+        from cacheeconomics.adapters.bodies import _counts_are_vouched
+        from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
+                                              counts_provenance,
+                                              recomputable_provenance)
+        body = self.BODIES[0]
+        row = {"body": body}
+        row[COUNTS_PROVENANCE_KEY] = recomputable_provenance(body, row, None)
+        self.assertFalse(_counts_are_vouched(row, body, None),
+                         "a record with no endpoint or tokenizer identity was "
+                         "accepted")
+        row[COUNTS_PROVENANCE_KEY] = counts_provenance(
+            body, row, None, "https://endpoint", "tokenizer-1")
+        row[COUNTS_PROVENANCE_KEY]["body_sha256"] = "tampered"
+        self.assertFalse(_counts_are_vouched(row, body, None))
+
     def test_the_writer_stamps_exactly_what_the_loader_checks(self):
         """The comparison that matters, now that the writer holds no digest of
         its own: every field the loader requires must appear in the record the
@@ -1617,6 +1660,67 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                            "counts written for two models were handed back for "
                            "a third that was never asked")
         self.assertIn("claude-sonnet-4-6", set(_ModelStub.seen))
+
+    def test_a_run_without_a_tokenizer_id_says_so_before_it_sends(self):
+        """Correct behaviour discovered too late to act on is its own defect.
+
+        Without `--tokenizer-id` the analyzer estimates these rows rather than
+        trusting them, which is the right direction to fail -- but an operator
+        who learns it from a downstream note has already spent the money and the
+        egress. The warning is emitted before the first call, while the choice is
+        still theirs, and the run is not refused: the counts may be wanted for
+        something other than a report.
+        """
+        src = self._export("claude-opus-5")
+        r = self._run(src)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertIn("--tokenizer-id", r.stderr)
+        self.assertIn("NOT load as exact", r.stderr)
+        self.assertGreater(len(_ModelStub.seen), 0,
+                           "the run was refused; it should warn and proceed")
+
+    def test_the_notice_comes_before_the_row_work_not_after_it(self):
+        """Ordering, asserted rather than assumed.
+
+        "Before it sends" is the whole point, so it has to be observable. A row
+        the counter refuses locally puts a `row 0:` line on the same stream after
+        the notice, which makes the order checkable within one stream.
+        """
+        p = os.path.join(self.dir, "unknown.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "model-nobody-has-heard-of",
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        r = self._run(p, "--allow-partial")
+        self.assertIn("NOT load as exact", r.stderr)
+        self.assertIn("row 0:", r.stderr)
+        self.assertLess(r.stderr.index("NOT load as exact"),
+                        r.stderr.index("row 0:"),
+                        "the notice was printed after the rows were processed, "
+                        "which is after the decision it exists to inform")
+
+    def test_a_run_with_a_tokenizer_id_does_not_nag(self):
+        """The other direction: a notice that always fires is noise, and noise
+        is how a real one gets missed."""
+        r = self._run(self._export("claude-opus-5"),
+                      "--tokenizer-id", "stub-1")
+        self.assertNotIn("NOT load as exact", r.stderr)
+
+    def test_the_dry_run_says_it_too(self):
+        """The dry run exists to answer "what would this do" while the answer can
+        still change the decision, so "you would pay for counts the report then
+        estimates" belongs in it alongside the call count."""
+        r = self._run(self._export("claude-opus-5"), "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        said = r.stdout + r.stderr
+        self.assertIn("--tokenizer-id", said)
+        self.assertIn("before spending the egress", said)
+        self.assertEqual(_ModelStub.seen, [], "a dry run sent something")
+
+    def test_the_dry_run_does_not_nag_when_the_flag_is_given(self):
+        r = self._run(self._export("claude-opus-5"), "--dry-run",
+                      "--tokenizer-id", "stub-1")
+        self.assertNotIn("before spending the egress", r.stdout + r.stderr)
 
     def test_a_rerun_does_not_resume_without_an_asserted_tokenizer(self):
         """Provenance is only as good as the cache it is stamped over.

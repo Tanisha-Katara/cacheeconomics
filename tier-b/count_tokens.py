@@ -355,6 +355,22 @@ def main() -> int:
                         args.dry_run))
         return counters[models.tokenizer]
 
+    # Said here, before the first call goes out, because this is the last moment
+    # the choice is still the operator's. Without an asserted tokenizer identity
+    # the analyzer will estimate these rows rather than trust them -- correct,
+    # since the export would claim nothing about what produced the counts -- but
+    # learning that afterwards, from a note, means having already spent the money
+    # and the egress on a file that will be treated as though it had neither.
+    #
+    # Stated, not refused: an operator may want the counts for something other
+    # than a report, and this script is not the place to decide that for them.
+    if not args.tokenizer_id:
+        print("  NOTE: no --tokenizer-id, so this export will NOT load as exact."
+              "\n  The counts will be written and the analyzer will estimate "
+              "those rows anyway,\n  because nothing in the file would say which "
+              "tokenizer deployment produced\n  them. Pass --tokenizer-id <id> "
+              "to have them count.", file=sys.stderr)
+
     if args.dry_run:
         print(f"  DRY RUN: nothing will be sent. Host that would receive the "
               f"prompt content: {args.endpoint}", file=sys.stderr)
@@ -476,6 +492,15 @@ def main() -> int:
             # export costs one set of prefix calls per model. An operator being
             # asked to approve the egress should see both facts before agreeing.
             print(f"  tokenizers asked: {', '.join(sorted(counters)) or 'none'}")
+            # The dry run exists to answer "what would this do" while the answer
+            # can still change the decision, and "you would pay for counts the
+            # report then estimates" belongs in that answer as much as the call
+            # count does.
+            if not args.tokenizer_id:
+                print("  WITHOUT --tokenizer-id those calls would buy counts the "
+                      "analyzer will estimate\n  anyway: the export would say "
+                      "nothing about which tokenizer deployment\n  produced them. "
+                      "Add --tokenizer-id <id> before spending the egress.")
             print("  Nothing was sent and nothing was written.")
             return 0
 
