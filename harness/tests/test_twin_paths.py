@@ -2744,3 +2744,65 @@ class TestASpanTooShortToCacheIsNotReused(unittest.TestCase):
         self.assertTrue(trace.span_is_reusable_by(span, later))
         self.assertFalse(trace.span_is_reusable_by(span, later, None, 512))
         self.assertTrue(trace.span_is_reusable_by(span, later, None, 100))
+
+
+class TestAZeroSumCountIsNotAnExactCount(unittest.TestCase):
+    """Both loaders took a "counted" claim at its word.
+
+    `load_bodies` accepted any `segment_tokens` array of the right length whose
+    entries are non-negative numbers -- an all-zero array satisfies every one of
+    those and was classified as exact. `load_jsonl` read the row's own
+    `tokens_counted: true` flag without checking it against the row's own
+    segment sizes. Either way `tokens_counted` reported 1.0, which is the gate
+    that releases structural money, on counts saying the prompt was empty.
+
+    The dry-run guard stops *this* tool producing such a file. It does not stop
+    one arriving, from a stale enrichment or a hostile one.
+    """
+
+    KEY = b"k" * 32
+    BODY = {"model": "claude-opus-5",
+            "system": [{"type": "text", "text": "x" * 4000}],
+            "messages": [{"role": "user", "content": "hi"}]}
+
+    def _write(self, rows):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("\n".join(json.dumps(r) for r in rows))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        return path
+
+    def _bodies(self, tok):
+        from cacheeconomics.adapters.bodies import load_bodies
+        rows = [{"request": self.BODY,
+                 "response": {"usage": {"input_tokens": 50_000}},
+                 "segment_tokens": [tok, tok]} for _ in range(20)]
+        return load_bodies(self._write(rows), self.KEY,
+                           target_id="anthropic/direct").tokens_counted
+
+    def _jsonl(self, tok):
+        from cacheeconomics.trace import load_jsonl
+        rows = [{"request_id": f"r{i}", "sent_at": f"2026-07-29T09:{i:02d}:00Z",
+                 "model": "claude-opus-5", "target_id": "anthropic/direct",
+                 "session": "s", "usage": {"input_tokens": 50_000},
+                 "tokens_counted": True,
+                 "segments": [{"id": "hmac:" + "a" * 64, "role": "system",
+                               "tokens": tok, "index": 0,
+                               "cache_marked": False, "ttl": None}]}
+                for i in range(20)]
+        return load_jsonl(self._write(rows), self.KEY).tokens_counted
+
+    def test_all_zero_sizes_are_not_counted_in_either_loader(self):
+        self.assertEqual(self._bodies(0), 0.0)
+        self.assertEqual(self._jsonl(0), 0.0)
+
+    def test_real_counts_still_are(self):
+        """The other direction, so the fix cannot be 'trust nothing'."""
+        self.assertEqual(self._bodies(500), 1.0)
+        self.assertEqual(self._jsonl(500), 1.0)
+
+    def test_the_two_loaders_agree(self):
+        for tok in (0, 500):
+            with self.subTest(tokens=tok):
+                self.assertEqual(self._bodies(tok), self._jsonl(tok))

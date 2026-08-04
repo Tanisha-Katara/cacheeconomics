@@ -1383,7 +1383,16 @@ def load_jsonl(path: str, key: bytes | None = None, *,
     def _counted(r):
         if r.get("tokens_are_estimated") is True:
             return False
-        return r.get("tokens_counted") is True
+        if r.get("tokens_counted") is not True:
+            return False
+        # The row's own claim, checked against its own numbers. A row can assert
+        # `tokens_counted: true` beside segment sizes summing to zero, and this
+        # took the flag at its word -- the same defect as the bodies loader
+        # accepting an all-zero `segment_tokens` array, one file over.
+        segs = _segment_list(r) or []
+        if _billed_input(_usage_dict(r.get("usage")) or {}) > 0:
+            return sum((s or {}).get("tokens") or 0 for s in segs) > 0
+        return True
 
     # Weighted by billed tokens, not by row count. Ninety-nine tiny counted
     # rows beside one huge uncounted one is 99% of rows and can be 0.02% of the

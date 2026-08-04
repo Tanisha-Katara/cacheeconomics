@@ -231,8 +231,17 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
             # median error per segment -- dense tool schemas starved, prose
             # over-allocated, in opposite directions inside one request.
             pre = row.get("segment_tokens")
-            if isinstance(pre, list) and len(pre) == len(segs) and all(
-                    _is_token_count(n) for n in pre):
+            # A positive sum, when the row was billed for input. An all-zero
+            # array satisfied every other check -- right length, non-negative
+            # numbers -- and was accepted as *exact*, so a stale or hostile
+            # enrichment reported `tokens_counted == 1.0` and gated structural
+            # money on counts that say the prompt was empty. The dry-run guard
+            # stops this tool producing such a file; it does not stop one
+            # arriving.
+            billed = _billed_input(usage) if usage else 0
+            if (isinstance(pre, list) and len(pre) == len(segs)
+                    and all(_is_token_count(n) for n in pre)
+                    and (sum(pre) > 0 or not billed)):
                 apply_counts(segs, pre)
                 counted += 1
                 was_counted = True
