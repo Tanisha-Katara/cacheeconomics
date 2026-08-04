@@ -1768,6 +1768,22 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         self.assertIn("before spending the egress", said)
         self.assertEqual(_ModelStub.seen, [], "a dry run sent something")
 
+    def test_the_dry_run_does_not_use_the_wording_for_a_run_that_writes(self):
+        """The pre-send notice printed before the dry-run branch, so a dry run
+        was told "The counts will be written" by a run that writes nothing.
+
+        Small, and exactly the wrong place to be loose: the whole point of that
+        notice is that it is accurate at the moment permission is being asked.
+        """
+        r = self._run(self._export("claude-opus-5"), "--dry-run")
+        said = r.stdout + r.stderr
+        self.assertNotIn("counts will be written", said,
+                         "a dry run claimed it would write counts")
+        self.assertNotIn("NOT load as exact", said,
+                         "a dry run used the wording for a run that writes")
+        # ...and still says the thing that IS true of a dry run.
+        self.assertIn("before spending the egress", said)
+
     def test_the_dry_run_does_not_nag_when_the_flag_is_given(self):
         r = self._run(self._export("claude-opus-5"), "--dry-run",
                       "--tokenizer-id", "stub-1")
@@ -2199,6 +2215,59 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
                 got = m.row_models({}, {"model": raw, "messages": []}, target)
                 self.assertEqual(got.tokenizer, tok)
                 self.assertEqual(got.prefix, prefix)
+
+    def test_priceable_is_not_the_same_as_servable(self):
+        """The rule said "known to serve" and checked "known to price".
+
+        `countable` accepted anything whose *normalised base* was in the price
+        table, so `claude-opus-5-99999999` — a snapshot that has never existed —
+        normalised to a priced base and sailed through. A prompt body went out
+        and the remote 400 was what established the id was not countable, which
+        is the exact thing the rule exists to do locally. A model can be
+        priceable and not served, and a dated id is the common case.
+
+        Exact match only, so a dated id is refused unless asserted. The bare
+        model must still pass, or the rule has just become "refuse everything".
+        """
+        from cacheeconomics.tokenizer import (FIRST_PARTY_COUNT_ENDPOINT,
+                                              countable, row_models)
+
+        def ok(mid, endpoint=FIRST_PARTY_COUNT_ENDPOINT, assume=False):
+            return countable(row_models({}, {"model": mid, "messages": []}),
+                             endpoint, assume)[0]
+
+        self.assertTrue(ok("claude-opus-5"), "the ordinary case was refused")
+        for dated in ("claude-opus-5-99999999", "claude-opus-5-20260101"):
+            with self.subTest(model=dated):
+                self.assertFalse(
+                    ok(dated),
+                    f"{dated} was treated as servable because its base is "
+                    f"priced; that is priceability wearing serveability's name")
+                self.assertTrue(ok(dated, assume=True),
+                                "the operator's assertion must still work")
+
+    def test_a_priced_id_is_not_servable_on_an_arbitrary_endpoint(self):
+        """The endpoint was used only in the error string. A model this project
+        prices says nothing about what some other host will answer to."""
+        from cacheeconomics.tokenizer import (FIRST_PARTY_COUNT_ENDPOINT,
+                                              countable, row_models)
+        models = row_models({}, {"model": "claude-opus-5", "messages": []})
+        self.assertTrue(countable(models, FIRST_PARTY_COUNT_ENDPOINT)[0])
+        self.assertFalse(
+            countable(models, "https://someone-elses-gateway/count")[0],
+            "a priced id was assumed servable by a host nothing here knows")
+        self.assertTrue(
+            countable(models, "https://someone-elses-gateway/count", True)[0])
+
+    def test_the_refusal_names_the_endpoint_it_could_not_vouch_for(self):
+        """The message has to be actionable: which host, which id, what to pass."""
+        from cacheeconomics.tokenizer import countable, row_models
+        _ok, why = countable(
+            row_models({}, {"model": "claude-opus-5-99999999", "messages": []}),
+            "https://gw.internal/count")
+        self.assertIn("gw.internal", why)
+        self.assertIn("claude-opus-5-99999999", why)
+        self.assertIn("--assume-endpoint-serves", why)
 
     def test_a_surface_prefixed_id_is_not_sent_when_no_surface_is_named(self):
         """`normalize_model` needs the target to know what the prefix is, so
