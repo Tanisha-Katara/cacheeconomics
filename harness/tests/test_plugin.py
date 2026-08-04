@@ -1828,3 +1828,76 @@ class TestTenantMatchesTheBatchAdapter(unittest.TestCase):
         self.assertEqual(plugin_mod._tenant_of(ObjKey(), {}), "team-a")
         self.assertEqual(plugin_mod._tenant_of({"user_api_key_hash": "h1"}, {}), "h1")
         self.assertEqual(plugin_mod._tenant_of({}, {"metadata": {"team_id": "t2"}}), "t2")
+
+
+class TestTheNearMinimumFloorIsDerivedFromMeasuredError(unittest.TestCase):
+    """The floor was `minimum x 1.15`, and 1.15 came from nowhere.
+
+    The size it guards is `bytes / 3.6`, and this repo measured that estimator
+    against the provider's own tokenizer. On cumulative prefixes -- which is
+    what a marker sits on -- the estimate runs median 1.002, p90 1.071, and
+    **max 2.812** above the real count. So the guard was calibrated below the
+    error it exists to guard against.
+
+    Reproduced: an estimated 608-token prefix clears the old 589 floor while
+    really sitting at 216 tokens, below Opus 5's 512 minimum. The marker is
+    placed, the provider caches nothing, returns no error, and the client pays
+    a write premium for silence.
+
+    The evidence file makes the point itself: it contains a case named "tiny
+    prompt, near the minimum" whose prefix ratio is 1.10, against a margin of
+    1.15. Four and a half points of headroom on the case built to probe exactly
+    this threshold.
+    """
+
+    def _prefix(self, est_tokens):
+        """A body whose *estimated* prefix is about `est_tokens`."""
+        text = "x" * int(est_tokens * plugin_mod.BYTES_PER_TOKEN)
+        return lambda i: {"system": [{"type": "text", "text": text}],
+                          "messages": [{"role": "user", "content": f"turn {i}"}]}
+
+    def test_the_default_floor_is_the_measured_worst_overestimate(self):
+        from cacheeconomics.segment import ESTIMATOR_WORST_OVERESTIMATE
+        p = CachePlugin(key=KEY, warmup=4)
+        self.assertAlmostEqual(1 + p.minimum_margin, ESTIMATOR_WORST_OVERESTIMATE,
+                               places=6)
+
+    def test_a_prefix_the_estimate_cannot_vouch_for_is_not_marked(self):
+        """608 estimated against a 512 minimum: over it, and over the old 1.15
+        floor, and still possibly 216 real tokens."""
+        p = CachePlugin(key=KEY, warmup=4)
+        _, d = warm(p, n=20, maker=self._prefix(608), model="claude-opus-5")
+        self.assertFalse(d.applied)
+        self.assertTrue(any("ABSTAIN" in n for n in d.notes))
+
+    def test_the_note_names_the_measured_error_and_the_worst_case_size(self):
+        """An abstention the reader cannot act on is close to silence."""
+        p = CachePlugin(key=KEY, warmup=4)
+        _, d = warm(p, n=20, maker=self._prefix(608), model="claude-opus-5")
+        note = next(n for n in d.notes if "ABSTAIN" in n)
+        self.assertIn("2.81", note)
+        self.assertIn("no error is returned", note)
+        # The worst-case size is checked against the note's own estimate rather
+        # than a copied constant, so the test does not go stale when the
+        # fixture's byte count shifts by a few tokens.
+        import re
+        from cacheeconomics.segment import ESTIMATOR_WORST_OVERESTIMATE
+        est = int(re.search(r"estimated prefix ([\d,]+) tokens",
+                            note).group(1).replace(",", ""))
+        worst = int(re.search(r"as few as ([\d,]+) tokens",
+                              note).group(1).replace(",", ""))
+        self.assertEqual(worst, int(est / ESTIMATOR_WORST_OVERESTIMATE))
+
+    def test_a_prefix_clear_of_its_own_error_is_still_marked(self):
+        """The other direction. A floor that never places is as wrong as one
+        that always does -- and real agent prefixes sit far above this."""
+        p = CachePlugin(key=KEY, warmup=4)
+        _, d = warm(p, n=20, maker=self._prefix(20_000), model="claude-opus-5")
+        self.assertTrue(d.applied)
+        self.assertTrue(d.placements)
+
+    def test_the_old_margin_would_have_marked_it(self):
+        """Pins that the change is what moved this case, not the fixture."""
+        p = CachePlugin(key=KEY, warmup=4, minimum_margin=0.15)
+        _, d = warm(p, n=20, maker=self._prefix(608), model="claude-opus-5")
+        self.assertTrue(d.applied)

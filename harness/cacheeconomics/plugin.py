@@ -50,7 +50,8 @@ from . import registry, tiers
 _log = logging.getLogger("cacheeconomics.plugin")
 from .allocate import reuse_chain
 from .monitor import MAX_FIRING, MAX_SCOPES, WINDOW, Alert, Monitor
-from .segment import (apply_markers, marker_count, segments_from_request,  # noqa: F401
+from .segment import (ESTIMATOR_WORST_OVERESTIMATE,  # noqa: F401
+                      apply_markers, marker_count, segments_from_request,
                       strip_markers, walk)
 from .trace import (UNATTRIBUTED, Request, Segment, _text, read_field,
                     resolve_litellm_tenant, session_of, write_tokens)
@@ -178,7 +179,7 @@ class CachePlugin:
     """
 
     def __init__(self, *, key: bytes, warmup: int = 32,
-                 minimum_margin: float = 0.15,
+                 minimum_margin: float = ESTIMATOR_WORST_OVERESTIMATE - 1,
                  respect_existing: bool = True,
                  max_scopes: int = MAX_SCOPES,
                  monitor: Monitor | None = None):
@@ -631,9 +632,14 @@ class CachePlugin:
                 notes.append(
                     f"ABSTAIN at wire position {t.marker_position}: estimated "
                     f"prefix {t.prefix_tokens:,} tokens against a {minimum:,} "
-                    f"minimum, inside the {self.minimum_margin:.0%} margin this "
-                    f"estimate cannot resolve. Below the minimum a marker caches "
-                    f"nothing and no error is returned.")
+                    f"minimum. The size is a bytes-per-token estimate, measured "
+                    f"as much as {ESTIMATOR_WORST_OVERESTIMATE:.2f}x above the "
+                    f"real count on a prefix of dense content, so this could be "
+                    f"as few as {int(t.prefix_tokens / ESTIMATOR_WORST_OVERESTIMATE):,} "
+                    f"tokens. Below the minimum a marker caches nothing and no "
+                    f"error is returned, so the estimate has to clear the "
+                    f"threshold by more than its own error before it is safe to "
+                    f"act on.")
         return keep, notes
 
     # --- what it would recommend a human do -------------------------------

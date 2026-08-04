@@ -25,6 +25,32 @@ from .trace import (_billed_input, _is_token_count,  # noqa: F401
 # count, so the constant's inaccuracy cancels out of the proportions.
 _BYTES_PER_TOKEN = 3.6
 
+# How far above the truth that estimate can land on a cumulative prefix.
+#
+# The sentence above is true of the *batch* path, where `_scale_to_measured`
+# pins the total and only the split is estimated. It is not true of the live
+# plugin, which decides at request time with no billed total to scale to: there
+# the estimate is absolute, and an overestimate means marking a prefix the
+# provider will silently refuse to cache.
+#
+# Measured against the provider's own tokenizer in
+# `tier-b/evidence/inferred-token-split.json`, on cumulative prefixes rather
+# than single segments, because a prefix is what a marker sits on:
+#
+#     median 1.002    p90 1.071    max 2.812
+#
+# The maximum is the "long identifiers, low bytes-per-token" case, whose first
+# system block estimates 925 tokens against a real 329. Content that tokenises
+# far more densely than 3.6 bytes/token reads as three times its true size.
+#
+# 26 prefixes over six bodies is a small sample, so this is a floor on the
+# error rather than a proof of its bound -- which is why it is written down with
+# its source instead of being folded into a threshold as a bare number, and why
+# the direction it protects matters more than its precision: an overestimate
+# fails silently, an underestimate only costs a marker somebody can see was
+# skipped.
+ESTIMATOR_WORST_OVERESTIMATE = 2.81
+
 
 def _model_visible(block):
     """The block as the model sees it, with transport metadata removed.
