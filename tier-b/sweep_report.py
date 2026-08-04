@@ -42,9 +42,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # derivation is what produced that, so there is now one.
 sys.path.insert(0, HERE)
 from count_tokens import (DEFAULT_ENDPOINT, PROVENANCE_KEY,      # noqa: E402
-                          counted_path, row_models)
+                          counted_path)
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
-from cacheeconomics.tokenizer import counts_provenance, row_sha256  # noqa: E402
+from cacheeconomics.tokenizer import counts_provenance           # noqa: E402
 
 
 def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
@@ -109,17 +109,15 @@ def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
                 f"(stored {p.get('tokenizer_id')!r}, this run "
                 f"{tokenizer_id!r}), so nothing shows the tokenizer that "
                 f"produced these counts is the one answering now")
-        models = row_models(s, body, target_id)
+
         # The package's vouching record -- version and the two digests the
         # loader checks -- plus the settings that decide whether a *re-run*
         # would agree. Built from `counts_provenance` rather than restated, so a
         # field added to the contract is compared here the day it is added.
-        want = {**counts_provenance(body),
-                "row_sha256": row_sha256(s),
-                "tokenizer_model": models.tokenizer,
-                "analysis_model": models.analysis,
-                "endpoint": endpoint, "target_id": target_id,
-                "tokenizer_id": tokenizer_id}
+        # The package's record -- version, digests, both models, the surface --
+        # plus the two settings only a re-run cares about. Built rather than
+        # restated, so this and the loader compare the same fields.
+        want = counts_provenance(body, s, target_id, endpoint, tokenizer_id)
         for field, expected in want.items():
             if p.get(field) != expected:
                 return None, (f"row {i} was counted with "

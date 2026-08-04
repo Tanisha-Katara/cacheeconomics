@@ -1024,15 +1024,14 @@ class TestOneDigestServesBothSidesOfTheProvenanceGate(unittest.TestCase):
         """The comparison that matters, now that the writer holds no digest of
         its own: every field the loader requires must appear in the record the
         writer actually emits, with the same value."""
-        from cacheeconomics.tokenizer import counts_provenance
+        from cacheeconomics.tokenizer import recomputable_provenance
         writer = load("count_tokens")
         for body in self.BODIES:
-            stamped = writer.provenance(
-                {"body": body}, body,
-                writer.RowModels("claude-opus-5", "claude-opus-5"),
-                "https://e", None, None)
+            stamped = writer.provenance({"body": body}, body,
+                                        "https://e", None, None)
             with self.subTest(body=body):
-                for k, v in counts_provenance(body).items():
+                for k, v in recomputable_provenance(
+                        body, {"body": body}, None).items():
                     self.assertEqual(stamped.get(k), v,
                                      f"the writer's {k} is not what the loader "
                                      f"will compute for the same body")
@@ -1103,23 +1102,14 @@ class TestTheLoaderOnlyTrustsCountsItCanVouchFor(unittest.TestCase):
             "messages": [{"role": "user", "content": "hello there"}]}
 
     def _row(self, counts, provenance="valid", body=None):
-        from cacheeconomics.tokenizer import body_sha256, cuts_sha256
         body = body or json.loads(json.dumps(self.BODY))
         row = {"sent_at": "2026-08-01T09:00:00Z", "body": body,
                "usage": {"input_tokens": 1000, "cache_read_input_tokens": 0,
                          "cache_creation_input_tokens": 0},
                "segment_tokens": counts}
         if provenance == "valid":
-            row[self.ct.PROVENANCE_KEY] = {
-                "version": self.ct.COUNTER_VERSION,
-                "tool": "tier-b/count_tokens.py",
-                "row_sha256": "unchecked-by-the-loader",
-                "body_sha256": body_sha256(body),
-                "cuts_sha256": cuts_sha256(body),
-                "tokenizer_model": "claude-opus-5",
-                "analysis_model": "claude-opus-5",
-                "endpoint": "https://anything", "target_id": None,
-                "tokenizer_id": None}
+            row[self.ct.PROVENANCE_KEY] = self.ct.provenance(
+                row, body, "https://anything", None, "stub-tokenizer-1")
         elif provenance is not None:
             row[self.ct.PROVENANCE_KEY] = provenance
         return row
@@ -1227,7 +1217,7 @@ class TestTheLoaderOnlyTrustsCountsItCanVouchFor(unittest.TestCase):
         out = os.path.join(self.dir, "counted.jsonl")
         r = subprocess.run(
             [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
-             "-o", out, "--endpoint",
+             "-o", out, "--tokenizer-id", "stub-1", "--endpoint",
              f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens"],
             capture_output=True, text=True, timeout=90,
             env=dict(os.environ, ANTHROPIC_API_KEY="test"))
@@ -1237,6 +1227,96 @@ class TestTheLoaderOnlyTrustsCountsItCanVouchFor(unittest.TestCase):
         self.assertEqual(ts.tokens_counted, 1.0,
                          "the loader would not vouch for what the counter just "
                          "wrote; the two sides have drifted")
+
+    def test_a_flat_row_survives_the_round_trip(self):
+        """The aliasing defect, end to end, and the shape every other fixture
+        here misses.
+
+        For a flattened export `_find_body` returns the ROW ITSELF, so `body`
+        and `row` are one object: storing `segment_tokens` mutated the thing
+        whose digest was about to be taken, and adding the record mutated it
+        again. On reload the loader hashed the *enriched* flat row, the digest
+        missed, and the row was estimated -- after its prompt prefixes had
+        already gone to the tokenizer. Flat exports paid full egress and got
+        nothing.
+        """
+        stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CountStub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.shutdown)
+        src = os.path.join(self.dir, "flat.jsonl")
+        # No `body`/`request` wrapper: the request fields sit on the row.
+        flat = {"sent_at": "2026-08-01T09:00:00Z",
+                "model": "claude-opus-5",
+                "system": [{"type": "text", "text": "policy " * 40}],
+                "messages": [{"role": "user", "content": "hello there"}],
+                "usage": {"input_tokens": 1000, "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 0}}
+        with open(src, "w") as f:
+            f.write(json.dumps(flat) + "\n")
+        from cacheeconomics.adapters.bodies import _find_body
+        self.assertIs(_find_body(json.loads(json.dumps(flat))) is None, False)
+        out = os.path.join(self.dir, "flat-counted.jsonl")
+        r = subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
+             "-o", out, "--tokenizer-id", "stub-1", "--endpoint",
+             f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens"],
+            capture_output=True, text=True, timeout=90,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        row = json.loads(open(out).read().strip())
+        self.assertIn("segment_tokens", row, "the flat row was never counted")
+        from cacheeconomics.adapters.bodies import load_bodies
+        ts = load_bodies(out, key=b"k" * 32)
+        self.assertEqual(ts.tokens_counted, 1.0,
+                         "a counted flat row did not load as exact; its prompt "
+                         "prefixes were sent and the counts thrown away")
+
+    def test_a_digest_ignores_what_enrichment_adds(self):
+        """Why the flat case works: the digest is over the request, not over
+        whatever the row later accumulates."""
+        from cacheeconomics.tokenizer import body_sha256, row_sha256
+        flat = {"model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}]}
+        enriched = dict(flat, segment_tokens=[1, 2],
+                        segment_tokens_provenance={"version": 99})
+        self.assertEqual(body_sha256(flat), body_sha256(enriched))
+        self.assertEqual(row_sha256(flat), row_sha256(enriched))
+
+    def test_the_loader_checks_everything_it_can_recompute(self):
+        """The loader gated structural dollars on three fields while
+        `sweep_report` checked eight, so the weaker gate was the one that
+        mattered. Every field the loader can recompute must now match."""
+        from cacheeconomics.tokenizer import recomputable_provenance
+        for field in recomputable_provenance(self.BODY, {"body": self.BODY},
+                                             None):
+            with self.subTest(field=field):
+                row = self._row(self._counts_for())
+                row[self.ct.PROVENANCE_KEY][field] = "tampered"
+                self.assertEqual(self._load(row).tokens_counted, 0.0,
+                                 f"a counted row survived a changed {field}")
+
+    def test_counts_with_no_asserted_tokenizer_are_estimated(self):
+        """The two fields the loader cannot recompute are required to be
+        present. A counted export produced without --tokenizer-id claims nothing
+        about what answered, which is the unbacked claim the sweep already
+        refuses to reuse -- the loader was accepting it."""
+        for field in ("endpoint", "tokenizer_id"):
+            with self.subTest(field=field):
+                row = self._row(self._counts_for())
+                row[self.ct.PROVENANCE_KEY][field] = None
+                self.assertEqual(self._load(row).tokens_counted, 0.0)
+
+    def test_the_two_rejection_reasons_are_counted_separately(self):
+        """One counter fed both notes, so the shape-mismatch note reported a
+        figure that included rows whose shape was fine. The two say different
+        things: re-run the counter, versus these counts may be someone else's."""
+        shape_bad = self._row([1])                    # wrong length
+        vouch_bad = self._row(self._counts_for(), provenance=None)
+        ts = self._load(shape_bad, vouch_bad)
+        shape_note = next(n for n in ts.notes if "did not match their segments" in n)
+        vouch_note = next(n for n in ts.notes if "could not vouch for" in n)
+        self.assertIn("1 request(s)", shape_note)
+        self.assertIn("1 request(s)", vouch_note)
 
     def test_the_accepted_version_tracks_the_counter(self):
         """The two constants are bumped in lockstep. If they part, the loader
@@ -1670,6 +1750,50 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                          "the prefix was not stripped before the tokenizer was "
                          "asked")
 
+    def test_an_unknown_model_puts_nothing_on_the_wire(self):
+        """The egress rule as a rule rather than a list of known-bad shapes.
+
+        Blank models, routing prefixes and Bedrock ids were each closed by a
+        separate review; an unknown model, an OpenAI id against an Anthropic
+        endpoint, and a composite routed id still sent a body and learned it was
+        hopeless from the remote error. Nothing goes out unless the id that
+        would be sent is one the registry recognises.
+        """
+        for model in ("gpt-4o", "model-nobody-has-heard-of",
+                      "bedrock/anthropic.not-a-real-model",
+                      "claude-opus-5-but-with-a-typo"):
+            with self.subTest(model=model):
+                _ModelStub.seen = []
+                p = os.path.join(self.dir, "u.jsonl")
+                with open(p, "w") as f:
+                    f.write(json.dumps({"body": {
+                        "model": model,
+                        "system": [{"type": "text", "text": "SECRET-POLICY"}],
+                        "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+                r = self._run(p, "--allow-partial")
+                self.assertEqual(_ModelStub.seen, [],
+                                 f"a prompt body was sent for {model!r}, whose "
+                                 f"call could not have returned a usable count")
+                self.assertIn("not a model this registry knows", r.stderr)
+
+    def test_the_operator_can_assert_a_gateway_serves_an_unknown_id(self):
+        """The override. A gateway with its own model names is a real case, and
+        the rule must be escapable explicitly rather than by accident."""
+        p = os.path.join(self.dir, "gw.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        r = self._run(p, "--assume-endpoint-serves")
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"})
+
+    def test_a_known_model_is_still_countable(self):
+        """The other direction: the rule must not refuse the ordinary case."""
+        r = self._run(self._export("claude-opus-5"))
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"})
+
     def test_a_row_with_no_resolvable_model_is_not_counted_at_all(self):
         """The consequence of having no fallback, stated as behaviour.
 
@@ -1933,8 +2057,8 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
 
     def test_the_known_prefixes_come_from_the_registry(self):
         """Listing them here would go stale the first time a surface is added."""
-        m = load("count_tokens")
-        self.assertIn("anthropic.", m._known_routing_prefixes())
+        from cacheeconomics.tokenizer import _known_routing_prefixes
+        self.assertIn("anthropic.", _known_routing_prefixes())
 
     def test_a_blank_model_is_unnamed_rather_than_a_model_named_blank(self):
         """`_text` returns strings unchanged, so `"   "` passed the truthiness
@@ -2324,10 +2448,8 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
         src_row = json.loads(open(self.src).read().strip())
         row = json.loads(json.dumps(src_row))
         row["segment_tokens"] = [7]
-        prov = self.ct.provenance(
-            src_row, src_row["body"],
-            self.ct.row_models(src_row, src_row["body"]),
-            self.ct.DEFAULT_ENDPOINT, None, None)
+        prov = self.ct.provenance(src_row, src_row["body"],
+                                  self.ct.DEFAULT_ENDPOINT, None, None)
         prov.update(overrides)
         row[self.ct.PROVENANCE_KEY] = prov
         if extra_row:

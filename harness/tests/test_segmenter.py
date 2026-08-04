@@ -976,7 +976,9 @@ class TestExactTokenCountsWhenSupplied(unittest.TestCase):
             # for one, so it carries it too.
             from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
                                                   counts_provenance)
-            row[COUNTS_PROVENANCE_KEY] = counts_provenance(row["request"])
+            row[COUNTS_PROVENANCE_KEY] = counts_provenance(
+                row["request"], row, None, "https://test-endpoint",
+                "test-tokenizer")
         return row
 
     def _load(self, row):

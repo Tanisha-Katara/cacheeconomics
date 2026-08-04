@@ -33,7 +33,7 @@ from ..segment import (_billed_input, _requested_ttl, _scale_to_measured,
                        segments_from_request, usage_from_response)
 
 from ..tokenizer import (COUNTS_PROVENANCE_KEY, COUNTS_PROVENANCE_VERSION,
-                        apply_counts, counts_provenance)
+                        apply_counts, recomputable_provenance)
 from ..trace import (Segment, Tier, TraceSet, _is_token_count, _parse_ts,
                      request_from_row, resolve_tenant)
 
@@ -44,7 +44,7 @@ PROVENANCE_KEY = COUNTS_PROVENANCE_KEY
 ACCEPTED_COUNTER_VERSION = COUNTS_PROVENANCE_VERSION
 
 
-def _counts_are_vouched(row: dict, body: dict) -> bool:
+def _counts_are_vouched(row: dict, body: dict, target_id: str | None) -> bool:
     """Whether this row's `segment_tokens` may be trusted as exact.
 
     Provenance naming a counter version this loader knows, over digests of what
@@ -58,14 +58,25 @@ def _counts_are_vouched(row: dict, body: dict) -> bool:
     p = row.get(PROVENANCE_KEY)
     if not isinstance(p, dict):
         return False
-    # Compared against a freshly built record rather than field by field, so a
-    # field added to the contract is checked here the day it is added instead of
-    # the day somebody remembers to check it. The writer stamps a superset --
-    # the tokenizer that answered, the endpoint, the surface -- and those say
-    # whether a re-run would agree, which is a different question from whether
-    # these counts describe this body.
-    want = counts_provenance(body)
-    return all(p.get(k) == v for k, v in want.items())
+    # Every field this loader can recompute, in one comparison. It used to check
+    # three of them -- version and the two digests -- while `sweep_report`
+    # checked eight, so the gate that actually releases structural dollars was
+    # the weaker of the two: a counted file fed straight to `load_bodies` could
+    # change its top-level model, its surface or its usage and still load as
+    # exact.
+    #
+    # `counts_provenance` is the comparison record, so a field added to the
+    # contract is checked here the day it is added rather than the day somebody
+    # remembers to add a check.
+    if any(p.get(k) != v
+           for k, v in recomputable_provenance(body, row, target_id).items()):
+        return False
+    # The two the loader cannot recompute: which host answered and which
+    # deployment the operator asserted was behind it. It cannot verify them, so
+    # it requires them to be there. A counted export produced without
+    # `--tokenizer-id` claims nothing about what tokenizer answered, and that is
+    # the same unbacked claim `sweep_report` already refuses to reuse.
+    return bool(p.get("endpoint")) and bool(p.get("tokenizer_id"))
 
 # Where the request body and the response live in each export shape. Checked in
 # order; the first that yields a dict with `messages` wins. Adding a format is a
@@ -185,7 +196,7 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
 
     requests, notes = [], []
     skipped_no_body = unparseable = dropped_no_body = 0
-    counted = uncounted = unvouched = 0
+    counted = mismatched = unvouched = 0
     # Which requests got exact counts, in lockstep with `requests`, so coverage
     # can be weighted by what each one cost. `counted / segmented` counted rows,
     # and rows are the wrong denominator for a gate that releases dollars.
@@ -283,7 +294,7 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
             # by one flag would fail every row into the estimate branch below,
             # which is the direction that looks fine, so the two sides are
             # pinned to one function by test rather than by intention.
-            vouched = _counts_are_vouched(row, body)
+            vouched = _counts_are_vouched(row, body, target_id)
             if (isinstance(pre, list) and len(pre) == len(segs)
                     and all(_is_token_count(n) for n in pre)
                     and (sum(pre) > 0 or not billed)
@@ -292,7 +303,11 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
                 counted += 1
                 was_counted = True
             elif pre is not None:
-                uncounted += 1
+                # Counted separately by *why*, because the two say different
+                # things to an operator: a shape mismatch means re-run the
+                # counter, an unvouched row means the counts may be someone
+                # else's. One counter fed both notes, so the shape-mismatch note
+                # reported a figure that included rows whose shape was fine.
                 if not vouched:
                     # Estimated rather than refused, deliberately. The row's
                     # billed total is still real and its structure is still
@@ -301,6 +316,8 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
                     # denominator and understate spend, which is a second wrong
                     # answer laid over the first.
                     unvouched += 1
+                else:
+                    mismatched += 1
             _scale_to_measured(segs, _billed_input(usage) if usage else None)
         counted_flags.append(was_counted)
         requests.append(request_from_row(
@@ -346,7 +363,7 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
         f"{segmented:,} of {len(requests):,} requests carried a body and were segmented "
         f"post hoc. Segment boundaries are inferred from the logged body, not recorded "
         f"at source.")
-    if counted and not uncounted:
+    if counted and not (mismatched or unvouched):
         # Stated in money, not in request count. `counted` is a number of rows,
         # and rows are the wrong denominator for a sentence a reader takes as
         # "the figures rest on exact counts". A capture whose no-body rows carry
@@ -376,9 +393,9 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
     # when some other row's did. A `segment_tokens` array that matches nothing
     # means the enrichment step ran and did not take -- and if every row is like
     # that, `counted` is zero and this is the only thing that would say so.
-    if uncounted:
+    if mismatched:
         notes.append(
-            f"{uncounted:,} request(s) carried a `segment_tokens` array that did not "
+            f"{mismatched:,} request(s) carried a `segment_tokens` array that did not "
             f"match their segments -- wrong length, or a value that is not a token "
             f"count -- so they were estimated instead. That usually means the export "
             f"was re-segmented after counting; re-run tier-b/count_tokens.py against "
