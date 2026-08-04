@@ -482,41 +482,68 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         self.assertEqual(self._run(self._hook(), "claude-haiku-4-5"),
                          {UNATTRIBUTED})
 
-    def test_mutation_stands_down_rather_than_patching_a_guessed_surface(self):
-        """The consequence, not the label."""
+    def test_mutation_cannot_be_enabled_without_a_stated_surface(self):
+        """This used to assert a per-request stand-down, because the handler
+        would accept mutate=True with no surface and refuse each request.
+
+        That was the right instinct and the wrong place. Removing the
+        anthropic/direct substitution turned mutation off for the ordinary
+        LiteLLM Anthropic config -- `model: claude-opus-5` with no
+        `custom_llm_provider` -- and only a runtime alert said so, which is a
+        silent behaviour change discovered from a bill.
+
+        Recognising bare Claude ids as first-party was considered and rejected:
+        LiteLLM's `model` is the alias the client asked for, and aliasing
+        `claude-opus-5` to a Bedrock backend is ordinary configuration, so the
+        id is not evidence of the surface.
+
+        So the refusal moved to construction. One line of config at start-up,
+        instead of a per-request stand-down nobody reads.
+        """
+        from cacheeconomics.plugin import CachePlugin, litellm_handler
+        plug = CachePlugin(key=b"k" * 32, warmup=0)
+        with self.assertRaises(ValueError) as caught:
+            litellm_handler(plug, mutate=True)
+        self.assertIn("target_id", str(caught.exception))
+
+    def test_observation_still_needs_no_surface(self):
+        """The refusal is about mutating, not about running. A team watching
+        their traffic must not have to name a surface first."""
+        from cacheeconomics.plugin import CachePlugin, litellm_handler
+        plug = CachePlugin(key=b"k" * 32, warmup=0)
+        self.assertTrue(litellm_handler(plug, mutate=False))
+
+    def test_a_configured_handler_mutates_the_ordinary_anthropic_config(self):
+        """The regression this closes: a bare `claude-*` model with no provider
+        field, which is how most LiteLLM Anthropic deployments are set up."""
         import asyncio
         from cacheeconomics.plugin import CachePlugin, litellm_handler
         seen = []
         plug = CachePlugin(key=b"k" * 32, warmup=0)
         real = plug.on_request
-        plug.on_request = lambda body, **kw: (
-            seen.append((kw.get("target_id"), kw.get("apply"))), real(body, **kw))[1]
-        h = litellm_handler(plug, mutate=True)
+        plug.on_request = lambda b, **kw: (
+            seen.append((kw.get("target_id"), kw.get("apply"))), real(b, **kw))[1]
+        h = litellm_handler(plug, mutate=True, target_id="anthropic/direct")
         loop = asyncio.new_event_loop()
         try:
-            for _ in range(3):
-                loop.run_until_complete(h.async_pre_call_hook(
-                    {}, None, {"model": "claude-opus-5",
-                               "messages": [{"role": "user", "content": "x" * 400}]},
-                    "completion"))
+            loop.run_until_complete(h.async_pre_call_hook(
+                {}, None, {"model": "claude-haiku-4-5",
+                           "messages": [{"role": "user", "content": "x" * 400}]},
+                "completion"))
         finally:
             loop.close()
-        self.assertEqual(seen[0], (UNATTRIBUTED, False))
-        codes = [a.code for a in plug.alerts]
-        self.assertIn("RT-UNATTRIBUTED", codes)
-        self.assertEqual(codes.count("RT-UNATTRIBUTED"), 1,
-                         "one alert per scope, not one per request")
+        self.assertEqual(seen[0], ("anthropic/direct", True))
 
-    def test_a_named_surface_still_mutates(self):
-        """Standing down must not become never mutating."""
+    def test_a_row_that_names_its_own_surface_still_wins(self):
+        """The configured surface is a fallback, not an override."""
         import asyncio
         from cacheeconomics.plugin import CachePlugin, litellm_handler
         seen = []
         plug = CachePlugin(key=b"k" * 32, warmup=0)
         real = plug.on_request
-        plug.on_request = lambda body, **kw: (
-            seen.append((kw.get("target_id"), kw.get("apply"))), real(body, **kw))[1]
-        h = litellm_handler(plug, mutate=True)
+        plug.on_request = lambda b, **kw: (
+            seen.append(kw.get("target_id")), real(b, **kw))[1]
+        h = litellm_handler(plug, mutate=True, target_id="anthropic/direct")
         loop = asyncio.new_event_loop()
         try:
             loop.run_until_complete(h.async_pre_call_hook(
@@ -526,8 +553,7 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
                 "completion"))
         finally:
             loop.close()
-        self.assertEqual(seen[0], ("amazon-bedrock/converse", True))
-        self.assertNotIn("RT-UNATTRIBUTED", [a.code for a in plug.alerts])
+        self.assertEqual(seen[0], "amazon-bedrock/converse")
 
     def test_an_operator_override_answers_when_nothing_names_it(self):
         self.assertEqual(

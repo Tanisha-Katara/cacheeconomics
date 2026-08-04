@@ -742,6 +742,35 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
     without checking. The cost is that tool definitions -- usually the largest
     stable block there is -- are covered only when a marker sits above them.
     """
+    # Mutation requires a stated surface, at construction rather than per
+    # request. Markers are placed against a surface's minimum cacheable prefix,
+    # its supported lifetimes and its breakpoint budget, and none of those are
+    # knowable from a request that names no provider.
+    #
+    # This used to substitute `anthropic/direct` for an unnamed surface, which
+    # priced and patched Bedrock traffic as first-party. Removing that
+    # substitution turned mutation *off* for the ordinary LiteLLM Anthropic
+    # config -- `model: claude-opus-5` with no `custom_llm_provider` -- and only
+    # a runtime alert said so.
+    #
+    # Recognising bare Claude ids as first-party was considered and rejected:
+    # LiteLLM's `model` is the alias the client asked for, and aliasing
+    # `claude-opus-5` to a Bedrock backend is ordinary configuration, so the id
+    # is not evidence of the surface. `custom_llm_provider` is the authoritative
+    # field and rows that carry it still win.
+    #
+    # Failing here is louder and cheaper than either: one line of config, at
+    # start-up, instead of a silent behaviour change discovered from a bill.
+    if mutate and not target_id:
+        raise ValueError(
+            "litellm_handler(mutate=True) requires target_id. Placing a cache "
+            "marker needs the surface's minimum cacheable prefix, supported "
+            "lifetimes and breakpoint budget, and a request that names no "
+            "provider gives none of them -- a minimum guessed too low is "
+            "processed uncached, writes nothing, returns no error and bills "
+            "normally. Pass the surface you are proxying to, for example "
+            "target_id='anthropic/direct' or 'amazon-bedrock/converse'. "
+            "Observation needs no surface: mutate=False works unchanged.")
     if base is None:
         base = _custom_logger_base()
 

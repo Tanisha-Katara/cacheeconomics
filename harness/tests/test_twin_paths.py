@@ -978,7 +978,8 @@ class TestTheLiveResponseParserReadsBothLiteLLMShapes(unittest.TestCase):
 
         def alerts_for(resp):
             p = plugin.CachePlugin(key=KEY, warmup=2)
-            h = plugin.litellm_handler(p, mutate=True)
+            h = plugin.litellm_handler(p, mutate=True,
+                                       target_id="anthropic/direct")
 
             async def go():
                 for i in range(10):

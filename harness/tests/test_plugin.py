@@ -1526,7 +1526,8 @@ class TestALateVetoLeavesNoAppliedDecision(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_vetoed_decision_is_recorded_as_not_applied(self):
         p = CachePlugin(key=KEY)
-        h = litellm_handler(p, mutate=True)
+        h = litellm_handler(p, mutate=True,
+                            target_id="anthropic/direct")
         body = {"model": "claude-opus-5", "litellm_call_id": "c1",
                 "metadata": {"session_id": "s", "agent": "main"},
                 "messages": [{"role": "user",
@@ -1580,7 +1581,8 @@ class TestStructuredMetadataCannotFailTheCall(unittest.IsolatedAsyncioTestCase):
                      {"session_id": {"a": 1}, "agent": {"b": 2}},
                      {"session_id": [1], "conversation_id": "fallback"}):
             with self.subTest(meta=meta):
-                h = litellm_handler(CachePlugin(key=KEY), mutate=True)
+                h = litellm_handler(CachePlugin(key=KEY), mutate=True,
+                                    target_id="anthropic/direct")
                 out = await h.async_pre_call_hook(
                     self.Keys(), None, self._body(meta), "completion")
                 self.assertIsNotNone(out)
