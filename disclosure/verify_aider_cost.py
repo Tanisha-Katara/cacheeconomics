@@ -111,6 +111,67 @@ def arithmetic() -> int:
     return 0 if ok else 1
 
 
+GUARD_URL = ("https://raw.githubusercontent.com/Aider-AI/aider/main/"
+             "aider/coders/base_coder.py")
+
+
+def premise() -> int:
+    """Does the arithmetic above actually run?
+
+    The original filing said `compute_costs_from_tokens` produces the printed
+    cost. It does not: the caller tries LiteLLM's own calculator first and falls
+    back only when that comes back empty. That was retracted publicly in
+    `correction-aider-5516.md`, whose closing line is the reason this function
+    exists -- "the reproduction I attached checked my arithmetic and never
+    checked my premise."
+
+    So the premise is checked, from upstream, rather than asserted in prose. A
+    verifier that replays arithmetic and stops is the same artifact that caused
+    the retraction.
+    """
+    import urllib.request
+    print("Premise: is that arithmetic on the path a normal call takes?\n")
+    try:
+        src = urllib.request.urlopen(GUARD_URL, timeout=30).read().decode()
+    except Exception as e:                                     # noqa: BLE001
+        print(f"  could not fetch base_coder.py ({e.__class__.__name__}).")
+        print("  PREMISE UNCHECKED -- offline. The arithmetic above still holds;")
+        print("  whether it executes is exactly what this could not confirm, so")
+        print("  do not read the result above as the original claim.")
+        return 0
+
+    lines = src.splitlines()
+    call = guard = fallback = None
+    for i, line in enumerate(lines, 1):
+        if "litellm.completion_cost(" in line and call is None:
+            call = i
+        elif call and guard is None and line.strip() == "if not cost:":
+            guard = i
+        elif guard and fallback is None and "compute_costs_from_tokens(" in line:
+            fallback = i
+            break
+
+    if not (call and guard and fallback):
+        print("  the guard is no longer where it was: completion_cost="
+              f"{call}, `if not cost:`={guard}, fallback={fallback}")
+        print("  PREMISE CHANGED -- re-read the caller before citing this.")
+        return 1
+
+    print(f"  base_coder.py:{call}  cost = litellm.completion_cost(...)")
+    print(f"  base_coder.py:{guard}  if not cost:")
+    print(f"  base_coder.py:{fallback}      cost = self.compute_costs_from_tokens(...)\n")
+    print("  So the fallback runs only when completion_cost returns falsy or")
+    print("  raises -- an uncosted model, or an exception. Measured on")
+    print("  claude-haiku-4-5 through litellm 1.83.9, completion_cost returned")
+    print("  $0.0068015 non-streaming and $0.0005892 streaming, both correct,")
+    print("  so the fallback was not reached in either.\n")
+    print("SCOPE: latent. The two defects above are real and unretracted, and")
+    print("       they do not produce the cost aider prints in the normal case.")
+    print("       The original headline claim that they do was withdrawn in")
+    print("       correction-aider-5516.md.")
+    return 0
+
+
 def live() -> int:
     """Re-establish the premise: prompt_tokens does not move when the same
     prompt goes from uncached, to a cache write, to a cache read."""
@@ -151,6 +212,8 @@ def live() -> int:
 
 if __name__ == "__main__":
     rc = arithmetic()
+    print("\n" + "=" * 62 + "\n")
+    rc |= premise()
     if "--live" in sys.argv:
         print("\n" + "=" * 62 + "\n")
         rc |= live()

@@ -51,7 +51,16 @@ CLAIMS = [
         "4-aider",
         "Aider-AI/aider",
         "aider/coders/base_coder.py",
-        [(2092, "prompt_tokens - input_cost_per_token_cache_hit"),
+        # The guard first, then the arithmetic it guards. Pinning only the
+        # arithmetic is what let the original filing claim this code produces
+        # the printed cost: the fallback is reached only when
+        # `litellm.completion_cost` comes back falsy, and nothing here would
+        # have noticed that guard being added, moved or removed. That omission
+        # is what correction-aider-5516.md retracts.
+        [(2037, "litellm.completion_cost("),
+         (2041, "if not cost:"),
+         (2042, "compute_costs_from_tokens("),
+         (2092, "prompt_tokens - input_cost_per_token_cache_hit"),
          (2095, "cache_write_tokens * input_cost_per_token * 1.25"),
          (2097, "cost += prompt_tokens * input_cost_per_token")],
         [],
