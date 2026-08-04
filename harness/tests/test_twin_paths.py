@@ -1328,6 +1328,46 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         self.assertIsNotNone(b.delta_pct)
         self.assertNotIn("indeterminate", b.verdict)
 
+    def test_the_invoice_is_not_an_input_to_the_comparison(self):
+        """Why the exception above is an exception, asserted rather than argued.
+
+        "No Gate 1 pass may print when the evidence behind it is withheld" is a
+        proxy. The sharp rule is that a percentage dies when the missing
+        evidence moves the arms *differentially*, and every blocker added to
+        this gate was measured doing exactly that: an unprovable lifetime took
+        the same twelve requests from 20.0% to 50.0%, and an estimated split
+        moved the relocation headline 11.4 points on real bodies.
+
+        An invoice cannot, because it is not an input. It is compared against
+        the as-shipped arm after the fact and never enters a spend calculation,
+        so it can be absent, exact, a thousand times too large, a cent, or
+        negative, and the arms are bit-identical. That is what this asserts --
+        if the invoice ever becomes an input, this fails and the carve-out has
+        to be re-argued rather than quietly inherited.
+        """
+        ts = self._clean()
+        exact = simulate.bake_off(ts.analysable, trace=ts,
+                                  allow_unreconciled=True
+                                  ).arms["as-shipped"]["spend"].raw()
+        seen = set()
+        for label, kw in (("no invoice, override", {"allow_unreconciled": True}),
+                          ("no invoice, no flag", {}),
+                          ("exact", {"invoice_usd": exact}),
+                          ("wildly high", {"invoice_usd": 999_999.0}),
+                          ("a cent", {"invoice_usd": 0.01}),
+                          ("negative", {"invoice_usd": -5.0})):
+            with self.subTest(label):
+                b = simulate.bake_off(ts.analysable, trace=ts, **kw)
+                self.assertIsNotNone(b.delta_pct, label)
+                seen.add((b.delta_pct, b.delta_pct_relocation,
+                          b.delta_pct_optimistic,
+                          b.delta_pct_relocation_optimistic))
+        self.assertEqual(
+            len(seen), 1,
+            f"the invoice moved the comparison across {len(seen)} distinct "
+            f"outcomes, so it is an input after all and the missing-invoice "
+            f"carve-out is not defensible: {sorted(seen)}")
+
     def test_the_verdict_still_names_the_specific_blocker(self):
         """Refusing is not enough if the refusal sends the reader nowhere. Each
         condition has to say which one it was, or "indeterminate" becomes the
