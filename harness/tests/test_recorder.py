@@ -207,12 +207,36 @@ class TestRecordingRoundTrip(unittest.TestCase):
 
         The structure is what this asserts. The *verdict* is a separate claim
         and the recorder does not yet earn it: `Recorder` runs
-        `_scale_to_measured` over every capture and never writes
-        `tokens_counted`, so its own output loads with `tokens_are_counted`
-        False and the bake-off will not answer Gate 1 over a byte-share split.
-        That is not a regression this test should paper over -- `analyze` over
-        the identical capture already withholds FAN-1's money for the same
-        reason and drops it to confidence "low". The two agreeing is the point.
+        `_scale_to_measured` over every capture and stamps
+        `tokens_are_estimated: True` on every row, so its own output loads with
+        `tokens_are_counted` False and the bake-off will not answer Gate 1 over
+        a byte-share split. `analyze` over the identical capture already
+        withholds FAN-1's money for the same reason and drops it to confidence
+        "low"; the two agreeing is the point, and the row's own flag has been
+        saying so since the recorder was written.
+
+        What that costs, measured on the committed evidence rather than argued.
+        `tier-b/evidence/inferred-token-split.json` carries estimated and real
+        per-segment counts for the same real bodies, with the totals equal in
+        every case, so it isolates the split. Replaying the four cases that have
+        enough segments in the volatile-head shape -- the shape Gate 1 is about:
+
+            case                              head est->real   placement  relocation
+            dense JSON tools beside prose      356->845 0.42x   20.0/20.0  38.5/38.0
+            tools dominate                     538->982 0.55x   20.0/20.0  69.0/64.3
+            long identifiers, low bytes/token  925->329 2.81x   20.0/20.0  67.5/78.9
+            multi-turn with tool results       341->795 0.43x   20.0/20.0  20.0/20.0
+
+        The relocation headline moves by up to 11.4 points from the split alone,
+        which is wider than the 10% gate itself. The placement headline did not
+        move at all across head errors from 0.42x to 2.81x.
+
+        That asymmetry is real and it is deliberately NOT acted on. Four cases
+        agreeing to the decimal is suggestive of something structural -- the
+        relocation arm moves token mass across the cache boundary and placement
+        does not -- but four cases are not a proof, and relaxing a gate on the
+        strength of a pattern I cannot derive is the overclaim this branch keeps
+        producing. Both verdicts stay blocked until someone establishes it.
 
         The counted half is asserted below, so this is a statement about the
         recorder rather than an off switch.
