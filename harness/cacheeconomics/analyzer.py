@@ -96,6 +96,17 @@ class Finding:
     # counters. Those claims are only as good as the segmentation behind them,
     # which on an inferred trace is a guess until somebody measures it.
     structural: bool = False
+    # Why *this finding's own* sample cannot support a monthly projection, or ""
+    # if it can. Set by `_avoidable` from the timestamps of the requests that
+    # actually contributed to the amount, and applied by `analyze` after the
+    # reconciliation gate has had its say.
+    #
+    # Per-finding rather than per-trace because the floor was evaluated once
+    # from the whole window and request count, so a finding costed from two
+    # requests one second apart cleared it on the strength of unrelated traffic.
+    # It is a string rather than a bool so the reason carries the finding's own
+    # numbers -- "2 requests", not the trace's ten.
+    projection_why: str = ""
 
     def describe(self) -> str:
         """The structural finding always renders; the dollar claim may not.
@@ -284,11 +295,22 @@ def _usages(reqs: list[Request]) -> tuple[list[cost.Usage], list[Request]]:
     return priced, unprovable
 
 
-def _window_days(reqs: list[Request]) -> float | None:
-    ts = sorted(r.sent_at for r in reqs if r.sent_at)
+def _span_days(times) -> float | None:
+    """How long a set of timestamps spans, floored at an hour.
+
+    Split out from `_window_days` because the projection floor has to ask this
+    of a *finding's own* sample as well as of the whole trace, and a rule holds
+    timestamps rather than Requests by the time it knows which ones paid for its
+    figure.
+    """
+    ts = sorted(t for t in times if t)
     if len(ts) < 2:
         return None
     return max((ts[-1] - ts[0]).total_seconds() / 86400.0, 1 / 24)
+
+
+def _window_days(reqs: list[Request]) -> float | None:
+    return _span_days(r.sent_at for r in reqs)
 
 
 # A projection multiplies the observed window by `30/window_days`, so the
@@ -309,39 +331,69 @@ PROJECTION_MIN_DAYS = 1.0
 PROJECTION_MIN_REQUESTS = 10
 
 
-# What this floor does and does not withhold, said once because it is appended
-# to both reasons below and because the previous version of this sentence
-# described the code as it was *not*: it said any per-finding monthly figure
-# "has not been gated by it", which was true and is now false. A reason string
-# that overstates what was protected is bad; one that understates it sends a
-# reader hunting for a leak that no longer exists.
+# What this floor does and does not withhold. Said once per sample it can be
+# asked about, because the previous version of this sentence described the code
+# as it was *not* -- twice.
 #
-# The word "reconciled" is deliberately not in it, and a test asserts that:
+# First it said any per-finding monthly figure "has not been gated by it", which
+# was true until the gate reached them. Then the replacement said the refusal
+# withholds "the spend total and each finding's", which is true when the *trace*
+# fails the floor and false when the trace clears it and one finding's own
+# evidence does not: there the spend total publishes and the sentence beside the
+# withheld finding claims otherwise. Overstating and understating what was
+# protected are the same defect pointed opposite ways, and this one had already
+# been fixed once in the other direction.
+#
+# The word "reconciled" is deliberately not in either, and a test asserts that:
 # this reader supplied a correct invoice, and any mention of reconciliation in
 # the refusal sends them to fix something that is not broken.
-_PROJECTION_SCOPE = (
+_SCOPE_TRACE = (
     "This withholds every monthly figure -- the spend total and each finding's. "
     "Nothing measured over the window itself is affected: measured spend and "
     "each finding's avoidable amount over the observed window still publish, "
     "because the invoice does establish those.")
 
+_SCOPE_FINDING = (
+    "This withholds this finding's monthly figure and nothing else -- other "
+    "findings are judged on their own evidence, and the trace as a whole may "
+    "well carry enough of it. The amount avoided over the observed window still "
+    "publishes, because the invoice does establish that.")
 
-def _projection_supported(window_days, n_requests) -> tuple[bool, str]:
-    """May a per-month figure be published from this window?"""
+
+def _projection_supported(window_days, n_requests, *,
+                          sample: str = "trace") -> tuple[bool, str]:
+    """May a per-month figure be published from this sample?
+
+    `sample` names what was measured, because this is asked twice about two
+    different populations: the whole trace, for the spend total, and a single
+    finding's contributing requests, for that finding's figure. Reporting the
+    trace's numbers in a refusal about a finding is how a reader concludes the
+    tool is broken -- they can see ten requests over two days in the coverage
+    line directly above a sentence saying there were two.
+    """
+    subject, scope = {
+        "trace": ("this trace covers", _SCOPE_TRACE),
+        "finding": ("the evidence behind this finding covers", _SCOPE_FINDING),
+    }[sample]
     if not window_days or window_days < PROJECTION_MIN_DAYS:
         got = f"{(window_days or 0) * 24:.1f} hours"
         return False, (
             f"monthly figures need at least {PROJECTION_MIN_DAYS:.0f} day of "
-            f"traffic and this trace covers {got}. Agent workloads have a daily "
+            f"traffic and {subject} {got}. Agent workloads have a daily "
             f"cycle, so a shorter sample cannot be scaled to a month -- an "
             f"invoice proves the measured subtotal, not that the window is "
-            f"typical. " + _PROJECTION_SCOPE)
+            f"typical. " + scope)
     if n_requests < PROJECTION_MIN_REQUESTS:
+        # "rests on" rather than "covers": the count is of the requests that
+        # contributed, which for a finding is not the same as the requests its
+        # window spans.
+        rests = ("this trace has" if sample == "trace"
+                 else "this finding rests on")
         return False, (
             f"monthly figures need at least {PROJECTION_MIN_REQUESTS} requests "
-            f"and this trace has {n_requests}. Below that a single request moves "
+            f"and {rests} {n_requests}. Below that a single request moves "
             f"the projected total more than the rest of the trace combined. "
-            + _PROJECTION_SCOPE)
+            + scope)
     return True, ""
 
 
@@ -382,7 +434,8 @@ def _withhold_projection(fig, why: str):
     return fig.release(False, why) if fig is not None and fig.released else fig
 
 
-def _avoidable(amount: float | None, window_days: float | None) -> dict:
+def _avoidable(amount: float | None, window_days: float | None,
+               sample_times) -> dict:
     """Both halves of a finding's dollar claim, built at one site.
 
     Returned as kwargs so a rule cannot supply one and forget the other. Every
@@ -400,18 +453,64 @@ def _avoidable(amount: float | None, window_days: float | None) -> dict:
     projection floor to gate. It carries MODELED because it is still a
     counterfactual -- what the workload would not have spent under a different
     configuration -- and no counterfactual was run.
+
+    `sample_times` is the timestamp of every request that contributed a term to
+    `amount`, and it is required rather than optional. The floor used to be
+    evaluated once, from the whole trace, and applied to every finding -- so a
+    finding costed from two requests one second apart published a month because
+    eight unrelated requests elsewhere in the file made the *global* window and
+    count clear the floor. Measured on a ten-request, 2.3-day trace whose only
+    two cache writers went out one second apart: EFF-1 published $6.43/mo and
+    FAN-1 $14.79/mo, both `reconciled`, on a two-request sample. The request
+    floor exists precisely so a small subset cannot drive a client-facing
+    projection, and evaluated globally it did not do that job.
+
+    Required, with no default, because a default is how the next rule silently
+    gets the old behaviour back.
+
+    The subset check subsumes the global one for findings and is not merely
+    added to it: a finding's sample is drawn from the trace, so its window and
+    count can only be smaller. Where the whole trace fails the floor, every
+    finding fails it too, and with its own numbers in the reason rather than the
+    trace's.
     """
     if amount is None:
         return {"avoidable_usd_window": None, "avoidable_usd_month": None}
+    sample = list(sample_times)
+    supported, why = _projection_supported(_span_days(sample), len(sample),
+                                           sample="finding")
     return {
         "avoidable_usd_window": money.Figure(
             amount, money.MODELED, released=False,
             withheld_because="not yet reconciled"),
         "avoidable_usd_month": _monthly(amount, window_days),
+        # Recorded rather than applied. Both figures are withheld at this point
+        # and `Finding.released` releases whatever it finds, so a refusal
+        # applied here would be undone by the reconciliation gate a moment
+        # later. `analyze` re-applies this after release, which is the same
+        # order the trace-wide floor already used for `monthly_input_usd`.
+        "projection_why": "" if supported else why,
     }
 
 
 # --- diagnosis rules -------------------------------------------------------
+
+def _rate_free(fn):
+    """Marks a rule whose evidence is counters and identity, never a price.
+
+    Those rules run over every analysable request; the rest run over the priced
+    subset, because a dollar figure must not be derived from a row that spend
+    excluded. Marking the *rate-free* ones rather than the pricing ones makes
+    the unmarked default the narrow, older behaviour, so a rule added later
+    cannot widen its own input by omission.
+
+    A marker is a claim, and this file's whole subject is claims nothing can
+    contradict, so `TestTheRateFreeMarkingIsAccurate` checks it by watching
+    which rules actually reach for `rate_for` and `cost.price`.
+    """
+    fn.rate_free = True
+    return fn
+
 
 def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
     """Are the writes being read? This is where money actually leaks."""
@@ -455,6 +554,12 @@ def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
     # excess as a fixed fraction of write volume no matter how much was read
     # back. A write of 100k with a 40k payback and one with no payback at all
     # both reported the same $90.
+    # The requests that actually moved `excess`, for the projection floor. A row
+    # of plain uncached input prices identically either way, so it contributes a
+    # term of exactly zero and is not part of the sample this figure would be
+    # scaled from -- counting it would let filler traffic vouch for a projection
+    # it contributed nothing to, which is the defect this list exists to close.
+    contributed: list = []
     excess, unprovable = 0.0, 0
     for r in reqs:
         try:
@@ -474,7 +579,10 @@ def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
         except registry.RegistryError:
             unprovable += 1
             continue
-        excess += spend.usd - spend.hypothetical_uncached_usd
+        term = spend.usd - spend.hypothetical_uncached_usd
+        if term:
+            contributed.append(r.sent_at)
+        excess += term
     wasted = excess
     if wasted <= 0:
         # Caching is paying for itself on this workload even at a low ratio.
@@ -490,7 +598,7 @@ def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
                 + (f" {unprovable} request(s) had writes of unprovable lifetime and are "
                    f"excluded from the figure." if unprovable else "")),
         affected_requests=sum(1 for r in reqs if write_tokens(r.usage)),
-        **_avoidable(wasted, window),
+        **_avoidable(wasted, window, contributed),
         confidence="high", quality_risk="low",
         fix="Find what invalidates the prefix between requests before changing any TTL. "
             "A longer lifetime on an unstable prefix buys nothing.")
@@ -612,6 +720,10 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
             continue
         by_chain[reuse_chain_of(r)].append((r.sent_at, tokens, r, ttl))
 
+    # Timestamps of the requests that actually contributed to `wasted`, for the
+    # projection floor. Only the transitions that were still warm recover
+    # anything, so only they are the sample this figure would be scaled from.
+    contributed: list = []
     per_request, wasted = [], 0.0
     for entries in by_chain.values():
         entries.sort(key=lambda e: e[0])
@@ -622,6 +734,7 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
             last = sent_at
             if not alive:
                 continue            # cold before the move and cold after it
+            contributed.append(sent_at)
             try:
                 m = registry.multipliers(r.target_id)
             except registry.RegistryError:
@@ -670,7 +783,7 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
         # No figure when a second blocker means this move recovers nothing on
         # its own. The observation stands; the arithmetic for the full move set
         # is not something this rule models.
-        **_avoidable(None if stuck else wasted, window),
+        **_avoidable(None if stuck else wasted, window, contributed),
         confidence="medium" if stuck else "high", quality_risk="medium",
         fix=("Move that segment after the last breakpoint. Where it carries operator "
              "authority, a mid-conversation system message preserves that while keeping "
@@ -681,6 +794,7 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
                 f"no figure is attached to moving this one by itself.")))
 
 
+@_rate_free
 def _f_below_minimum(reqs, ratios, window, rate_for) -> Finding | None:
     """Markers on prefixes too short to cache. Silent: no error is returned."""
     hits = []
@@ -860,7 +974,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 continue
             by_scope[(r.tenant, r.target_id, r.model, r.session)].append(
                 (r.sent_at, u.cache_write_5m, rate_for(r.model, _when(r), r.target_id),
-                 spans))
+                 spans, (r.usage.get("cache_read_input_tokens") or 0)))
 
         # Only a rewrite in the 5m-to-1h band is evidence that the five-minute
         # lifetime is what caused the miss. A rewrite 60 seconds after the last
@@ -869,6 +983,12 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
         # cache pool. A longer lifetime does not fix any of those, and counting
         # them here published savings for traffic the recommendation cannot
         # help. EFF-1 and VOL-1 are the findings that name those causes.
+        # Every write that moved `recoverable`, in either direction, for the
+        # projection floor. Both arms count: the in-band rewrites this rule would
+        # convert to reads and the cold writes it charges the 1h premium for are
+        # equally part of the sample the net figure is scaled from. A rewrite
+        # excluded as a non-TTL miss is not -- it contributes no term.
+        contributed: list = []
         non_ttl_misses, in_band_rewrites = 0, 0
         for scope, writes in by_scope.items():
             writes.sort()
@@ -906,8 +1026,41 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
             # stops at the first match, which is the longest still-relevant one
             # because writes are in time order.
             earlier: list = []
-            for sent_at, tokens, rate, spans in writes:
+            for sent_at, tokens, rate, spans, read in writes:
                 per_token = rate / 1e6
+                # The size of the cache ENTRY this request leaves behind, which
+                # is not the size of the write that touched it.
+                #
+                # A read refreshes the entry it read, so a request that reads a
+                # 100k prefix back and writes a 1k appended suffix leaves a live
+                # 100k+1k entry while writing 1,000 tokens. Storing the write
+                # meant the later TTL miss on that entry was credited with
+                # recovering 1,000 tokens instead of 101,000 -- and since the
+                # cold-write premium is charged against the real write, the
+                # netting came out negative and the rule went silent. Measured
+                # on a synthetic thirteen-request trace of refresh-then-miss
+                # cycles: TTL-1 did not fire at all, against $3.11 of genuine
+                # recovery over the window. A correct recommendation never
+                # reaching the client is a different kind of wrong from an
+                # inflated one, but it is still wrong.
+                #
+                # `read + write` is the cached part of this prompt: the provider
+                # bills each input token exactly once as a read, a write, or
+                # plain input, so the two are disjoint and adding them
+                # double-counts nothing.
+                #
+                # Pre-existing rather than introduced by the proportional share
+                # above -- measured on the same fixture with that share reverted,
+                # TTL-1 was equally silent. `read` is zero on every cache-writing
+                # row in every shipped fixture (0 of 136 in demo-traces.jsonl),
+                # which is why nothing caught it and why no published figure
+                # moves: with no read this is exactly `tokens` and the
+                # single-marker case is unchanged to the cent.
+                #
+                # The cap below still bounds recovery by what the later request
+                # actually wrote, so this cannot credit a read that never had to
+                # be re-paid for.
+                established = read + tokens
                 match = None
                 for prev_at, prev_span, prev_tokens in reversed(earlier):
                     if span_is_reusable_by(prev_span, spans, _lookback,
@@ -944,7 +1097,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 outermost_tokens = spans[-1][1] or 0
                 for span in spans:
                     share = (span[1] / outermost_tokens) if outermost_tokens else 1.0
-                    earlier.append((sent_at, span, tokens * share))
+                    earlier.append((sent_at, span, established * share))
                 gap = None if match is None else (sent_at - match[0]).total_seconds()
                 if gap is not None and gap <= 300:
                     non_ttl_misses += 1        # a 5m entry was still alive; not a TTL problem
@@ -958,16 +1111,24 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                     # content under either lifetime, so crediting all of it
                     # overstates the saving.
                     #
-                    # Both sides are the provider's own `cache_creation` figure
-                    # rather than our segment token estimates. Bounding by the
-                    # estimate instead cut a fixture writing 200,000 tokens down
-                    # to its 7,000-token segment sum and silenced the rule --
-                    # the estimate is a split of the billed total, not a second
+                    # Both sides are the provider's own billed counters rather
+                    # than our segment token estimates. Bounding by the estimate
+                    # instead cut a fixture writing 200,000 tokens down to its
+                    # 7,000-token segment sum and silenced the rule -- the
+                    # estimate is a split of the billed total, not a second
                     # opinion on it.
+                    #
+                    # `match[1]` is the matched entry's size and `tokens` is what
+                    # this request actually wrote. The cap is what keeps this
+                    # honest in the other direction: however large the entry was,
+                    # a longer lifetime can only save what this request paid to
+                    # write again.
                     recovered = min(match[1], tokens)
                     recoverable += recovered * per_token * (_w5 - _read)
+                    contributed.append(sent_at)
                 else:
                     recoverable -= tokens * per_token * (_w1h - _w5)    # cold write costs more
+                    contributed.append(sent_at)
 
         # A longer lifetime only helps if the prefix is actually reused, and
         # there are two ways to prove reuse. Observed reads are one. The other
@@ -1004,13 +1165,19 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
         monetizable = unkeyed == 0 and recoverable > 0
         rank = recoverable if monetizable else 0.0
         candidates.append((rank, agent, median, in_band, len(ts),
-                           already_1h, unprovable, non_ttl_misses, monetizable))
+                           already_1h, unprovable, non_ttl_misses, monetizable,
+                           # Carried per candidate, not read off the winner
+                           # afterwards: `contributed` is rebuilt per agent, so
+                           # taking it from the enclosing scope after the loop
+                           # would hand the winning agent whichever agent
+                           # happened to be iterated last.
+                           contributed))
     if not candidates:
         return None
     # Nothing written means nothing to recover by changing the lifetime; that
     # agent has a different problem and a different finding will name it.
-    extra, agent, median, in_band, n, already_1h, unprovable, non_ttl, monetizable = \
-        max(candidates, key=lambda c: (c[0], c[3]))
+    (extra, agent, median, in_band, n, already_1h, unprovable, non_ttl,
+     monetizable, contributed) = max(candidates, key=lambda c: (c[0], c[3]))
     caveat = ""
     if already_1h:
         caveat = (f" {already_1h:,} tokens for this agent are already written at the "
@@ -1058,7 +1225,7 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 f"five-minute cache expires before the next request and rewrites at 1.25x, "
                 f"while a one-hour cache would have read at 0.1x.{caveat}"),
         affected_requests=n,
-        **_avoidable(extra if monetizable else None, window),
+        **_avoidable(extra if monetizable else None, window, contributed),
         confidence="medium" if monetizable else "low", quality_risk="low",
         fix="Set a one-hour TTL on the static prefix for this agent. Outside the "
             "five-minute-to-one-hour band the five-minute default is cheaper, so this "
@@ -1125,6 +1292,11 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
     band_gaps = band_priced = under_5m = over_1h = 0
     saving = cost_of_switch = 0.0
     surfaces = set()
+    # Requests that moved `net`, for the projection floor: the ones that wrote
+    # at the one-hour lifetime (the saving) and the ones at an in-band gap that
+    # carried a read (the rebuild it would cost). A gap counted only for the
+    # rarity premise contributes no dollars and is not part of the sample.
+    contributed: list = []
     for (tenant, target_id, model, session), rows in by_scope.items():
         try:
             m = registry.multipliers(target_id)
@@ -1145,6 +1317,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
             if u.cache_write_1h:
                 written_1h += u.cache_write_1h
                 saving += u.cache_write_1h * per_token * (w1h - w5)
+                contributed.append(sent_at)
             if prev is not None:
                 gap = (sent_at - prev[0]).total_seconds()
                 if gap < 300:
@@ -1160,6 +1333,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
                         band_priced += 1
                         band_prefix += prefix
                         cost_of_switch += prefix * per_token * (w5 - read)
+                        contributed.append(sent_at)
             prev = (sent_at, r, u)
 
     if not written_1h:
@@ -1238,7 +1412,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
                 f"out ahead. This is a projection, not an observation -- the "
                 f"five-minute arm was never run."),
             affected_requests=sum(len(v) for v in by_scope.values()),
-            **_avoidable(abs(net), window),
+            **_avoidable(abs(net), window, contributed),
             confidence="medium" if band_gaps else "high", quality_risk="medium",
             fix="Drop the static prefix to the five-minute lifetime and measure "
                 "again before assuming it held. Where a scope genuinely idles "
@@ -1286,6 +1460,12 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             buckets[((r.tenant, r.target_id, r.model), pk)].append(r)
     waste, groups, unprovable = 0.0, 0, 0
     affected = set()
+    # The requests in a counted pair, for the projection floor. Fan-out evidence
+    # is concurrent by definition, so a trace with a single pair spans seconds
+    # and cannot support a month -- which is exactly the case that published
+    # $14.79/mo off two requests one second apart while eight unrelated rows
+    # elsewhere in the file carried the global floor.
+    contributed: dict = {}
     # Which rule decided each pair was concurrent, so the detail can say so
     # rather than implying every trace was measured the same way.
     boundaries: set = set()
@@ -1326,6 +1506,11 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
             per_token = rate_for(b.model, _when(b), b.target_id) / 1e6
             groups += 1
             affected.update((a.request_id, b.request_id))
+            # Keyed by request id, because three requests fanning out form two
+            # adjacent pairs and `b` is counted in both -- the same reason
+            # `affected` is a set rather than a running total.
+            contributed[a.request_id] = a.sent_at
+            contributed[b.request_id] = b.sent_at
             waste += ub.cache_write_5m * per_token * (m["write_5m"] - 0.10)
             waste += ub.cache_write_1h * per_token * (m["write_1h"] - 0.10)
     # One pair is the whole phenomenon. Two concurrent requests writing the
@@ -1355,11 +1540,12 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
         # Unique requests, not pairs times two. Three requests fanning out form
         # two adjacent pairs and would have been reported as four requests.
         affected_requests=len(affected),
-        **_avoidable(waste, window),
+        **_avoidable(waste, window, contributed.values()),
         confidence="medium", quality_risk="low",
         fix="Send one request, wait for its first token, then release the rest of the batch.")
 
 
+@_rate_free
 def _f_model_split(reqs, ratios, window, rate_for) -> Finding | None:
     """One session spread across models means separate cache pools."""
     # Scoped by tenant and surface. Session ids are not globally unique in a
@@ -1429,6 +1615,7 @@ REBUILD_FRACTION = 0.5
 HEALTHY_READ_SHARE = 0.75
 
 
+@_rate_free
 def _f_prefix_rebuild(reqs, ratios, window, rate_for) -> Finding | None:
     """How often the accumulated prefix is thrown away and paid for again.
 
@@ -1615,6 +1802,7 @@ def _f_cache_verdict(reqs, ratios, window, rate_for) -> Finding | None:
              "Stop writing caches that nothing reads before tuning anything else."))
 
 
+@_rate_free
 def _f_rebuild_abstention(reqs, ratios, window, rate_for) -> Finding | None:
     """REB-0 as its own rule, so it cannot suppress REB-1.
 
@@ -1794,16 +1982,44 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         uncached_total += s.hypothetical_uncached_usd
         priced_usages.append(u)
         priced_reqs.append(r)
-    usages, priced = priced_usages, priced_reqs
-    ratios = cost.ratios(usages)
+    # `ratios` stays the observed one, computed above from every row whose usage
+    # counters parse. It used to be recomputed here over the priced subset, and
+    # that threw away measurements pricing has no bearing on: `input_from_cache`
+    # and `prefix_efficiency` are ratios of the provider's own counters and
+    # depend on no rate table at all.
+    #
+    # Measured on a 40-request Bedrock trace with full usage counters -- a
+    # surface the cloud provider invoices, so the recorded Anthropic rates do
+    # not apply and every row fails pricing: `requests` reported 0,
+    # `input_from_cache` and `prefix_efficiency` both None, and no findings,
+    # under a coverage line reading "40 of 40 requests analysable". The report
+    # said it had read everything and then said nothing about any of it.
+    priced = priced_reqs
 
-    # Rules run over the priced set, not every request. Spend already excluded
-    # requests whose write lifetime could not be proven, but the rules were
-    # still reading the full list and computing avoidable_usd_month straight off
-    # cache_creation_input_tokens — so a trace could carry a note saying those
-    # requests were excluded from every dollar figure while a finding published
-    # a monthly saving derived from them.
-    findings = [f for f in (rule(priced, ratios, window, rate_for) for rule in RULES) if f]
+    # Each rule gets the population its own evidence can support, rather than
+    # one list for all of them.
+    #
+    # A rule marked `@_rate_free` reads counters and identity and never asks for
+    # a price, so a surface with no recorded rate takes nothing away from it:
+    # REB-1 counting prefix rebuilds, REB-0 saying which rows it could not group,
+    # SPL-1 naming a session that switched model, MIN-1 finding a marker under
+    # the provider's minimum. Those run over every analysable request. The
+    # pricing rules keep the priced subset, which is what stops a dollar figure
+    # being derived from a row spend excluded.
+    #
+    # Running everything over the wide set was tried first and is wrong: on the
+    # Bedrock trace `rate_for` returns 0.0 for a surface it cannot price, and
+    # `cost.price` refuses a zero rate with a `ValueError` that EFF-1 does not
+    # catch, so the whole analysis raised. Sixteen tests said so.
+    #
+    # The default for an unmarked rule is the narrow set, so a rule added later
+    # keeps today's behaviour rather than silently widening. The marking is
+    # verified at runtime by `TestTheRateFreeMarkingIsAccurate`, which spies on
+    # `rate_for` and `cost.price` per rule -- a comment claiming a function does
+    # not price is exactly the kind of claim this suite exists to stop trusting.
+    findings = [f for f in
+                (rule(reqs if getattr(rule, "rate_free", False) else priced,
+                      ratios, window, rate_for) for rule in RULES) if f]
     findings.sort(key=lambda f: (
         {"high": 0, "medium": 1, "low": 2}[f.severity],
         -(f.avoidable_usd_month.raw() if f.avoidable_usd_month else 0)))
@@ -2115,6 +2331,39 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         # thing again -- the fix was never an invoice, it was a rate.
         why = _residual_blocker()
 
+    # An ingest adapter can know something the analyzer cannot see, and record
+    # it as a blocking note: most sharply, that the *surface* was assumed rather
+    # than stated by the export. Nothing here read those, so a trace whose rate
+    # table was a guess reconciled against the invoice and published
+    # `released_as='reconciled'` -- the provenance of an invoice check, on a
+    # figure computed from an assumption. Measured on a twelve-request trace
+    # carrying one such note: every figure in `spend`, the finding, and
+    # `total_avoidable_month` all came back `reconciled`, and the assumption
+    # survived only as free text a renderer appended afterwards.
+    #
+    # DRAFT rather than withheld, and the distinction is the point. The invoice
+    # did reconcile; what is assumed is the rate table it reconciled against, so
+    # a match is weaker evidence than it looks rather than no evidence. DRAFT is
+    # exactly that claim -- released, and not for forwarding -- and it carries
+    # the banner both renderers already print *before* any figure, which is
+    # where a caveat has to be to do any work.
+    #
+    # Not a third release state. `ASSUMED` would be the precise word, and adding
+    # it means `money.RELEASES`, `simulate.py` and `test_invariants.py`'s
+    # round-trip table, two of which are outside this track. Measured and
+    # reported rather than half-built.
+    #
+    # Deliberately after the override above: that branch sets DRAFT for its own
+    # reason and inserts its own note, and two DRAFT banners would say the same
+    # thing twice with different reasons.
+    if gate_ok and released_as == money.RECONCILED and ts.blocking_notes:
+        released_as = money.DRAFT
+        notes.insert(0, "DRAFT — " + ts.blocking_notes[0].rstrip(". ") +
+                     ". The invoice reconciles, but it reconciles against that "
+                     "assumption, so these figures are not invoice-checked in "
+                     "the sense the word usually carries. Not for external use "
+                     "until the assumption is confirmed.")
+
     # Structural claims carry a second gate. The first asks whether the money
     # ties to an invoice; this one asks whether the segmentation the claim rests
     # on was ever checked. An inferred trace with no alignment score published
@@ -2208,13 +2457,22 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     # the more client-facing of them was the ungated one.
     #
     # The reason it stayed open was real and is now answered rather than
-    # deferred: extending the gate withheld money in eleven existing tests whose
+    # deferred: extending the gate withheld money in existing tests whose
     # fixtures run 9 to 18 minutes, and widening those windows was not an option
     # because the request gaps are the quantity several of those rules measure.
-    # None of the eleven was about projections -- each needed *some* released
-    # figure to exist so it could assert a different gate -- so what they needed
-    # was a figure the observed window supports. That is `avoidable_usd_window`,
-    # and they assert it now.
+    # None of them was about projections -- each needed *some* released figure to
+    # exist so it could assert a different gate -- so what they needed was a
+    # figure the observed window supports. That is `avoidable_usd_window`, and
+    # they assert it now.
+    #
+    # This call answers for the *spend total* only. Each finding is judged
+    # against its own contributing sample, recorded by `_avoidable` as
+    # `Finding.projection_why`, because this one is computed from the whole
+    # trace: applied to a finding it let unrelated traffic vouch for a
+    # projection it contributed nothing to. Measured on a ten-request, 2.3-day
+    # trace whose only two cache writers went out one second apart -- EFF-1
+    # published $6.43/mo and FAN-1 $14.79/mo, both `reconciled`, on a
+    # two-request sample, with `total_avoidable_month` at $21.21.
     projection_ok, projection_why = _projection_supported(window, len(reqs))
     if not projection_ok:
         notes.append(projection_why[0].upper() + projection_why[1:])
@@ -2228,15 +2486,23 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             released.append(f.released(gate_ok, why, as_=released_as))
     # Only the extrapolation loses its release; the measured window keeps it,
     # exactly as `input_usd` does beside `monthly_input_usd` below. Applied
-    # after the loop above rather than inside each rule, so a rule added
-    # tomorrow is covered without knowing this floor exists.
+    # after the release loop rather than inside it, because `Finding.released`
+    # releases every Figure it finds and would undo a refusal applied earlier.
+    #
+    # `f.projection_why` and not the trace-wide `projection_why`: a finding's
+    # sample is drawn from the trace, so its window and count can only be
+    # smaller, and the per-finding verdict therefore subsumes the trace-wide one
+    # rather than merely adding to it. Where the whole trace fails the floor,
+    # every finding fails it too -- and reports its own numbers in the reason
+    # instead of the trace's, which is the difference between "2 requests" and
+    # "10 requests" in a sentence a client reads.
     #
     # `Analysis.total_avoidable_month` needs no line of its own: it reads its
     # release off its parts, so withholding them withholds it. Verified rather
     # than assumed -- INV-1 walks the analysis and would find it either way.
-    if not projection_ok:
-        released = [replace(f, avoidable_usd_month=_withhold_projection(
-            f.avoidable_usd_month, projection_why)) for f in released]
+    released = [replace(f, avoidable_usd_month=_withhold_projection(
+        f.avoidable_usd_month, f.projection_why)) if f.projection_why else f
+        for f in released]
     findings = released
     if not structure_trusted and any(f.structural for f in findings):
         notes.append(

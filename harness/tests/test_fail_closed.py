@@ -141,6 +141,267 @@ class TestNoPriceOnAnUnknownSurface(unittest.TestCase):
         self.assertFalse(a.total_avoidable_month.released)
 
 
+class TestAnUnpriceableSurfaceStillGetsItsMeasurements(unittest.TestCase):
+    """Refusing to price is not the same as refusing to look.
+
+    `analyze` replaced both `usages` and the rule input with the rows that
+    survived pricing, then recomputed the ratios from that subset. So a
+    Bedrock or Vertex trace -- surfaces the cloud provider invoices, where the
+    recorded Anthropic rates do not apply -- reported `requests: 0`,
+    `input_from_cache: None`, `prefix_efficiency: None` and no findings at all,
+    directly under a coverage line reading "40 of 40 requests analysable". The
+    provider's own counters were sitting in the file the whole time, and those
+    two ratios are arithmetic over them that no rate table touches.
+
+    SYNTHETIC. Forty turns a minute apart, each rewriting the whole 50k prefix
+    it had just established -- something REB-1 can name from counters alone.
+    """
+
+    BEDROCK = "amazon-bedrock/converse"
+
+    def _trace(self, target):
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(seconds=60 * i),
+                        model="claude-opus-5", target_id=target, tenant="t",
+                        session="s", agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 200,
+                               "cache_read_input_tokens": 5_000,
+                               "cache_creation_input_tokens": 50_000},
+                        segments=[Segment(id="sys", role="system",
+                                          tokens=50_000, index=0,
+                                          cache_marked=True, ttl="5m"),
+                                  Segment(id=f"t{i}", role="user", tokens=200,
+                                          index=1)])
+                for i in range(40)]
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+
+    def test_the_surface_really_is_unpriceable(self):
+        """Guard the guard. If these rows priced, every assertion below would
+        be about the ordinary path and prove nothing."""
+        from cacheeconomics import registry
+        with self.assertRaises(registry.RegistryError):
+            cost.price(cost.Usage(uncached_input=1_000), "claude-opus-5",
+                       target_id=self.BEDROCK)
+
+    def test_the_counters_survive(self):
+        a = analyze(self._trace(self.BEDROCK), allow_unreconciled=True)
+        self.assertEqual(40, a.ratios.get("requests"))
+        self.assertIsNotNone(a.ratios.get("input_from_cache"))
+        self.assertIsNotNone(a.ratios.get("prefix_efficiency"))
+
+    def test_the_ratios_match_the_priceable_surface_exactly(self):
+        """They are ratios of the provider's counters, so the surface cannot
+        change them. Asserting equality rather than merely "not None" is what
+        makes this a measurement instead of a smoke test."""
+        priced = analyze(self._trace("anthropic/direct"), allow_unreconciled=True)
+        unpriced = analyze(self._trace(self.BEDROCK), allow_unreconciled=True)
+        for k in ("requests", "input_from_cache", "prefix_efficiency"):
+            with self.subTest(ratio=k):
+                self.assertEqual(priced.ratios.get(k), unpriced.ratios.get(k))
+
+    def test_a_counter_only_finding_still_reaches_the_reader(self):
+        a = analyze(self._trace(self.BEDROCK), allow_unreconciled=True)
+        self.assertIn("REB-1", [f.code for f in a.findings],
+                      "a rebuild the reader's own counters show is still not "
+                      "reported on a surface this tool cannot price")
+
+    def test_but_no_dollar_figure_comes_back_with_it(self):
+        """The point is that observations survive, not that dollars do."""
+        a = analyze(self._trace(self.BEDROCK), allow_unreconciled=True)
+        self.assertTrue(a.findings, "nothing to check")
+        for f in a.findings:
+            with self.subTest(finding=f.code):
+                for name in ("avoidable_usd_month", "avoidable_usd_window"):
+                    fig = getattr(f, name)
+                    self.assertFalse(fig is not None and fig.released,
+                                     f"{f.code}.{name} published on an "
+                                     f"unpriceable surface")
+        self.assertFalse(a.total_avoidable_month.released)
+        self.assertFalse(a.spend["input_usd"].released)
+
+
+class TestTheRateFreeMarkingIsAccurate(unittest.TestCase):
+    """`@_rate_free` decides which rules see rows that failed pricing, so a
+    wrong marking is a rule reading a row it cannot price.
+
+    Checked by watching what each rule actually reaches for, not by reading the
+    decorators: a marker is a claim, and a claim verified by rereading the claim
+    is what this suite exists to stop trusting. Measured the hard way first --
+    running every rule over the wide set crashed sixteen tests, because
+    `rate_for` answers 0.0 for a surface it cannot price and `cost.price`
+    refuses a zero rate with a `ValueError` that EFF-1 does not catch.
+    """
+
+    def _touches_pricing(self, rule, reqs, ratios):
+        """Run one rule and report whether it asked for a price."""
+        from cacheeconomics import analyzer
+        asked = []
+        real_price = analyzer.cost.price
+
+        def spy_price(*a, **kw):
+            asked.append("price")
+            return real_price(*a, **kw)
+
+        def spy_rate(model, when=None, target_id=None):
+            asked.append("rate")
+            from cacheeconomics import registry
+            return registry.base_rate(model, when or "2026-07-29", target_id)
+
+        analyzer.cost.price = spy_price
+        try:
+            rule(reqs, ratios, 3.0, spy_rate)
+        except Exception:                                      # noqa: BLE001
+            pass          # a rule that raises still reveals what it touched
+        finally:
+            analyzer.cost.price = real_price
+        return bool(asked)
+
+    def _fixture(self):
+        from cacheeconomics import cost as _cost
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(seconds=60 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", session="s", agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 200,
+                               "cache_read_input_tokens": 5_000,
+                               "cache_creation_input_tokens": 50_000},
+                        segments=[Segment(id="sys", role="system",
+                                          tokens=50_000, index=0,
+                                          cache_marked=True, ttl="5m"),
+                                  Segment(id=f"t{i}", role="user", tokens=200,
+                                          index=1)])
+                for i in range(40)]
+        usages = [_cost.Usage.from_anthropic(r.usage, ttl="5m") for r in reqs]
+        return reqs, _cost.ratios(usages)
+
+    def test_the_spy_sees_something(self):
+        """Vacuity guard: if nothing touches pricing on this fixture, the check
+        below passes by never observing anything."""
+        from cacheeconomics.analyzer import RULES
+        reqs, ratios = self._fixture()
+        self.assertTrue(
+            [r for r in RULES if self._touches_pricing(r, reqs, ratios)],
+            "no rule asked for a price; the spy is not wired up")
+
+    def test_no_rate_free_rule_asks_for_a_price(self):
+        """The direction that matters. A rule marked rate-free runs over rows
+        that failed pricing, so if it reaches for a rate it is reading a row
+        whose rate is either missing or zero.
+
+        The converse is deliberately not asserted: a pricing rule can return
+        early on a given fixture without touching a rate, and failing on that
+        would make this test a statement about the fixture.
+        """
+        from cacheeconomics.analyzer import RULES
+        reqs, ratios = self._fixture()
+        wrong = [r.__name__ for r in RULES
+                 if getattr(r, "rate_free", False)
+                 and self._touches_pricing(r, reqs, ratios)]
+        self.assertEqual([], wrong,
+                         "marked rate-free but asks for a price: " + ", ".join(wrong))
+
+
+class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
+    """An ingest adapter records what it had to assume. Nothing read it.
+
+    `ts.blocking_notes` is how a loader says something qualifies every figure in
+    this trace -- most sharply, that the *surface* was assumed rather than named
+    by the export, which makes the rate table and the cache multipliers an
+    assumption too. The release decision never consulted it, so the invoice
+    reconciled against assumed rates and every figure came back
+    `released_as='reconciled'`: the provenance of an invoice check, on a number
+    computed from a guess. Measured on the fixture below, all six figures.
+
+    The remedy is DRAFT rather than withholding. The invoice did reconcile; what
+    is assumed is what it reconciled against, so the evidence is weaker than it
+    looks rather than absent -- and DRAFT already means exactly "released, and
+    not for forwarding", with a banner both renderers print before any figure.
+
+    A third state spelled ASSUMED would be the precise word. It would also mean
+    changing `money.RELEASES`, `simulate.py` and the round-trip table in
+    `test_invariants.py`, two of which are outside this track, so it is measured
+    and reported rather than half-built.
+    """
+
+    NOTE = ("The surface was assumed to be anthropic/direct; the export names "
+            "none. Rates and cache multipliers here are an assumption.")
+
+    def _analysis(self, blocking=True):
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(hours=6 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", session="s", agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 100_000},
+                        segments=[])
+                for i in range(12)]
+        ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY,
+                      notes=[self.NOTE] if blocking else [],
+                      blocking_notes=[self.NOTE] if blocking else [])
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return analyze(ts, invoice_usd=invoice)
+
+    def _figures(self, a):
+        from cacheeconomics.money import Figure
+        out = [(f"spend[{k!r}]", v) for k, v in a.spend.items()
+               if isinstance(v, Figure)]
+        for i, f in enumerate(a.findings):
+            for name in ("avoidable_usd_month", "avoidable_usd_window"):
+                fig = getattr(f, name)
+                if fig is not None:
+                    out.append((f"findings[{i}].{name}", fig))
+        out.append(("total_avoidable_month", a.total_avoidable_month))
+        return out
+
+    def test_the_invoice_really_does_reconcile(self):
+        """Guard the guard. If the gate failed for an ordinary reason every
+        figure would be withheld and this would pass without testing anything."""
+        a = self._analysis()
+        self.assertEqual(0.0, a.reconciliation["delta_pct"])
+        self.assertTrue(a.reconciliation["within_ship_gate"])
+        self.assertTrue([f for _p, f in self._figures(a) if f.released],
+                        "nothing was released, so provenance is untested")
+
+    def test_no_released_figure_claims_to_be_invoice_checked(self):
+        a = self._analysis()
+        from cacheeconomics import money
+        wrong = [p for p, f in self._figures(a)
+                 if f.released and f.released_as == money.RECONCILED]
+        self.assertEqual(
+            [], wrong,
+            "an assumed surface published with the provenance of a "
+            "measurement:\n    " + "\n    ".join(wrong))
+
+    def test_they_are_marked_draft_rather_than_withheld(self):
+        """Withholding would be the wrong correction: the invoice did reconcile,
+        and throwing the figures away entirely tells a reader less than telling
+        them what the figures rest on."""
+        a = self._analysis()
+        from cacheeconomics import money
+        released = [(p, f) for p, f in self._figures(a) if f.released]
+        self.assertTrue(released, "everything was withheld")
+        for p, f in released:
+            with self.subTest(figure=p):
+                self.assertEqual(money.DRAFT, f.released_as)
+
+    def test_the_draft_banner_says_which_assumption(self):
+        a = self._analysis()
+        banner = next((n for n in a.notes if n.startswith("DRAFT")), None)
+        self.assertIsNotNone(banner, "figures went out as drafts with no banner")
+        self.assertIn("surface was assumed", banner)
+
+    def test_a_trace_with_no_such_note_is_still_reconciled(self):
+        """The other direction. Downgrading everything to DRAFT would satisfy
+        every assertion above and relabel every honest figure in the product."""
+        a = self._analysis(blocking=False)
+        from cacheeconomics import money
+        released = [(p, f) for p, f in self._figures(a) if f.released]
+        self.assertTrue(released)
+        for p, f in released:
+            with self.subTest(figure=p):
+                self.assertEqual(money.RECONCILED, f.released_as)
+
+
 class TestABaselineArmDoesNotInventABudget(unittest.TestCase):
     """litellm_auto reads the marker budget from the registry. An unknown
     surface there raised out of the whole bake-off once; it must neither raise
@@ -1606,6 +1867,143 @@ class TestTheProjectionFloorReachesEveryProjectedFigure(unittest.TestCase):
                 with self.subTest(figure=path):
                     self.assertIn("day of traffic", fig.withheld_because)
                     self.assertNotIn("reconcil", fig.withheld_because.lower())
+
+
+class TestTheProjectionFloorJudgesEachFindingsOwnSample(unittest.TestCase):
+    """The floor was evaluated once, from the whole trace, and applied to every
+    finding. So unrelated traffic could vouch for a projection it contributed
+    nothing to.
+
+    Measured on the fixture below -- ten requests over 2.3 days, of which only
+    two touch the cache and those two go out one second apart -- EFF-1 published
+    $6.43/mo and FAN-1 $14.79/mo, both `released_as='reconciled'`, with
+    `total_avoidable_month` at $21.21. Every one of those numbers rests on a
+    two-request, one-second sample. The request floor exists precisely so that a
+    small subset cannot drive a client-facing monthly projection, and evaluated
+    globally it did not do that job: the eight filler requests it counted
+    contributed exactly zero dollars to either figure.
+    """
+
+    def _trace(self):
+        """SYNTHETIC. Eight uncached requests spread over three days, plus two
+        concurrent writers of the same prefix one second apart.
+
+        The filler is what makes the global window and count clear the floor;
+        it prices identically cached or not, so it contributes no term to any
+        figure here. That gap between "counted" and "contributed" is the defect.
+        """
+        reqs = [Request(request_id=f"p{i}", sent_at=T0 + timedelta(hours=8 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", agent="filler", session=f"f{i}",
+                        ttl_requested="5m",
+                        usage={"input_tokens": 1_000,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0},
+                        segments=[])
+                for i in range(8)]
+        reqs += [Request(request_id=f"w{k}",
+                         sent_at=T0 + timedelta(days=1, seconds=k),
+                         model="claude-opus-5", target_id="anthropic/direct",
+                         tenant="t", agent="fan", session="s",
+                         ttl_requested="5m",
+                         usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                                "cache_creation_input_tokens": 200_000},
+                         segments=[Segment(id="sys", role="system",
+                                           tokens=200_000, index=0,
+                                           cache_marked=True, ttl="5m")])
+                 for k in range(2)]
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED)
+
+    def _analysis(self):
+        ts = self._trace()
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return analyze(ts, invoice_usd=invoice)
+
+    def _priced(self, a):
+        return [f for f in a.findings if f.avoidable_usd_month is not None]
+
+    def test_the_fixture_clears_the_floor_globally(self):
+        """Guard the guard, and it is the whole point of this class: if the
+        trace itself failed the floor, the trace-wide gate would withhold these
+        figures and the per-finding check would never be what was under test."""
+        from cacheeconomics.analyzer import _projection_supported, _window_days
+        reqs = self._trace().analysable
+        ok, _ = _projection_supported(_window_days(reqs), len(reqs))
+        self.assertTrue(ok, "the trace no longer clears the floor globally, so "
+                            "this class is testing the trace-wide gate instead")
+        self.assertEqual(self._analysis().reconciliation["delta_pct"], 0.0)
+
+    def test_there_are_priced_findings_to_check(self):
+        self.assertTrue(self._priced(self._analysis()),
+                        "no finding carries a monthly figure; the checks below "
+                        "would pass while examining nothing")
+
+    def test_a_finding_costed_from_a_tiny_subset_publishes_no_month(self):
+        a = self._analysis()
+        leaked = [(f.code, f.affected_requests, str(f.avoidable_usd_month))
+                  for f in self._priced(a) if f.avoidable_usd_month.released]
+        self.assertEqual(
+            [], leaked,
+            "these projected a month from their own small sample, on the "
+            "strength of unrelated traffic clearing the floor:\n" +
+            "\n".join(f"    {c} ({n} affected requests) = {v}"
+                      for c, n, v in leaked))
+
+    def test_the_total_inherits_it(self):
+        """`total_avoidable_month` reads release off its parts, so this needs no
+        gate of its own -- but it is the number a client reads first, and
+        "inherits correctly" is worth asserting rather than assuming."""
+        self.assertFalse(self._analysis().total_avoidable_month.released)
+
+    def test_the_measured_window_amount_still_publishes(self):
+        """The split earning its keep. What these two requests actually cost is
+        measured, the invoice establishes it, and withholding it too would throw
+        away the finding entirely rather than just its projection."""
+        for f in self._priced(self._analysis()):
+            with self.subTest(finding=f.code):
+                self.assertTrue(f.avoidable_usd_window.released)
+
+    def test_the_reason_reports_the_findings_numbers_not_the_traces(self):
+        """A refusal citing the trace's ten requests and 2.3 days, printed
+        beside a coverage line saying the same, reads as the tool malfunctioning
+        rather than as a floor doing its job."""
+        for f in self._priced(self._analysis()):
+            with self.subTest(finding=f.code):
+                why = f.avoidable_usd_month.withheld_because
+                self.assertIn("this finding", why)
+                self.assertNotIn("this trace", why)
+
+    def test_the_reason_does_not_claim_the_spend_total_was_withheld(self):
+        """It was not: the trace clears the floor, so `monthly_input_usd`
+        publishes. The trace-wide wording says "the spend total and each
+        finding's", and printing that beside a published spend total is the
+        overstatement this floor's reason has already been fixed for once."""
+        a = self._analysis()
+        self.assertTrue(a.spend["monthly_input_usd"].released,
+                        "fixture no longer publishes a monthly spend total")
+        for f in self._priced(a):
+            with self.subTest(finding=f.code):
+                self.assertNotIn("the spend total",
+                                 f.avoidable_usd_month.withheld_because)
+
+    def test_a_finding_whose_own_sample_clears_the_floor_still_publishes(self):
+        """The other direction. A floor that withheld every finding's month
+        would pass every test above and be useless."""
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(hours=6 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", agent="a", session="s", ttl_requested="5m",
+                        usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 100_000},
+                        segments=[])
+                for i in range(12)]
+        ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY)
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        a = analyze(ts, invoice_usd=invoice)
+        eff = next(f for f in a.findings if f.code == "EFF-1")
+        self.assertEqual("", eff.projection_why)
+        self.assertTrue(eff.avoidable_usd_month.released)
+        self.assertTrue(a.total_avoidable_month.released)
 
 
 class TestSilenceUnderAnUnnamedSurfaceIsSpokenAloud(unittest.TestCase):

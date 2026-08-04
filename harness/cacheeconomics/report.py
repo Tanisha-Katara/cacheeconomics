@@ -364,6 +364,29 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
         parts.insert(4, f"<div class=gate><strong>DRAFT — not for external "
                         f"use.</strong> {e(_draft_reason(a))}</div>")
 
+    # The caveats that qualify a published figure go above the fold too, for the
+    # same reason and after the same mistake.
+    #
+    # They lived in the Standing block at section 04, behind the Input spend KPI
+    # in 02 and every finding in 03, so a reader met the whole document's money
+    # before the sentence saying what it rests on -- and the sharpest of those
+    # sentences says the surface it was all priced against was assumed rather
+    # than stated. The text renderer had the same ordering and is fixed in the
+    # same change; this is the pair that has diverged over caveat placement
+    # before.
+    #
+    # Above the hero rather than in section 01, which was the first attempt: the
+    # lede itself carries "Caching saved $X" and the reconciliation card echoes
+    # the invoice, so a caveat inside 01 still trails two dollar figures. The
+    # test that pins this compares offsets and caught exactly that.
+    #
+    # Inserted after the DRAFT banner in source order but at the same index, so
+    # the banner stays first: it says do not forward this document, which
+    # outranks any single caveat about what is in it.
+    for note in reversed(spend_caveats(a)):
+        parts.insert(4 + (1 if _is_draft(a) else 0),
+                     f"<div class=gate><strong>Caveat.</strong> {e(note)}</div>")
+
     parts.append("<section class=verdict><div>")
     parts.append("<div class=label>Executive readout</div>")
     parts.append(f"<strong>{verdict}</strong>")
@@ -708,6 +731,19 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
                      "publishing money, not a doubt about the analysis. Step 1 "
                      "at the end turns the numbers on.", _WIDTH, "  ")
         out.append("")
+    # Caveats before the figures they qualify, not after them.
+    #
+    # These sat below the table and the TOTAL, so a reader met every number
+    # first and the sentence saying what qualifies them afterwards -- and the
+    # sharpest of them says the surface those numbers were priced against was
+    # assumed rather than stated. Measured on a trace carrying one such note:
+    # the first "$" landed at character 2,213 and the caveat at 3,013. A caveat
+    # a reader reaches after the number is doing very little, which is the same
+    # complaint this file already records about the DRAFT banner arriving 8,000
+    # characters into the HTML report.
+    for note in spend_caveats(a):
+        out += _wrap(f"caveat: {note}", _WIDTH, "  ")
+        out.append("")
     if not a.findings:
         out += _wrap("Nothing to act on. No rule here fired on this data.",
                      _WIDTH, "  ")
@@ -754,13 +790,9 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
                       "short to scale to one; the note above says by how much.")
     for line in legend:
         out += _wrap(line, _WIDTH, "  ")
-    # Caveats on the numbers directly above them. These used to sit in the
-    # notes block at the very bottom, so a figure and the sentence saying what
-    # it excludes were four sections apart, and folding that block away would
-    # have separated them entirely.
-    for note in spend_caveats(a):
-        out.append("")
-        out += _wrap(f"caveat: {note}", _WIDTH, "  ")
+    # (The caveats these numbers carry are printed above the table, not here.
+    # They used to sit at the very bottom of the report, then directly under the
+    # table; both put the qualification after the number it qualifies.)
     if not detail and a.findings:
         out.append("")
         out += _wrap("Every row above is the short version. Re-run with "

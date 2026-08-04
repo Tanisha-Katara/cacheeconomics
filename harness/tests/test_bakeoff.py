@@ -1538,6 +1538,110 @@ class TestTTLRecoveryIsProportionalToTheSpanThatMatched(unittest.TestCase):
                         "billed write it is a split of")
 
 
+class TestTTLRecoveryReadsTheEntrySizeNotTheWriteSize(unittest.TestCase):
+    """A read refreshes the entry it read, so a small write can leave a large
+    live entry.
+
+    `earlier` stored the size of the *write* that touched a span. A request that
+    reads a 100k prefix back and writes a 1k appended suffix leaves a live 101k
+    entry while writing 1,000 tokens, so the later TTL miss on that entry was
+    credited with recovering 1,000 tokens instead of 101,000. The cold-write
+    premium is charged against the real write, so the netting came out negative
+    and TTL-1 went silent altogether -- the recommendation, which is correct and
+    worth roughly $3 over this window, never reached the client at all.
+
+    SYNTHETIC. Refresh-then-miss cycles: a refresh two minutes after the last
+    write (inside the five-minute lifetime, so the entry is alive and gets
+    extended), then a miss ten minutes later (outside it, so a five-minute entry
+    is gone and a one-hour one would not have been).
+
+    Not a regression from the proportional-share fix in the class above:
+    measured with that share reverted, this fixture was equally silent. It is
+    invisible in the shipped fixtures because none of their cache-writing rows
+    carries a read -- 0 of 136 in demo-traces.jsonl -- which is both why it
+    survived and why closing it moves no published figure.
+    """
+
+    PREFIX = 100_000
+    SUFFIX = 1_000
+    CYCLES = 6
+
+    def _req(self, rid, when, read, write, marks):
+        segs = [seg(0, "system", self.PREFIX, "sys", "sys", marked=True, ttl="5m")]
+        if marks > 1:
+            segs.append(seg(1, "user", self.SUFFIX, "suffix", "hist",
+                            marked=True, ttl="5m"))
+        return Request(request_id=rid, sent_at=when, model="claude-opus-5",
+                       target_id="anthropic/direct", tenant="t", session="s",
+                       agent="a", ttl_requested="5m",
+                       usage={"input_tokens": 0, "cache_read_input_tokens": read,
+                              "cache_creation_input_tokens": write},
+                       segments=segs)
+
+    def _reqs(self, refresh_read):
+        """`refresh_read` is how much the refreshing request reads back.
+
+        Zero turns each refresh into an ordinary small cold write, which is the
+        control: with no read the entry really is only as big as the write, and
+        the figure must not move.
+        """
+        out, t = [self._req("r0", T0, 0, self.PREFIX, 1)], T0
+        for c in range(self.CYCLES):
+            t += timedelta(seconds=120)
+            out.append(self._req(f"refresh{c}", t, refresh_read, self.SUFFIX, 2))
+            t += timedelta(seconds=600)
+            out.append(self._req(f"miss{c}", t, 0, self.PREFIX + self.SUFFIX, 2))
+        return out
+
+    def _ttl(self, refresh_read):
+        a = analyze(TraceSet(requests=self._reqs(refresh_read),
+                             tier=Tier.INSTRUMENTED), allow_unreconciled=True)
+        return next((f for f in a.findings if f.code == "TTL-1"), None)
+
+    def test_a_refreshed_entry_is_recovered_at_its_own_size(self):
+        f = self._ttl(self.PREFIX)
+        self.assertIsNotNone(
+            f, "TTL-1 stayed silent on a workload a one-hour lifetime would "
+               "genuinely help: the recommendation never reaches the client")
+        self.assertIsNotNone(f.avoidable_usd_window, "fired without a figure")
+        self.assertGreater(f.avoidable_usd_window.raw(), 0)
+
+    def test_the_recovery_scales_with_what_was_refreshed(self):
+        """The claim, stated as a comparison rather than as an expected dollar
+        amount. Reading a hundred times more back must recover more, and under
+        the defect both read the write size and come out identical."""
+        small = self._ttl(self.SUFFIX)
+        large = self._ttl(self.PREFIX)
+        self.assertIsNotNone(large.avoidable_usd_window)
+        small_usd = (small.avoidable_usd_window.raw()
+                     if small is not None and small.avoidable_usd_window else 0.0)
+        self.assertLess(
+            small_usd, large.avoidable_usd_window.raw(),
+            "the credit is reading the write size, not the entry size")
+
+    def test_a_write_with_no_read_is_unchanged(self):
+        """The control, and the property that keeps this from moving published
+        figures: with no read the entry is exactly the write, so every trace in
+        which nothing reads back -- which is every cache-writing row in the
+        shipped fixtures -- prices identically."""
+        self.assertIsNone(
+            self._ttl(0),
+            "a trace whose refreshes read nothing back has no reuse for a "
+            "longer lifetime to recover, and TTL-1 should stay silent on it")
+
+    def test_recovery_never_exceeds_what_the_later_request_wrote(self):
+        """The bound that keeps entry size from becoming an over-credit. A
+        longer lifetime can only save what was actually paid to write again,
+        however large the entry behind it was."""
+        from cacheeconomics import registry
+        f = self._ttl(self.PREFIX)
+        m = registry.multipliers("anthropic/direct")
+        rate = registry.base_rate("claude-opus-5", "2026-01-01", "anthropic/direct")
+        ceiling = (self.CYCLES * (self.PREFIX + self.SUFFIX)
+                   * (rate / 1e6) * (m["write_5m"] - m["read"]))
+        self.assertLessEqual(f.avoidable_usd_window.raw(), ceiling)
+
+
 class TestVolatileFindingRespectsCachePools(unittest.TestCase):
     """VOL-1 bucketed segment ids across the whole export while the simulator
     isolates by (tenant, target, model). A per-tenant header stable in every

@@ -999,6 +999,126 @@ class TestTheLiveResponseParserReadsBothLiteLLMShapes(unittest.TestCase):
                            "neither shape produced diagnostics; the test proves nothing")
 
 
+class TestACaveatPrecedesTheFigureItQualifies(unittest.TestCase):
+    """In both renderers, checked by offset rather than by presence.
+
+    A caveat is not a checkbox. The text report printed the spend caveats below
+    the findings table and the TOTAL, and the HTML one carried them in the
+    Standing block at section 04 -- after the Input spend KPI in 02 and every
+    finding in 03. So a reader met every number in the document and the sentence
+    saying what those numbers rest on afterwards. Measured on the fixture below:
+    the first "$" in the text report at character 2,213 against the caveat at
+    3,013.
+
+    This is the same defect, and the same test shape, as the DRAFT banner that
+    was inserted at index 1 -- inside `<head>` -- and passed a substring check
+    while rendering nowhere. Presence was never the claim; order is.
+    """
+
+    # Two, and the second one is load-bearing. The DRAFT banner quotes the
+    # *first* blocking note verbatim and prints at the top of both reports, so a
+    # check that searched for that text found the banner and passed wherever the
+    # caveat block itself sat -- measured by reverting the fix and watching this
+    # class stay green. A test whose subject is placement, satisfied by a
+    # different element that happens to contain the same words, is the same
+    # failure as asserting the DRAFT banner's presence while it rendered inside
+    # `<head>`. The second note appears only in the caveat block, so it is the
+    # one that actually pins the ordering.
+    NOTES = [("The surface was assumed to be anthropic/direct; the export names "
+              "none. Rates and cache multipliers here are an assumption."),
+             ("Sampling: this export carries one row in every four, so the "
+              "totals below describe a quarter of the traffic.")]
+
+    def _analysis(self):
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(hours=6 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", session="s", agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 100_000},
+                        segments=[])
+                for i in range(12)]
+        ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x",
+                      notes=list(self.NOTES),
+                      blocking_notes=list(self.NOTES))
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return analyze(ts, invoice_usd=invoice)
+
+    def _renderers(self):
+        from cacheeconomics import report
+        return [(n, getattr(report, n)) for n in dir(report)
+                if n.startswith("render_") and callable(getattr(report, n))]
+
+    def test_the_fixture_publishes_a_figure_to_be_qualified(self):
+        """Guard the guard: with nothing published there is no ordering to
+        check and every assertion below is vacuous."""
+        from cacheeconomics.analyzer import spend_caveats
+        a = self._analysis()
+        self.assertEqual(2, len(spend_caveats(a)), "both caveats must survive")
+        self.assertTrue(a.spend["input_usd"].released, "nothing published")
+
+    def test_the_second_caveat_is_not_carried_by_the_draft_banner(self):
+        """Guard the guard again, and this one is the reason the class has two
+        notes. The banner quotes the first blocking note, so only a caveat it
+        does not quote can prove where the caveat block itself sits."""
+        a = self._analysis()
+        banner = next((n for n in a.notes if n.startswith("DRAFT")), "")
+        self.assertNotIn(self._key(self.NOTES[1]), banner)
+
+    @staticmethod
+    def _key(note):
+        return note.split(";")[0][:40]
+
+    def test_the_first_dollar_is_a_computed_figure_not_the_invoice_echo(self):
+        """The check below measures against the first "$". That is the right
+        thing to measure only while the first "$" is a number this tool
+        *computed*.
+
+        The HTML report also echoes the client's own invoice back at them, and
+        an echo is an input rather than a claim -- a caveat about what the
+        analysis rests on has nothing to say about a number the reader typed in,
+        so placing a caveat relative to it would be answering a question nobody
+        asked. It happens not to be first in either renderer: the text report
+        states reconciliation as a percentage and never prints the invoice at
+        all, and the HTML hero carries "Caching saved $X" well above the
+        reconciliation card.
+
+        Asserted rather than assumed. If either of those ever changes, the probe
+        below starts silently measuring the wrong thing, and this is what says so.
+        """
+        a = self._analysis()
+        rendered = dict(self._renderers())
+        html = rendered["render_html"](a)
+        echo = html.find("against invoice")
+        self.assertNotEqual(-1, echo, "fixture no longer echoes the invoice")
+        self.assertLess(html.find("$"), echo,
+                        "the HTML report's first dollar is now the invoice echo")
+        text = rendered["render_text"](a)
+        head = text[:text.find("what it is costing you")]
+        self.assertNotIn("$", head,
+                         "the text report now prints a dollar before its "
+                         "findings table; check whether it is the invoice echo")
+
+    def test_every_renderer_puts_every_caveat_before_the_first_figure(self):
+        """Over every renderer found at runtime, so a third one cannot phrase
+        the ordering a third way -- which is exactly how these two diverged."""
+        from cacheeconomics.analyzer import spend_caveats
+        a = self._analysis()
+        for name, fn in self._renderers():
+            text = fn(a)
+            at_money = text.find("$")
+            self.assertNotEqual(-1, at_money, f"{name} printed no figure")
+            for note in spend_caveats(a):
+                with self.subTest(renderer=name, caveat=note[:30]):
+                    at_caveat = text.find(self._key(note))
+                    self.assertNotEqual(-1, at_caveat,
+                                        f"{name} dropped a caveat entirely")
+                    self.assertLess(
+                        at_caveat, at_money,
+                        f"{name} prints a computed figure at {at_money} and the "
+                        f"caveat that qualifies it at {at_caveat}")
+
+
 class TestCoverageThatGatesMoneyIsWeightedByMoney(unittest.TestCase):
     """Rows are the wrong denominator for a dollar figure.
 
