@@ -473,3 +473,192 @@ class TestClaudeCodeMakesTheSurfaceAChoice(unittest.TestCase):
                                   "--assume-anthropic-direct")
         self.assertEqual(code, 1)
         self.assertIn("not both", err)
+
+
+class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
+    """`--assume-anthropic-direct` releases DRAFT figures at best.
+
+    Reconciliation checks a *total* against an invoice. It cannot check the
+    *rate table* that total was computed from, and with this flag that table
+    came from an assumption -- a Claude Code transcript carries no provider
+    field to compare against. So the report could carry
+    `released_as='reconciled'`, the label meaning an invoice verified this, over
+    dollars whose provenance was a guess.
+
+    Reproduced before the fix, on a 12-request fixture with an invoice equal to
+    computed spend: reconciled at 0.0%, and input_usd, if_uncached_usd,
+    caching_saved_usd and monthly_input_usd all released as 'reconciled'.
+
+    The assumption was disclosed, but only as prose a renderer adds later: in
+    the text report a costed finding and the total appear above the caveat, and
+    in HTML the Input spend KPI appears above the standing notes. Neither a
+    reader skimming nor a script reading the JSON `release_state` is reached by
+    a sentence further down the page.
+    """
+
+    def _fixture(self, tmp):
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "s.jsonl"), "w") as f:
+            for i in range(12):
+                f.write(json.dumps({
+                    "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
+                    "requestId": f"r{i}",
+                    "timestamp": f"2026-07-29T09:{i:02d}:00.000Z",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 100, "output_tokens": 10,
+                        "cache_read_input_tokens": 20_000,
+                        "cache_creation_input_tokens": 1_000,
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 1_000,
+                            "ephemeral_1h_input_tokens": 0}}}}) + "\n")
+        return tmp
+
+    def _analysis(self, tmp, target_id):
+        """An analysis with an invoice that reconciles exactly, so the release
+        gate genuinely passes and RECONCILED is what it would otherwise emit."""
+        from cacheeconomics.adapters.claude_code import load_sessions
+        from cacheeconomics.analyzer import analyze
+        ts = load_sessions(root=self._fixture(tmp), target_id=target_id)
+        spend = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return analyze(ts, invoice_usd=spend)
+
+    def _states(self, a):
+        """Release provenance of the figures that were actually published.
+
+        Withheld figures are excluded deliberately: this fixture's window is
+        minutes long, so `monthly_input_usd` is held back by the projection
+        floor and carries no release state at all. The question here is what
+        label the *published* figures wear.
+        """
+        from cacheeconomics.money import Figure
+        return {k: v.released_as for k, v in a.spend.items()
+                if isinstance(v, Figure) and v.released}
+
+    def test_the_gate_really_does_pass_so_reconciled_is_the_alternative(self):
+        """Guard the guard. If the fixture did not reconcile, every figure would
+        be withheld for an unrelated reason and the assertions below would hold
+        without testing anything."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = self._analysis(tmp, "anthropic/direct")
+        self.assertEqual(0.0, a.reconciliation["delta_pct"])
+        self.assertEqual({"reconciled"}, set(self._states(a).values()))
+
+    def test_the_flag_downgrades_every_spend_figure_to_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = cli._draft_because_the_surface_was_assumed(
+                self._analysis(tmp, "anthropic/direct"))
+        states = self._states(a)
+        self.assertTrue(states, "no figures found; the check would be vacuous")
+        self.assertEqual({"draft"}, set(states.values()))
+
+    def test_and_the_reconciliation_figures_too(self):
+        """`reconciliation.computed_usd` and `delta_usd` are money a script
+        reads, and they shipped as bare reconciled dollars once before."""
+        from cacheeconomics.money import Figure
+        with tempfile.TemporaryDirectory() as tmp:
+            a = cli._draft_because_the_surface_was_assumed(
+                self._analysis(tmp, "anthropic/direct"))
+        recon = [v.released_as for v in a.reconciliation.values()
+                 if isinstance(v, Figure)]
+        self.assertTrue(recon)
+        self.assertEqual({"draft"}, set(recon))
+
+    def test_both_renderers_stamp_it_without_being_told_separately(self):
+        from cacheeconomics import report
+        with tempfile.TemporaryDirectory() as tmp:
+            a = cli._draft_because_the_surface_was_assumed(
+                self._analysis(tmp, "anthropic/direct"))
+        self.assertTrue(report._is_draft(a),
+                        "release state is read off the figures; it says reconciled")
+        for name, fn in (("text", report.render_text),
+                         ("html", report.render_html)):
+            with self.subTest(renderer=name):
+                out = fn(a)
+                self.assertIn("DRAFT", out)
+                first_draft = out.find("DRAFT")
+                first_money = out.find("$")
+                self.assertTrue(
+                    first_money == -1 or first_draft < first_money,
+                    f"{name} printed a dollar figure before the DRAFT stamp")
+
+    def test_the_stamp_says_it_was_the_surface_that_was_assumed(self):
+        """A DRAFT banner that says "no invoice supplied" would be false here --
+        an invoice *was* supplied and it reconciled."""
+        from cacheeconomics import report
+        with tempfile.TemporaryDirectory() as tmp:
+            a = cli._draft_because_the_surface_was_assumed(
+                self._analysis(tmp, "anthropic/direct"))
+        reason = report._draft_reason(a)
+        self.assertIn("surface was assumed", reason)
+        self.assertIn("--target-id", reason)
+
+    def test_a_script_reading_the_json_sees_draft(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a = cli._draft_because_the_surface_was_assumed(
+                self._analysis(tmp, "anthropic/direct"))
+        payload = json.loads(cli.analysis_json(a, tier_name="USAGE_ONLY",
+                                               coverage=1.0))
+        states = payload["release_state"]
+        self.assertTrue(states)
+        self.assertNotIn("reconciled", set(states.values()),
+                         "a script cannot tell this from an invoice-checked figure")
+        self.assertIn("draft", set(states.values()))
+
+    def test_stating_the_surface_from_knowledge_still_reconciles(self):
+        """The other direction, so this does not become an over-block.
+        `--target-id anthropic/direct` is the same string arrived at by
+        knowledge, and nothing about it is assumed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _err = run("claude-code", "--root", self._fixture(tmp),
+                                  "--target-id", "anthropic/direct",
+                                  "--invoice-usd", "1.16")
+        self.assertEqual(code, 0)
+        self.assertNotIn("DRAFT", out)
+
+    def test_the_flag_goes_through_the_command_end_to_end(self):
+        """The helper is only a floor if `cmd_claude_code` actually applies it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _err = run("claude-code", "--root", self._fixture(tmp),
+                                  "--assume-anthropic-direct",
+                                  "--invoice-usd", "1.16")
+        self.assertEqual(code, 0)
+        self.assertIn("DRAFT", out)
+        self.assertIn("surface was assumed", out)
+
+    def test_it_never_launders_a_withheld_figure_into_a_released_one(self):
+        """A downgrade only. Re-releasing everything would turn the figures the
+        gate withheld into published drafts, which is the opposite failure."""
+        import dataclasses
+
+        from cacheeconomics.money import MEASURED, Figure
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._analysis(tmp, "anthropic/direct")
+        held = Figure(99.0, MEASURED, released=False,
+                      withheld_because="unprovable write lifetime")
+        a = cli._draft_because_the_surface_was_assumed(
+            dataclasses.replace(base, spend={"held": held, **base.spend}))
+        self.assertFalse(a.spend["held"].released)
+        self.assertEqual("unprovable write lifetime",
+                         a.spend["held"].withheld_because)
+        self.assertNotIn("99", str(a.spend["held"]))
+
+    def test_an_already_draft_figure_stays_draft(self):
+        import dataclasses
+
+        from cacheeconomics.money import DRAFT, MEASURED, Figure
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._analysis(tmp, "anthropic/direct")
+        a = cli._draft_because_the_surface_was_assumed(
+            dataclasses.replace(base, spend={
+                "old": Figure(5.0, MEASURED, released=True, released_as=DRAFT),
+                **base.spend}))
+        self.assertEqual(DRAFT, a.spend["old"].released_as)
+
+    def test_the_assumption_is_recorded_as_a_blocking_note(self):
+        """`blocking_notes` is the list of notes that qualify a published
+        figure, which is exactly what this now is."""
+        with tempfile.TemporaryDirectory() as tmp:
+            a = cli._draft_because_the_surface_was_assumed(
+                self._analysis(tmp, "anthropic/direct"))
+        self.assertTrue(any("surface was assumed" in n for n in a.blocking_notes))

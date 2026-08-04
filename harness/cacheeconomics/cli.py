@@ -340,6 +340,84 @@ def _claude_code_target(args) -> str:
         "amazon-bedrock/converse or google-cloud/vertex.")
 
 
+ASSUMED_SURFACE_DRAFT_NOTE = (
+    "DRAFT — the provider surface was assumed, not measured. "
+    "--assume-anthropic-direct supplied anthropic/direct, and every dollar "
+    "figure here is priced from that surface's rate table. An invoice can check "
+    "that the total adds up; it cannot check that the rate table it was added up "
+    "from is the right one, because a Claude Code transcript carries no provider "
+    "field to compare against. Pass --target-id to state the surface from "
+    "knowledge instead, and these become reconciled figures.")
+
+
+def _draft_because_the_surface_was_assumed(a):
+    """Re-release every figure in `a` as DRAFT rather than RECONCILED.
+
+    The floor under an assumed surface. Reconciliation checks a *total* against
+    an invoice; it cannot check the *rate table* that total was computed from,
+    and with `--assume-anthropic-direct` that table came from an assumption. So
+    a report could carry `released_as='reconciled'` -- the label meaning an
+    invoice verified this -- over dollars whose provenance was a guess.
+    Reproduced on a 40-request fixture: an invoice equal to computed spend
+    reconciled at 0.0% and released input_usd, if_uncached_usd,
+    caching_saved_usd and monthly_input_usd all as 'reconciled'.
+
+    That is this project's central failure in one place: an assumption
+    published with the provenance of a measurement. The assumption *was*
+    disclosed, but only as free text a renderer adds later -- in the text report
+    a costed finding and the total appear above the caveat, and in HTML the
+    Input spend KPI appears above the standing notes. Neither a reader skimming
+    nor a script reading the JSON `release_state` is reached by prose.
+
+    DRAFT is the existing vocabulary for "released, and not invoice-checked", so
+    this reuses it rather than inventing a third state that every renderer and
+    consumer would then have to learn. `report._is_draft` reads release state
+    off the figures rather than off the notes, so both renderers stamp this
+    without being told separately, and `Analysis.total_avoidable_month` derives
+    DRAFT from its parts on its own.
+
+    Deliberately a downgrade and never an upgrade: a figure that is withheld
+    stays withheld, and one already DRAFT stays DRAFT. `Figure.release` keeps an
+    explicit `as_`, so this cannot launder a withheld figure into a released one.
+
+    This is a floor, not the whole fix. It covers the surface *this flag*
+    assumed. The general form -- structured surface provenance on the figures
+    themselves, and `ts.blocking_notes` feeding the release decision so that any
+    assumed input blocks reconciled release whatever produced it -- belongs in
+    `analyzer.analyze` and is not done here.
+    """
+    import dataclasses
+
+    from . import money
+
+    def draft(v):
+        # Only touch what is actually published as invoice-checked. A withheld
+        # figure has no release state to downgrade and must keep its reason.
+        if not isinstance(v, money.Figure) or not v.released:
+            return v
+        return v.release(True, as_=money.DRAFT)
+
+    findings = [dataclasses.replace(f, avoidable_usd_month=draft(f.avoidable_usd_month))
+                if f.avoidable_usd_month is not None else f
+                for f in a.findings]
+    notes = a.notes
+    if ASSUMED_SURFACE_DRAFT_NOTE not in notes:
+        # At the front, where the analyzer puts its own DRAFT banner, so
+        # `report._draft_reason` finds this one and says which assumption.
+        notes = [ASSUMED_SURFACE_DRAFT_NOTE] + list(notes)
+    return dataclasses.replace(
+        a,
+        spend={k: draft(v) for k, v in a.spend.items()},
+        reconciliation=({k: draft(v) for k, v in a.reconciliation.items()}
+                        if a.reconciliation else a.reconciliation),
+        findings=findings,
+        notes=notes,
+        # The assumption qualifies a published figure, which is what this list
+        # is for. The adapter already records it; this states that it is now
+        # holding the release label down as well.
+        blocking_notes=list(a.blocking_notes) + [ASSUMED_SURFACE_DRAFT_NOTE])
+
+
 def cmd_claude_code(args) -> int:
     """Analyse local Claude Code transcripts.
 
@@ -350,11 +428,17 @@ def cmd_claude_code(args) -> int:
     The surface has to be chosen, one way or the other. See `_claude_code_target`.
     """
     from .adapters.claude_code import load_sessions
+    target_id = _claude_code_target(args)
     ts = load_sessions(root=args.root, project=args.project, limit=args.limit,
-                       target_id=_claude_code_target(args))
+                       target_id=target_id)
     a = analyze(ts, invoice_usd=args.invoice_usd,
                 effective_rate=args.effective_rate, on_date=args.on_date,
                 allow_unreconciled=args.allow_unreconciled)
+    # Keyed on the flag rather than on the resulting surface id: `--target-id
+    # anthropic/direct` is the same string arrived at by knowledge, and there is
+    # nothing assumed about it.
+    if args.assume_anthropic_direct:
+        a = _draft_because_the_surface_was_assumed(a)
     print(_coverage_line(ts), file=sys.stderr)
     print(report.render_text(a, detail=args.detail))
     return 0
