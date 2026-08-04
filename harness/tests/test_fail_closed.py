@@ -561,129 +561,50 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
             {"amazon-bedrock/converse"})
 
     def test_the_budget_recheck_uses_the_resolved_surface(self):
-        """Behavioural, by observing which surface the registry was asked about.
+        """That the live hook consults the post-patch guard, and obeys it.
 
-        This was an AST check with two holes: assigning the surface to a
-        variable first yielded an ast.Name and passed, and passing it by keyword
-        left `node.args` empty so `assertNotIsInstance(None, ast.Constant)`
-        passed trivially.
+        Split from the predicate it calls, which is tested in
+        `TestTheBreakpointBudgetPredicate` below. Seven earlier versions tried
+        to prove both at once through the whole hook and could prove neither
+        cleanly:
 
-        The obvious replacement -- drive a Vertex request and assert the marker
-        count respects Vertex's budget -- proves nothing, because every
-        Anthropic-family surface records `max_breakpoints: 4`. A literal
-        "anthropic/direct" produces an identical plan, and I confirmed that by
-        applying the mutation and watching the value-based version pass. So the
-        observable property is not the result but the question: which surface
-        did the guard actually ask about.
+          - the first was an AST check with two holes -- assigning the surface
+            to a variable yielded an `ast.Name` and passed, and passing it by
+            keyword left `node.args` empty so the assertion was vacuous;
+          - the next four asserted on the registry *lookup* rather than on what
+            the guard did with it, so a `_pre_call` that looked the budget up
+            and deleted the comparison satisfied all of them;
+          - and `_hook()` builds the handler with `mutate=False`, so
+            `decision.applied` was false and this guard never ran at all.
+            Measured: 6 `max_breakpoints` reads on `google-cloud/vertex` from a
+            body with no `cache_control` anywhere, every one of them from the
+            runtime monitor.
 
-        It also has to reach the recheck it is named after, and it did not.
-        `_hook()` builds the handler with `mutate=False`, so `decision.applied`
-        is false and `async_pre_call_hook` returns before the post-patch guard
-        ever runs. Every `max_breakpoints` read the spy saw came from the
-        runtime monitor's `_marker_budget` -- measured: 6 reads on
-        `google-cloud/vertex` from a body with no `cache_control` anywhere,
-        while `plugin.py`'s own guards never executed. A regression pinning the
-        literal at the actual recheck passed all three assertions.
-
-        So: drive the mutating path, and make the handler's own `target_id` the
-        *wrong* surface on purpose. `custom_llm_provider` outranks it, so
-        everything must resolve to Vertex, and any use of the handler default
-        at the recheck shows up as `anthropic/direct`.
-
-        Every version of this test before the fifth asserted on the registry
-        *lookup* rather than on what the guard did with it, and each one was a
-        better necessary condition than the last without ever becoming a
-        sufficient one. A `_pre_call` that performs the lookup, discards it and
-        deletes the `marker_count` comparison satisfies all of them.
-
-        The fifth was behavioural but only proved the body came back unmarked
-        *under* a forced budget, so an implementation that vetoed whenever this
-        recheck ran -- without ever comparing -- passed while also suppressing
-        perfectly legal requests.
-
-        DO NOT "simplify" the spy to answer every call site the same budget.
-        That version was written, measured and rejected, and it is the one
-        shape of this test that cannot fail:
-
-          - `_decide` enforces the same predicate earlier, against its own view
-            of the body. Lower the budget everywhere and `_decide` refuses
-            first, so this guard is never the cause of anything.
-          - Measured: with a uniform Vertex budget of 1, deleting this
-            recheck's enforcement outright left the body unmarked and the test
-            green.
-          - Instrumenting `marker_count` at both sites shows why no
-            uniform-answer version can work. On correct code `_decide` and
-            `_pre_call` both count 2. There is no body that is legal at one
-            site and illegal at the other unless one of them is told something
-            different, which is exactly what the per-call-site answer below
-            does and why it is here.
-
-        So the budget is answered only for this call site, and the *body* is
-        what varies. Same forced budget, two prompts, opposite required
-        outcomes:
-
-          one stable block  -> 1 marker placed, budget 1, body KEEPS it
-          two stable blocks -> 2 markers placed, budget 1, body comes back EMPTY
-
-        That pair is what makes the veto prove it is a function of
-        `marker_count(patched)` rather than of having run. A recheck that
-        vetoes unconditionally fails the first. One that never compares fails
-        the second. One pinned to the handler's `anthropic/direct` default
-        fails the second too, because that surface is left at its real budget
-        of 4 and shows headroom the resolved surface does not have.
-
-        Why this is tested at all, given the guard cannot fire on today's
-        code: it is defence in depth against the override path failing to strip
-        the caller's markers, and "unreachable by construction" is a property
-        of the current implementation, not of the design. The day that changes
-        is the day nobody will notice it changed. Deleting this test and
-        recording the guard as unreachable in a document would trade a tested
-        guard for a claim in a file, which is the failure mode this whole suite
-        exists to prevent. The per-call-site answer is a compromise; a guard
-        with no coverage is a gap. Reviewed and chosen deliberately.
+        Here the helper is replaced outright. Both runs send byte-identical
+        requests and differ only in what the helper answers, so what is
+        being proved is exactly: the hook calls it, passes it the *resolved*
+        surface, and honours the verdict in both directions. No registry state
+        is faked and no call site is answered differently from another --
+        earlier versions needed that only because the predicate was inline.
         """
         import asyncio
-        import os
-        import sys as _sys
         from datetime import datetime, timedelta, timezone
 
-        from cacheeconomics import registry
+        from cacheeconomics import plugin as plugin_mod
         from cacheeconomics.plugin import CachePlugin, litellm_handler
         from cacheeconomics.segment import marker_count
 
-        # The function holding the post-patch recheck. Named rather than
-        # line-numbered so ordinary edits to plugin.py do not move it, and so a
-        # rename fails loudly here instead of quietly matching nothing.
-        RECHECK_SITE = ("plugin.py", "_pre_call")
-        RESOLVED = "google-cloud/vertex"
         t0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
-        real = registry.capability
+        real_guard = plugin_mod.over_breakpoint_budget
 
-        def drive(blocks, recheck_budget=None):
-            """Returns the marker count on the body the hook handed back.
+        def drive(verdict):
+            """`(markers on the returned body, surfaces the guard was asked
+            about)`. `verdict` is what the guard is made to answer."""
+            asked = []
 
-            `blocks` is how many stable sections the prompt carries, which is
-            how many markers the allocator places. That is the variable the
-            assertions turn on; the budget is held constant across the pair.
-            """
-            def spy(target_id, name, *a, **kw):
-                value = real(target_id, name, *a, **kw)
-                if name != "max_breakpoints" or recheck_budget is None:
-                    return value
-                frame = _sys._getframe(1)
-                site = (os.path.basename(frame.f_code.co_filename),
-                        frame.f_code.co_name)
-                # Only this guard, and only when it asks about the surface the
-                # request resolved to. Pinned to `anthropic/direct` it falls
-                # through to that surface's real budget of 4 and never vetoes.
-                #
-                # The per-call-site narrowness is deliberate and load-bearing.
-                # Answering every site the same number makes `_decide` refuse
-                # first and this test cannot fail -- measured; see the
-                # docstring before widening it.
-                if site == RECHECK_SITE and target_id == RESOLVED:
-                    return recheck_budget
-                return value
+            def fake_guard(body, target_id):
+                asked.append(target_id)
+                return verdict
 
             p = CachePlugin(key=b"k" * 32, warmup=4)
             # Spaced timestamps: a tight loop on wall-clock time reads as
@@ -698,69 +619,149 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
 
             p.on_request = timed
             # Deliberately not Vertex. `mutate=True` requires a surface, and
-            # making it the wrong one turns "did the recheck use the handler
-            # default" into an observable rather than an argument.
+            # making the handler default the wrong one turns "did the guard get
+            # the resolved surface" into an observable rather than an argument.
             h = litellm_handler(p, mutate=True, target_id="anthropic/direct")
             out = None
 
             async def go():
                 nonlocal out
                 for i in range(24):
-                    msgs = [{"role": "system", "content": "policy " * 4000}]
-                    if blocks == 2:
-                        msgs.append({"role": "system",
-                                     "content": "tool docs " * 4000})
-                    msgs.append({"role": "user", "content": f"t{i}"})
                     data = {"model": "claude-opus-5",
                             "litellm_call_id": f"c{i}",
                             "metadata": {"session_id": "conv"},
                             "custom_llm_provider": "vertex_ai",
-                            "messages": msgs}
+                            "messages": [
+                                {"role": "system", "content": "policy " * 4000},
+                                {"role": "system",
+                                 "content": "tool docs " * 4000},
+                                {"role": "user", "content": f"t{i}"}]}
                     out = await h.async_pre_call_hook(None, None, data,
                                                       "completion")
 
-            registry.capability = spy
+            plugin_mod.over_breakpoint_budget = fake_guard
             try:
                 asyncio.run(go())
             finally:
-                registry.capability = real
-            return marker_count(out)
+                plugin_mod.over_breakpoint_budget = real_guard
+            return marker_count(out), asked
 
-        # Control, on the registry exactly as it ships. Both halves of the pair
-        # below rest on these counts being 1 and 2; if the allocator's
-        # behaviour moves, the pair stops straddling the budget and proves
-        # nothing, which is the vacuity three earlier versions shipped.
-        # It is also itself a within-budget case -- two markers against
-        # Vertex's real budget of four -- so a guard that strips
-        # unconditionally lands here rather than on the pair.
+        # Cleared: the hook leaves the body alone and the markers reach the
+        # wire. Fails if the hook vetoes without consulting the guard.
+        kept, asked = drive(None)
+        self.assertEqual(2, kept,
+                         "the guard cleared this body and the hook stripped it "
+                         "anyway")
+        self.assertTrue(asked, "the hook never consulted the post-patch guard")
         self.assertEqual(
-            (1, 2), (drive(blocks=1), drive(blocks=2)),
-            "on the shipped registry a one-block prompt must come back with "
-            "one marker and a two-block prompt with two. Either the allocator "
-            "stopped placing them, or something stripped a body that is well "
-            "inside Vertex's real budget of four; the pair below assumes both "
-            "counts and a budget of 1 sitting between them")
+            {"google-cloud/vertex"}, set(asked),
+            "the guard was asked about the wrong surface. `custom_llm_provider` "
+            "outranks the handler default, so every question must be about the "
+            "resolved surface; `anthropic/direct` here means the hook passed "
+            "its own default instead.")
 
-        # Same budget, legal body: the guard has to leave it alone. Fails if
-        # the recheck vetoes whenever it runs, or on the budget merely being
-        # small, rather than on the comparison.
+        # Vetoed: the original body goes out. Fails if the hook ignores the
+        # verdict, which is what "calls it and discards the answer" looks like.
+        vetoed, _ = drive((5, 4))
         self.assertEqual(
-            1, drive(blocks=1, recheck_budget=1),
-            "a patched body inside the surface's breakpoint budget was "
-            "stripped anyway. The recheck must veto on what was patched "
-            "exceeding the budget, not on having run at all.")
+            0, vetoed,
+            "the guard vetoed and the patched body went out anyway. The hook "
+            "must return the caller's original request when the post-patch "
+            "count exceeds the surface's budget.")
 
-        # Same budget, illegal body: the guard has to fire. Fails if the
-        # recheck never compares, or compares against the handler's default
-        # surface -- `anthropic/direct` still answers 4 here, so a pinned
-        # literal sees headroom the resolved surface does not have.
+
+class TestTheBreakpointBudgetPredicate(unittest.TestCase):
+    """`plugin.over_breakpoint_budget`, tested on what it actually compares.
+
+    This lived inline in the hook, where the only way to move the marker count
+    was to change the prompt -- which changes its shape and its text at the
+    same time. Every test of it therefore discriminated on something merely
+    *correlated* with the marker count: a guard vetoing on
+    `len(body["messages"]) > budget + 1` kept the small case, stripped the
+    large one, and never counted a marker.
+
+    So the fixtures below hold the body identical -- same message count, same
+    roles, same text, same lengths -- and vary only how many blocks carry
+    `cache_control`.
+    """
+
+    SURFACE = "anthropic/direct"
+
+    def _body(self, marked, blocks=6):
+        """`blocks` messages of identical shape and text; the first `marked`
+        of them carry a breakpoint."""
+        return {"messages": [
+            {"role": "user",
+             "content": [dict(
+                 {"type": "text", "text": "identical " * 50},
+                 **({"cache_control": {"type": "ephemeral"}} if i < marked
+                    else {}))]}
+            for i in range(blocks)]}
+
+    def _budget(self):
+        from cacheeconomics import registry
+        return registry.capability(self.SURFACE, "max_breakpoints")
+
+    def test_the_fixtures_differ_only_in_marker_count(self):
+        """Guard the guard. If the two bodies differ in any other way, the
+        assertions below stop isolating the marker count and this class goes
+        back to proving a correlate."""
+        import json
+        from cacheeconomics.segment import marker_count
+        lo, hi = self._body(1), self._body(self._budget() + 1)
+        self.assertNotEqual(marker_count(lo), marker_count(hi))
+        strip = json.dumps(
+            [[{k: v for k, v in b.items() if k != "cache_control"}
+              for b in m["content"]] for m in lo["messages"]])
         self.assertEqual(
-            0, drive(blocks=2, recheck_budget=1),
-            "the patched body went out carrying more markers than the resolved "
-            "surface allows. The post-patch recheck must read the budget for "
-            "the surface the request resolved to and veto the patch when the "
-            "body exceeds it -- reading it and not enforcing, or enforcing "
-            "against the handler's default surface, both land here.")
+            strip,
+            json.dumps([[{k: v for k, v in b.items() if k != "cache_control"}
+                         for b in m["content"]] for m in hi["messages"]]),
+            "the fixtures differ somewhere other than `cache_control`")
+
+    def test_a_body_within_the_budget_clears(self):
+        from cacheeconomics.plugin import over_breakpoint_budget
+        for marked in range(self._budget() + 1):
+            with self.subTest(markers=marked):
+                self.assertIsNone(
+                    over_breakpoint_budget(self._body(marked), self.SURFACE))
+
+    def test_a_body_over_the_budget_is_reported_with_both_numbers(self):
+        from cacheeconomics.plugin import over_breakpoint_budget
+        budget = self._budget()
+        over = over_breakpoint_budget(self._body(budget + 1), self.SURFACE)
+        self.assertEqual((budget + 1, budget), over)
+
+    def test_it_counts_markers_not_blocks(self):
+        """The mutation this class exists for. Same marker count, very
+        different body size: a predicate keyed on anything but the markers
+        answers these two differently."""
+        from cacheeconomics.plugin import over_breakpoint_budget
+        budget = self._budget()
+        self.assertIsNone(
+            over_breakpoint_budget(self._body(budget, blocks=budget),
+                                   self.SURFACE))
+        self.assertIsNone(
+            over_breakpoint_budget(self._body(budget, blocks=budget * 8),
+                                   self.SURFACE))
+
+    def test_an_unbounded_surface_is_not_a_licence_to_veto(self):
+        """`openai/direct` records `max_breakpoints: null` and
+        `deepseek/direct` records 0. Neither is a budget to exceed, and
+        `_decide` has already refused to place against them, so inventing one
+        here would veto live traffic on a guess."""
+        from cacheeconomics.plugin import over_breakpoint_budget
+        for surface in ("openai/direct", "deepseek/direct",
+                        UNATTRIBUTED):
+            with self.subTest(surface=surface):
+                self.assertIsNone(
+                    over_breakpoint_budget(self._body(9), surface))
+
+    def test_a_contested_surface_does_not_veto_either(self):
+        """A contested row is never treated as fact, in either direction."""
+        from cacheeconomics.plugin import over_breakpoint_budget
+        self.assertIsNone(
+            over_breakpoint_budget(self._body(9), "openai/bedrock"))
 
 
 class TestSegmentIdsAreScopedToTheTenant(unittest.TestCase):
