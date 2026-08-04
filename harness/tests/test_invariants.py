@@ -167,6 +167,70 @@ def renderers():
 
 
 
+
+def surface_fallback_sites():
+    """Every place package source supplies a first-party surface as a FALLBACK.
+
+    INV-4 reads `inspect.signature`, so it sees parameter defaults and nothing
+    else. Measured on main after the signature class was closed: four sites
+    still fabricated `anthropic/direct` and INV-4 passed green -- an argparse
+    `default=`, and three `or` expressions in the function body. The shipped
+    `cacheeconomics checks` command answered with Anthropic's 512-token minimum
+    for a caller who never named a surface, and the same prefix FAILS on
+    openai/direct at 1024.
+
+    So this walks the AST instead, and looks for the *shape* rather than the
+    string: a surface id standing where a value goes when nobody supplied one.
+    Four shapes, plus class-level field defaults, which the first version of
+    this function missed -- `trace.py`'s `target_id: str = "anthropic/direct"`
+    is an `AnnAssign`, not `ast.arguments`, so a detector written from the
+    other four found eleven sites and quietly skipped the twelfth. Caught by
+    cross-checking against a broader scan, which is the only reason this
+    docstring is not making the same overconfident claim as the last one.
+
+    Deliberately NOT flagged: a surface id used as a VALUE, in a mapping that
+    translates something observed (`adapters/litellm.py`'s provider table) or
+    in a comparison. Those name a surface because the data named it. Flagging
+    them would make this noisy, and a noisy invariant gets switched off.
+    """
+    import ast
+    import pathlib
+    ids = {t for t in registry.target_ids() if t != registry.UNATTRIBUTED}
+
+    def surface(n):
+        return (isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and n.value in ids)
+
+    root = pathlib.Path(registry.HERE)
+    out = []
+    for f in sorted(root.rglob("*.py")):
+        if f.name == "registry.py":
+            continue
+        rel = f.relative_to(root.parent)
+        for node in ast.walk(ast.parse(f.read_text())):
+            if isinstance(node, ast.arguments):
+                for d in list(node.defaults) + [k for k in node.kw_defaults if k]:
+                    if surface(d):
+                        out.append(f"{rel}:{d.lineno} parameter default")
+            elif isinstance(node, (ast.AnnAssign, ast.Assign)):
+                v = node.value
+                if v is not None and surface(v):
+                    out.append(f"{rel}:{v.lineno} field default")
+            elif isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+                for v in node.values[1:]:
+                    if surface(v):
+                        out.append(f"{rel}:{v.lineno} `or` fallback")
+            elif isinstance(node, ast.Call):
+                fn = node.func
+                if (isinstance(fn, ast.Attribute) and fn.attr == "get"
+                        and len(node.args) == 2 and surface(node.args[1])):
+                    out.append(f"{rel}:{node.args[1].lineno} dict.get fallback")
+                for kw in node.keywords:
+                    if kw.arg in ("default", "target_id") and surface(kw.value):
+                        out.append(f"{rel}:{kw.value.lineno} {kw.arg}= keyword")
+    return sorted(set(out))
+
+
 # --- known defects, as exact sets -----------------------------------------
 #
 # These replace `@unittest.expectedFailure`, which round 3 of external review
@@ -214,6 +278,25 @@ KNOWN_SURFACE_DEFAULTS = (
 # INV-4, Track B. Entry points that mutate unless told not to.
 KNOWN_MUTATE_BY_DEFAULT = (
     "plugin.CachePlugin.on_request(apply=True)",
+)
+
+# INV-6. Every place the package supplies a first-party surface when nobody
+# named one. Found by AST shape, not by name, so it covers routes
+# `inspect.signature` cannot see. Line numbers move -- re-run
+# `surface_fallback_sites()` and paste, do not hand-edit.
+KNOWN_SURFACE_FALLBACKS = (
+    "cacheeconomics/adapters/claude_code.py:83 parameter default",
+    "cacheeconomics/checks.py:101 parameter default",
+    "cacheeconomics/checks.py:240 parameter default",
+    "cacheeconomics/checks.py:63 parameter default",
+    "cacheeconomics/cli.py:292 `or` fallback",
+    "cacheeconomics/cli.py:446 default= keyword",
+    "cacheeconomics/cost.py:389 parameter default",
+    "cacheeconomics/plugin.py:276 parameter default",
+    "cacheeconomics/plugin.py:528 `or` fallback",
+    "cacheeconomics/recorder.py:119 parameter default",
+    "cacheeconomics/relocate.py:385 `or` fallback",
+    "cacheeconomics/trace.py:179 field default",
 )
 
 # INV-5, Track C. Registry dependencies that disable a check in silence.
@@ -867,6 +950,47 @@ def _run_with_failing(kind, name):
         registry.capability = real_capability
         registry.min_cacheable_tokens = real_min
     return fired
+
+
+
+class TestNoSurfaceIsFabricatedAnywhereInTheSource(unittest.TestCase):
+    """INV-6. The class INV-4 structurally cannot see.
+
+    `inspect.signature` shows parameter defaults. It does not show an argparse
+    `default=`, an `or` fallback in a function body, a `dict.get` second
+    argument, or a dataclass field default -- and a surface fabricated by any
+    of those is priced and bounded exactly like one fabricated by a parameter
+    default. INV-4 went green on a package with four such sites.
+
+    Whether a caller "named a surface" is a property of the source, so the
+    source is what this reads.
+    """
+
+    def test_the_scan_finds_something_to_check(self):
+        self.assertTrue(surface_fallback_sites(),
+                        "no fallback sites found at all; the AST scan is "
+                        "broken and this invariant is vacuous")
+
+    def test_the_scan_ignores_legitimate_surface_names(self):
+        """Guard against over-reach in the other direction.
+
+        `adapters/litellm.py` maps observed provider names onto surface ids.
+        That is a translation table, not a fabrication -- the surface is named
+        because the data named it. An invariant that flags it is noise, and
+        noise is how an invariant gets deleted.
+        """
+        found = " ".join(surface_fallback_sites())
+        self.assertNotIn("adapters/litellm.py", found,
+                         "the provider translation table is being reported as "
+                         "a fabricated surface")
+
+    def test_no_new_site_fabricates_a_surface(self):
+        self.assertEqual(
+            sorted(KNOWN_SURFACE_FALLBACKS), surface_fallback_sites(),
+            "the set of places the package supplies a first-party surface "
+            "when nobody named one has CHANGED. If you closed some, update "
+            "KNOWN_SURFACE_FALLBACKS (or set it to `()`). Line numbers move, "
+            "so re-run and paste the current list rather than editing by hand.")
 
 
 if __name__ == "__main__":
