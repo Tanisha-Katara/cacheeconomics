@@ -18,6 +18,7 @@ heard of, produce no marker, no dollar figure, and a reason.
 
 import argparse
 import json
+import math
 import os
 import sys
 import tempfile
@@ -2725,8 +2726,13 @@ class TestABooleanMultiplierIsRefusedRatherThanPricedAtOneX(unittest.TestCase):
         self.assertFalse(cost.is_multiplier(None))
         self.assertFalse(cost.is_multiplier("1.25"))
         self.assertTrue(cost.is_multiplier(1.25))
-        self.assertTrue(cost.is_multiplier(0))
         self.assertTrue(cost.is_multiplier(2))
+        # Zero was accepted when this predicate rejected only bools. It prices a
+        # cache write as free, which is a claim no registry row should be able
+        # to make by accident, and no recorded row does -- every multiplier in
+        # the registry is 0.1 or above.
+        self.assertFalse(cost.is_multiplier(0))
+        self.assertFalse(cost.is_multiplier(0.0))
 
     def test_the_hole_is_real_in_the_language(self):
         """The reason this needs a named predicate at all: the obvious guard is
@@ -2775,25 +2781,137 @@ class TestABooleanMultiplierIsRefusedRatherThanPricedAtOneX(unittest.TestCase):
             tiers._surface("anthropic/direct", "claude-opus-5")
         self.assertIn("read multiplier", str(e.exception))
 
-    def test_a_boolean_write_multiplier_drops_that_tier_rather_than_pricing_it(self):
-        """The deliberate half, kept. A surface may advertise a lifetime the
-        registry records no premium for, and that tier is simply unavailable to
-        the plan -- which is why absent write multipliers are skipped rather
-        than fatal. Accepting a *boolean* one was not deliberate: it entered the
-        search as a 1.0x write premium nobody recorded."""
-        self._poison("write_5m", True)
-        _budget, rates, _read = tiers._surface("anthropic/direct",
-                                               "claude-opus-5")
-        self.assertNotIn("5m", rates, "a boolean premium entered the plan")
-        self.assertEqual({"1h": self.real["write_1h"]}, rates)
+    def test_a_present_but_unusable_write_multiplier_is_refused(self):
+        """Absent and corrupt are different facts and must not share a path.
+
+        This previously took the *skip* path, so `write_5m: true` beside a
+        numeric `write_1h` returned a one-lifetime rate map and the allocator
+        went on to recommend 1h-only plans -- with nothing anywhere reporting
+        that the 5m price input was corrupt. Measured before the fix:
+
+            write_5m ABSENT -> {'1h': 2.0}      (correct: a gap in the registry)
+            write_5m=True   -> {'1h': 2.0}      (wrong: identical, and it is a
+                                                 fault in the data, not a gap)
+            write_5m=NaN    -> {'5m': nan, ...} (worse: it entered the search)
+
+        An absent premium is a fact about the surface. A corrupt one is a fact
+        about the data, and only the second should stop the run.
+        """
+        for value in (True, float("nan"), float("inf"), -1.0, 0.0):
+            with self.subTest(write_5m=value):
+                self._poison("write_5m", value)
+                with self.assertRaises(tiers.Unsupported) as e:
+                    tiers._surface("anthropic/direct", "claude-opus-5")
+                self.assertIn("unusable write multipliers", str(e.exception))
+                self.assertIn("write_5m", str(e.exception))
+
+    def test_but_a_genuinely_absent_one_still_only_drops_that_tier(self):
+        """The deliberate half, kept and now on its own fixture rather than
+        sharing the corrupt one. A surface may advertise a lifetime the registry
+        records no premium for; that tier is unavailable to the plan and the
+        rest of the plan is still sound."""
+        for label, m in (("key absent",
+                          {k: v for k, v in self.real.items() if k != "write_5m"}),
+                         ("explicit null", {**self.real, "write_5m": None})):
+            with self.subTest(case=label):
+                self.registry.multipliers = lambda _t, _m=m: _m
+                _budget, rates, _read = tiers._surface("anthropic/direct",
+                                                       "claude-opus-5")
+                self.assertEqual({"1h": self.real["write_1h"]}, rates)
 
     def test_and_refuses_outright_when_no_lifetime_survives(self):
-        self.registry.multipliers = lambda _t: {**self.real,
-                                                "write_5m": True,
-                                                "write_1h": True}
+        self.registry.multipliers = lambda _t: {
+            k: v for k, v in self.real.items()
+            if k not in ("write_5m", "write_1h")}
         with self.assertRaises(tiers.Unsupported) as e:
             tiers._surface("anthropic/direct", "claude-opus-5")
         self.assertIn("no matching write", str(e.exception))
+
+    # --- the rule this predicate was copied from, and copied wrong ----------
+
+    HOSTILE = (float("nan"), float("inf"), float("-inf"), -1.0, 0.0, True,
+               False, None, "1.25")
+
+    def test_it_rejects_everything_that_is_not_a_finite_positive_number(self):
+        for v in self.HOSTILE:
+            with self.subTest(value=repr(v)):
+                self.assertFalse(cost.is_multiplier(v))
+        for v in (0.1, 1.25, 2, 2.0, 1e-6):
+            with self.subTest(value=repr(v)):
+                self.assertTrue(cost.is_multiplier(v))
+
+    def test_the_json_constants_are_the_reachable_half_of_that(self):
+        """NaN and Infinity are not exotic: `json.loads` accepts both literals
+        by default, so a hand-edited registry file reaches the process carrying
+        them without anything being malformed."""
+        self.assertTrue(math.isnan(json.loads('{"x": NaN}')["x"]))
+        self.assertTrue(math.isinf(json.loads('{"x": Infinity}')["x"]))
+
+    def test_price_refuses_every_hostile_multiplier(self):
+        usage = cost.Usage(uncached_input=0, cache_read=0,
+                           cache_write_5m=1_000_000)
+        for key in self.KEYS:
+            for v in self.HOSTILE:
+                with self.subTest(multiplier=key, value=repr(v)):
+                    self._poison(key, v)
+                    with self.assertRaises(self.registry.RegistryError):
+                        cost.price(usage, "claude-opus-5",
+                                   target_id="anthropic/direct",
+                                   on_date="2026-07-29")
+
+    def test_none_of_them_can_reach_a_published_figure(self):
+        """The consequence, stated as the numbers that used to come out.
+
+        Measured before the fix, `write_5m` poisoned, one million 5m-write
+        tokens: NaN gave `usd=nan` (and `--format json` emits a bare NaN, which
+        is not valid JSON), Infinity gave `inf`, -1.0 gave -$5.00, and 0.0 made
+        the write free.
+        """
+        usage = cost.Usage(uncached_input=0, cache_read=0,
+                           cache_write_5m=1_000_000)
+        for v in (float("nan"), float("inf"), -1.0, 0.0):
+            with self.subTest(write_5m=repr(v)):
+                self._poison("write_5m", v)
+                with self.assertRaises(self.registry.RegistryError):
+                    cost.price(usage, "claude-opus-5",
+                               target_id="anthropic/direct",
+                               on_date="2026-07-29")
+
+    def test_the_predicate_agrees_with_the_effective_rate_guard(self):
+        """The twin-path check, and the one that would have caught this.
+
+        `is_multiplier` exists *because* `effective_rate` fifty lines below
+        already refused a bool for the same reason. Only the bool third of that
+        rule was carried across: `effective_rate` rejects bool AND non-finite
+        AND non-positive, and this rejected bool.
+
+        Two guards over the same quantity -- a number every token count is
+        multiplied by -- have to agree, so they are now compared directly
+        instead of being written twice and trusted to match.
+        """
+        usage = cost.Usage(uncached_input=1_000)
+        # `None` is excluded, and the reason is the one interesting asymmetry
+        # this comparison turned up: to `effective_rate` it is the *sentinel for
+        # "not supplied"*, so `price` skips the override entirely and the guard
+        # never runs. To a multiplier it is a value in the map -- `read: null`
+        # is a real row on openai/direct -- and must be refused. Same literal,
+        # two meanings, so forcing the two guards to agree about it would be
+        # wrong in one of them.
+        compared = tuple(v for v in self.HOSTILE if v is not None)
+        for v in compared + (0.1, 1.25, 2.0):
+            with self.subTest(value=repr(v)):
+                try:
+                    cost.price(usage, "claude-opus-5",
+                               target_id="anthropic/direct",
+                               on_date="2026-07-29", effective_rate=v)
+                    rate_ok = True
+                except (ValueError, TypeError):
+                    rate_ok = False
+                self.assertEqual(
+                    rate_ok, cost.is_multiplier(v),
+                    f"the two guards over a multiplied rate disagree about "
+                    f"{v!r}: effective_rate {'accepts' if rate_ok else 'refuses'}"
+                    f" it, is_multiplier says {cost.is_multiplier(v)}")
 
     # KNOWN-FAILING in this worktree only, and deliberately an invariant rather
     # than a scoped check. The four analyzer consumers delegate to Track A's

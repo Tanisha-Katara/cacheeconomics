@@ -188,16 +188,38 @@ def _surface(target_id: str, model: str | None = None):
         raise Unsupported(
             f"{target_id} does not record an Anthropic-shaped read multiplier, "
             f"so this cost model cannot compare plans on it.")
-    rates = {}
+    # Three cases, not two, and collapsing the last two is what went wrong.
+    #
+    #   absent              -- skip. A surface can advertise a lifetime the
+    #                          registry records no premium for; the plan simply
+    #                          cannot use that tier, and that is a gap in the
+    #                          registry rather than a fault in the row.
+    #   present and valid   -- use.
+    #   present and invalid -- refuse. This took the skip path, so `write_5m:
+    #                          true` beside a numeric `write_1h` returned a
+    #                          one-lifetime rate map and the allocator went on
+    #                          to recommend 1h-only plans, with nothing anywhere
+    #                          reporting that the 5m price input was corrupt.
+    #
+    # The difference matters because the two look identical downstream and mean
+    # opposite things: an absent premium is a fact about the surface, a corrupt
+    # one is a fact about the data, and only the second should stop the run.
+    rates, corrupt = {}, []
     for t in ttls:
         key = f"write_{t}"
-        # Skipping an *absent* write multiplier is deliberate: a surface can
-        # advertise a lifetime the registry has no premium for, and the plan
-        # simply cannot use that tier. Accepting a *boolean* one was not -- it
-        # entered the search as a 1.0x write and priced a premium nobody
-        # recorded.
-        if cost.is_multiplier(mult.get(key)):
-            rates[t] = mult[key]
+        if key not in mult or mult[key] is None:
+            continue
+        if not cost.is_multiplier(mult[key]):
+            corrupt.append(f"{key}={mult[key]!r}")
+            continue
+        rates[t] = mult[key]
+    if corrupt:
+        raise Unsupported(
+            f"{target_id} records unusable write multipliers "
+            f"({', '.join(corrupt)}), so a plan built on the remaining "
+            f"lifetimes would be priced against a table that is partly "
+            f"corrupt. A multiplier must be a finite positive number; an "
+            f"absent one is a different thing and is skipped.")
     if not rates:
         raise Unsupported(
             f"{target_id} records lifetimes {ttls} but no matching write "

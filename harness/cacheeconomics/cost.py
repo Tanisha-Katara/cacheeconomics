@@ -12,6 +12,7 @@ negative, and it frequently is on a workload that writes caches nothing reads.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -277,29 +278,47 @@ ANTHROPIC_SHAPED_MULTIPLIERS = ("read", "write_5m", "write_1h")
 def is_multiplier(value) -> bool:
     """Is this a number a token count may be multiplied by?
 
-    `bool` is excluded, and that is the whole reason this exists. `bool`
-    subclasses `int`, so `isinstance(True, (int, float))` is True and a
-    hand-edited registry row carrying `write_5m: true` sailed through every
-    numeric guard in the package and priced at 1.0x. Measured on
-    anthropic/direct: one million 5m-write tokens came back $5.00 instead of
-    $6.25, a silent 20% understatement of the one figure the whole tool exists
-    to get right -- and 1.0x is a plausible-looking number, so nothing
-    downstream reads as broken.
+    Finite, positive, and not a bool. All four exclusions are here because all
+    four have been measured reaching a published figure.
 
-    `read: true` is worse in a different way: 1.0x instead of 0.1x makes a cache
-    read cost the same as fresh input, so the allocator models caching as
-    worthless and declines to place a marker at all.
+    `bool` came first. `bool` subclasses `int`, so `isinstance(True, (int,
+    float))` is True and a registry row carrying `write_5m: true` sailed through
+    every numeric guard and priced at 1.0x: one million 5m-write tokens came
+    back $5.00 instead of $6.25, a silent 20% understatement. `read: true` is
+    the same defect inverted -- 1.0x instead of 0.1x makes a cache read cost
+    what fresh input costs, so the allocator models caching as worthless.
 
-    This file already applied the rule one branch away -- `effective_rate`
-    excludes `bool` explicitly, for the same reason and with the same
-    consequence -- which is why it is now a named predicate rather than a
-    condition each caller writes out.
+    The rest were closed one round later, and the way they were missed is worth
+    recording: this predicate was written *because* `effective_rate` fifty lines
+    below already excluded bool, and only the bool third of that rule was
+    carried across. `effective_rate` rejects bool AND non-finite AND
+    non-positive; this rejected bool. Measured on anthropic/direct with
+    `write_5m` poisoned, all four priced rather than refusing:
 
-    `None` fails here too. `read: null` is a real registry value on
+        NaN       -> usd = nan          rendered "$nan", and `--format json`
+                                        emits a bare NaN, which is not valid JSON
+        Infinity  -> usd = inf
+        -1.0      -> usd = -5.00        a negative bill
+        0.0       -> usd = 0.00         writes free
+
+    `json.loads` accepts the `NaN` and `Infinity` literals by default, so those
+    two reach the process from a hand-edited registry file without anything
+    malformed being written.
+
+    Zero is refused with the rest, and no registry row is affected: every
+    recorded multiplier is 0.1 or above, checked across all eight rows. A zero
+    write multiplier prices a cache write as free, which is a claim no row
+    should be able to make by accident -- and "the row is corrupt" and "this
+    surface writes for free" would otherwise produce the same $0.00.
+
+    `None` fails on the type check. `read: null` is a real value on
     openai/direct, and multiplying by it raised a TypeError one layer from the
     cause instead of a refusal naming the surface.
     """
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0)
 
 
 def unusable_multipliers(mapping, keys=ANTHROPIC_SHAPED_MULTIPLIERS) -> list:
