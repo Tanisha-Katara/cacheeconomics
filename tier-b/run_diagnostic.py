@@ -76,6 +76,10 @@ def main() -> int:
     p.add_argument("--target-id",
                    help="the provider surface this traffic went to. Passed to "
                         "counting and to analysis, which must agree on it")
+    p.add_argument("--tokenizer-id",
+                   help="identifier for the tokenizer deployment behind "
+                        "--endpoint; without it counting does not resume from a "
+                        "cache, because nothing shows the tokenizer is the same")
     args, passthrough = p.parse_known_args()
     if args.target_id:
         passthrough += ["--target-id", args.target_id]
@@ -100,6 +104,8 @@ def main() -> int:
                "-o", out_path]
         if args.target_id:
             cmd += ["--target-id", args.target_id]
+        if args.tokenizer_id:
+            cmd += ["--tokenizer-id", args.tokenizer_id]
         if args.endpoint:
             cmd += ["--endpoint", args.endpoint]
         if args.dry_run:

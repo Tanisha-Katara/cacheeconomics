@@ -42,25 +42,30 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # derivation is what produced that, so there is now one.
 sys.path.insert(0, HERE)
 from count_tokens import (COUNTER_VERSION, DEFAULT_ENDPOINT,     # noqa: E402
-                          PROVENANCE_KEY, body_sha256, counted_path)
+                          PROVENANCE_KEY, body_sha256, counted_path,
+                          row_models, row_sha256)
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
 
 
-def stale_reason(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
-                 target_id: str | None = None) -> str | None:
-    """Why `out` cannot be treated as the counted form of `src`, or None.
+def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
+                    target_id: str | None = None,
+                    tokenizer_id: str | None = None):
+    """The capture in hand with `out`'s still-valid counts merged onto it, or
+    `(None, reason)`.
 
-    This existed because the previous rule was "the file is there". Counted rows
-    carry `segment_tokens`, and the loader accepts any correctly-shaped positive
-    array as exact -- so a counted export left over from a capture that has
-    since been re-recorded, or from a different endpoint, or from an older
-    version of the counter, was analysed as exact and nothing anywhere could
-    tell. Removing the flag that produced some of those files closed the door
-    and left the window open.
+    Two things were wrong with the version that answered "is `out` fresh?".
 
-    Every input that changes a count is compared: the body each row was counted
-    from, the tokenizer that answered, the host it answered from, the surface
-    used to resolve the model, and the version of the script.
+    It returned `out` itself, so the counted file supplied the *whole* row --
+    usage, timestamps, status, session -- and only the body digest was checked.
+    Now the counted file contributes `segment_tokens` and its provenance and
+    nothing else; every other field comes from the capture by construction, so
+    there is no set of fields left to enumerate and get wrong.
+
+    And it recorded the model without ever comparing it. For the shape where the
+    model sits on the row rather than in the body, changing it left the body
+    digest identical, so a file counted by the previous tokenizer passed. Both
+    models are compared now, resolved from the *current* row, along with a
+    digest of that whole row.
     """
     try:
         with open(src) as f:
@@ -68,37 +73,62 @@ def stale_reason(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
         with open(out) as f:
             out_rows = [json.loads(l) for l in f if l.strip()]
     except (OSError, ValueError) as e:
-        return f"could not read it ({type(e).__name__})"
+        return None, f"could not read it ({type(e).__name__})"
 
     if len(src_rows) != len(out_rows):
-        return (f"it has {len(out_rows):,} rows and the capture now has "
-                f"{len(src_rows):,}")
+        return None, (f"it has {len(out_rows):,} rows and the capture now has "
+                      f"{len(src_rows):,}")
 
+    merged = []
     for i, (s, o) in enumerate(zip(src_rows, out_rows)):
-        if not isinstance(o, dict) or "segment_tokens" not in o:
-            continue                     # never counted; nothing to trust
+        # The current row, never the stored one.
+        row = json.loads(json.dumps(s))
+        counts = o.get("segment_tokens") if isinstance(o, dict) else None
+        if counts is None:
+            merged.append(row)           # never counted; nothing to reuse
+            continue
         p = o.get(PROVENANCE_KEY)
         if not isinstance(p, dict):
-            return (f"row {i} carries counts with no record of what produced "
-                    f"them (written before counted exports recorded it)")
+            return None, (f"row {i} carries counts with no record of what "
+                          f"produced them (written before counted exports "
+                          f"recorded it)")
         body = _find_body(s) if isinstance(s, dict) else None
-        expected = {"version": COUNTER_VERSION,
-                    "body_sha256": body_sha256(body) if body else None,
-                    "endpoint": endpoint, "target_id": target_id}
-        for field, want in expected.items():
-            if p.get(field) != want:
-                return (f"row {i} was counted with {field}={p.get(field)!r}, "
-                        f"this run needs {want!r}")
-    return None
+        if not body:
+            return None, (f"row {i} carries counts but the capture no longer "
+                          f"has a recognisable body there")
+        models = row_models(s, body, target_id)
+        want = {"version": COUNTER_VERSION,
+                "row_sha256": row_sha256(s), "body_sha256": body_sha256(body),
+                "tokenizer_model": models.tokenizer,
+                "analysis_model": models.analysis,
+                "endpoint": endpoint, "target_id": target_id,
+                "tokenizer_id": tokenizer_id}
+        for field, expected in want.items():
+            if p.get(field) != expected:
+                return None, (f"row {i} was counted with "
+                              f"{field}={p.get(field)!r}, this run needs "
+                              f"{expected!r}")
+        row["segment_tokens"] = counts
+        row[PROVENANCE_KEY] = p
+        merged.append(row)
+    return merged, None
 
 
 def counted(path: str, endpoint: str = DEFAULT_ENDPOINT,
-            target_id: str | None = None) -> str:
+            target_id: str | None = None,
+            tokenizer_id: str | None = None) -> str:
     """Exact token counts, or the structural findings carry no figures."""
     out = counted_path(path)
     if os.path.exists(out):
-        why = stale_reason(path, out, endpoint, target_id)
+        merged, why = reusable_counts(path, out, endpoint, target_id,
+                                      tokenizer_id)
         if why is None:
+            # Rewritten from the capture in hand rather than handed back as
+            # found. Every row is the current one; only the counts came from the
+            # old file, and only after their provenance matched this row.
+            with open(out, "w") as f:
+                for row in merged:
+                    f.write(json.dumps(row) + "\n")
             return out
         # Refused rather than recounted, and this is the deliberate half of the
         # fix. Recounting on a mismatch would send this capture's prompt
@@ -119,6 +149,8 @@ def counted(path: str, endpoint: str = DEFAULT_ENDPOINT,
         cmd += ["--endpoint", endpoint]
     if target_id:
         cmd += ["--target-id", target_id]
+    if tokenizer_id:
+        cmd += ["--tokenizer-id", tokenizer_id]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         # Named, not just reported. This returns the *uncounted* capture, so
@@ -226,6 +258,23 @@ def analyse(path: str, target_id: str | None = None) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--dir", required=True)
+    # Reachable at all, which they were not. `counted()` and `analyse()` both
+    # take these and `main` called both with defaults, so a sweep of a Bedrock,
+    # Vertex or gateway capture could not strip the surface's model prefix and
+    # could not send its counting calls anywhere but the default host -- and a
+    # counted file produced correctly with --target-id was then refused as stale
+    # by this path, because this path passed None. Removing --model left those
+    # exports no route through the sweep at all.
+    p.add_argument("--target-id",
+                   help="the provider surface these captures went to. Passed to "
+                        "counting and to analysis, which must agree on it")
+    p.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
+                   help=f"where to send counting calls (default: "
+                        f"{DEFAULT_ENDPOINT})")
+    p.add_argument("--tokenizer-id",
+                   help="identifier for the tokenizer deployment behind "
+                        "--endpoint; without it counted captures are not "
+                        "resumed from a cache")
     args = p.parse_args()
 
     files = sorted(f for f in glob.glob(os.path.join(args.dir, "interval-*.jsonl"))
@@ -246,7 +295,8 @@ def main() -> int:
         if not c.get("n"):
             print("    no gaps; skipped", file=sys.stderr)
             continue
-        a = analyse(counted(f))
+        a = analyse(counted(f, args.endpoint, args.target_id,
+                            args.tokenizer_id), args.target_id)
         rows.append({"label": label, **c, **a})
 
     def schedule_seconds(r):
@@ -279,8 +329,16 @@ def main() -> int:
 
     out = os.path.join(args.dir, "sweep-report.json")
     with open(out, "w") as f:
-        json.dump({"artifact": "interval-sweep-report", "artifact_version": 1,
+        # The surface and the counting host travel with the numbers. Both change
+        # what the points mean -- the surface decides which rate table applies
+        # and how model ids resolve, the endpoint decides which tokenizer sized
+        # the segments -- and an artifact that records neither cannot be told
+        # apart from one run against different settings.
+        json.dump({"artifact": "interval-sweep-report", "artifact_version": 2,
                    "project": "browser-use", "model": "claude-haiku-4-5",
+                   "target_id": args.target_id,
+                   "count_endpoint": args.endpoint,
+                   "tokenizer_id": args.tokenizer_id,
                    "points": rows}, f, indent=2)
     print(f"\n  wrote {out}")
     return 0

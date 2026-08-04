@@ -52,6 +52,7 @@ import json
 import os
 import sys
 import time
+import typing
 import urllib.error
 import urllib.request
 
@@ -60,7 +61,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
 from cacheeconomics.tokenizer import count_segments              # noqa: E402
-from cacheeconomics.trace import request_from_row                # noqa: E402
+from cacheeconomics.trace import (_first, _text,                 # noqa: E402
+                                  request_from_row)
 
 # Overridable, because the clients most likely to care about egress are the
 # ones who cannot reach this host. An enterprise gateway, a Bedrock or Vertex
@@ -70,12 +72,38 @@ DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
 
 # Bumped when anything about how a count is produced changes -- the cut
 # construction, the differencing, which model is asked. Recorded in every
-# counted row so a reader can tell an export this script produced from one an
-# older version did, and refuse to reuse the older one.
-COUNTER_VERSION = 1
+# counted row *and* folded into every cache key, so neither a counted export nor
+# a resume cache written by an older version can be read back by this one.
+COUNTER_VERSION = 2
 
 # Where the record of what produced `segment_tokens` lives on each counted row.
 PROVENANCE_KEY = "segment_tokens_provenance"
+
+
+class RowModels(typing.NamedTuple):
+    """The two models a row has, which are two different questions.
+
+    Answering both with one value is the mistake this type exists to make
+    impossible, and it was made twice in opposite directions: first by sending
+    the raw id and recording it as the analysed model, then by normalising and
+    sending *that* to the tokenizer.
+
+    `tokenizer` is the id the count endpoint is asked for. It is the raw logged
+    value, because the tokenizer that billed this request is the one that
+    answers to the id the request carried. `claude-opus-5-20260101` is asked for
+    as `claude-opus-5-20260101`; if the bare alias has since moved, the dated id
+    is the only one that still means what the log meant.
+
+    `analysis` is what the report will name and price, normalised through
+    `request_from_row` -- the date stripped, the surface prefix stripped -- and
+    it is what the registry is keyed on.
+
+    `tokenizer` is None when the row names nothing a tokenizer could be asked
+    for. Such a row is not counted at all.
+    """
+
+    tokenizer: "str | None"
+    analysis: str
 
 
 def counted_path(path: str) -> str:
@@ -98,51 +126,50 @@ def counted_path(path: str) -> str:
     return os.path.join(head, f"{root}-counted{ext or '.jsonl'}")
 
 
-def row_model(row: dict, body: dict, target_id: str | None = None) -> str:
-    """Which tokenizer counts this row: whichever model the analyzer will say
-    it is.
+def row_models(row: dict, body: dict,
+               target_id: str | None = None) -> RowModels:
+    """The tokenizer to ask, and the model the report will name.
 
-    This calls the loader rather than reproducing it, and the history is the
-    argument. Three rounds of review found three different divergences, each in
-    a shape the previous fix had not modelled:
+    Four rounds of review found four divergences here, each one level below the
+    last, and the last two were the same mistake in opposite directions:
 
       round 1  the CLI's --model was stamped over every row
       round 2  only the extracted body was read, so a row naming its model at
                the top level resolved to the fallback
       round 3  precedence matched but the order of operations did not -- the
                loader picks the raw value first and coerces once, this coerced
-               each candidate before choosing, and six shapes disagreed:
+               each candidate before choosing, and six shapes disagreed
+      round 4  one value answered both questions. `request_from_row` returns the
+               *normalised* id, so a request logged as claude-opus-5-20260101
+               was counted as bare claude-opus-5: if that alias has moved, the
+               counts came from a tokenizer the log never named, and are marked
+               exact.
 
-                 body ["bad"], row opus  -> loader unknown,  this opus
-                 body 0,       row opus  -> loader opus,     this "0"
-                 body {...},   row opus  -> loader unknown,  this opus
-                 body True,    row opus  -> loader unknown,  this opus
-                 absent in both          -> loader unknown,  this the fallback
-                 body opus-20260101      -> loader opus,     this opus-20260101
-
-    Each one writes `segment_tokens` that a different model produced and the
-    analyzer then accepts as exact. Matching behaviour is what failed twice, so
-    this stops matching it: `request_from_row` is the function that decides what
-    `Request.model` is, and its answer is the answer. Divergence is no longer a
-    thing that can be got wrong, only a thing that can be renamed.
+    So there is no single answer and this returns both. The analysis side calls
+    `request_from_row`, because that function *is* the definition of
+    `Request.model` and matching its behaviour is what failed twice. The
+    tokenizer side stops one step earlier, at the raw resolved value, because
+    that is the id the request actually carried.
 
     The one line still transcribed from the caller is `model_override`, which is
     `bodies.load_bodies`'s argument rather than the resolver's own logic;
     `TestTheCounterAsksTheLoaderWhichModelThisIs` reads it back out of that
     source so it cannot drift either.
 
-    There is no fallback parameter. A row the loader calls "unknown" is counted
-    as "unknown", the endpoint refuses it, and the row is left for the analyzer
-    to estimate -- which is the honest outcome, because nothing in the export
-    says what tokenizer that row used. A `--model` default here counted such a
-    row with haiku while the report called it "unknown".
+    There is no fallback. A row that names nothing gets `tokenizer=None` and is
+    not counted; the analyzer estimates it and says so. A `--model` default here
+    counted such a row with haiku while the report called it "unknown".
     """
     if not isinstance(row, dict):
         row = {}
     override = body.get("model") if isinstance(body, dict) else None
     kwargs = {"default_target": target_id} if target_id else {}
-    return request_from_row(row, [], renamed={}, model_override=override,
-                            **kwargs).model
+    analysis = request_from_row(row, [], renamed={}, model_override=override,
+                                **kwargs).model
+    # The same expression the loader resolves, stopping before `_normalised`.
+    # `_text` still applies: a list or a dict is not an id anyone can send, and
+    # the loader discards those too.
+    return RowModels(_text(override or _first(row, "model")), analysis)
 
 
 def body_sha256(body) -> str:
@@ -156,8 +183,41 @@ def body_sha256(body) -> str:
         json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
 
 
-def provenance(body, model: str, endpoint: str,
-               target_id: str | None) -> dict:
+def row_sha256(row) -> str:
+    """A digest of the whole source row, before this script adds anything.
+
+    The body digest alone said only that the counted *content* was unchanged. It
+    is blind to everything else the analyzer reads off the row -- usage,
+    timestamps, status, session, and the top-level `model` that resolves the
+    tokenizer for exactly the export shape round 3 was spent fixing. Changing
+    `row["model"]` left the body digest identical, so a counted file made under
+    a different tokenizer passed the freshness check.
+
+    Digesting the whole row rather than an enumerated subset on purpose: naming
+    the analysis-relevant fields here is a copy of the loader's knowledge, and
+    every copy of the loader's knowledge in this file has drifted.
+    """
+    return hashlib.sha256(
+        json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def counter_id(models: RowModels, endpoint: str,
+               tokenizer_id: str | None) -> str:
+    """The cache scope: everything that decides what a count comes back as.
+
+    The version and the tokenizer identity are in here because provenance is
+    only as good as the cache it is stamped over. With a key of
+    `model\\0endpoint` alone, a rerun after a gateway changed behaviour made
+    zero calls, reused every prefix count, and wrote rows stamped with *current*
+    provenance -- which then passed the freshness check downstream. A cache is a
+    claim that nothing changed, and the claim has to be in the key.
+    """
+    return "\x00".join([f"v{COUNTER_VERSION}", models.tokenizer or "",
+                        endpoint, tokenizer_id or ""])
+
+
+def provenance(row, body, models: RowModels, endpoint: str,
+               target_id: str | None, tokenizer_id: str | None) -> dict:
     """What produced this row's `segment_tokens`.
 
     Counted rows used to carry the array and nothing else, and the loader
@@ -167,14 +227,20 @@ def provenance(body, model: str, endpoint: str,
     indistinguishable from a fresh one -- and `sweep_report.counted` reused it
     on the strength of the filename existing.
 
-    Everything here is an input that changes the counts. The digest covers the
-    body, the model and endpoint name the tokenizer that answered, `target_id`
-    is an input to the resolved model, and the version invalidates the lot when
-    this script's own arithmetic changes.
+    Both models, because they are two questions: `tokenizer_model` is what
+    answered and `analysis_model` is what the report names, and a reader
+    checking freshness may need either. Both digests, because the body says the
+    counted content is unchanged and the row says nothing else about the request
+    has changed underneath it. `tokenizer_id` is the operator's assertion about
+    which deployment answered, and it is the only thing here that cannot be
+    derived -- see `counter_id`.
     """
     return {"version": COUNTER_VERSION, "tool": "tier-b/count_tokens.py",
-            "body_sha256": body_sha256(body), "model": model,
-            "endpoint": endpoint, "target_id": target_id}
+            "row_sha256": row_sha256(row), "body_sha256": body_sha256(body),
+            "tokenizer_model": models.tokenizer,
+            "analysis_model": models.analysis,
+            "endpoint": endpoint, "target_id": target_id,
+            "tokenizer_id": tokenizer_id}
 
 
 def counter(model: str, key: str, stats: dict, endpoint: str = DEFAULT_ENDPOINT,
@@ -233,6 +299,14 @@ def main() -> int:
                         "stripped before the tokenizer is asked -- so pass the "
                         "same value to both or the counted model and the "
                         "analysed model can differ")
+    p.add_argument("--tokenizer-id",
+                   help="an identifier for the tokenizer deployment behind "
+                        "--endpoint, asserted by you (a gateway build, a date, "
+                        "anything that changes when the tokenizer might have). "
+                        "Without it the resume cache is neither read nor "
+                        "written: a cache is a claim that nothing changed since "
+                        "last time, and nothing observable can back that claim. "
+                        "Prefixes are still counted once per run either way")
     p.add_argument("--cache", help="cache file to read and write (default: <out>.cache.json)")
     p.add_argument("--allow-partial", action="store_true",
                    help="write the output and exit 0 even when some rows could "
@@ -257,7 +331,18 @@ def main() -> int:
 
     cache_path = args.cache or (args.out + ".cache.json")
     cache = {}
-    if os.path.exists(cache_path) and not args.dry_run:
+    # Resuming across runs is opt-in, because it is the one reuse path nothing
+    # can check. The keys are scoped to the counter version, the tokenizer model
+    # and the endpoint, and every one of those can be identical while the
+    # deployment behind the endpoint has been replaced -- at which point a rerun
+    # makes zero calls, reuses every prefix count, and stamps the rows with
+    # current provenance that then passes the freshness check downstream. So the
+    # cache is only read and written when the operator asserts an identity for
+    # what is answering. Within a run prefixes are still counted once, which is
+    # where the 1.2-calls-per-request figure comes from; this costs re-runs, and
+    # a re-run is exactly when the tokenizer may have moved.
+    resume = bool(args.tokenizer_id) and not args.dry_run
+    if resume and os.path.exists(cache_path):
         with open(cache_path) as f:
             cache = json.load(f)
         # Naming the counter, because after key scoping a model or endpoint
@@ -266,7 +351,12 @@ def main() -> int:
         # name is per row now, so it is reported at the end, once the rows have
         # said which models they are; only the endpoint is knowable up front.
         print(f"  resumed from {len(cache):,} cached counts "
-              f"(via {args.endpoint})", file=sys.stderr)
+              f"(via {args.endpoint}, tokenizer {args.tokenizer_id})",
+              file=sys.stderr)
+    elif not args.tokenizer_id and os.path.exists(cache_path) and not args.dry_run:
+        print(f"  not resuming from {cache_path}: no --tokenizer-id, so nothing "
+              f"shows the tokenizer that wrote it is the one answering now. "
+              f"Prefixes are counted once within this run.", file=sys.stderr)
     elif args.dry_run and os.path.exists(cache_path):
         # A dry run starts from an empty cache on purpose. The question it
         # answers is "what would you send", and the honest answer is what a
@@ -296,12 +386,13 @@ def main() -> int:
     # worth anything if the model in the key is the one that actually answered.
     counters = {}
 
-    def counter_for(model: str):
-        if model not in counters:
-            counters[model] = (f"{model}\x00{args.endpoint}",
-                               counter(model, key, stats, args.endpoint,
-                                       args.dry_run))
-        return counters[model]
+    def counter_for(models: RowModels):
+        if models.tokenizer not in counters:
+            counters[models.tokenizer] = (
+                counter_id(models, args.endpoint, args.tokenizer_id),
+                counter(models.tokenizer, key, stats, args.endpoint,
+                        args.dry_run))
+        return counters[models.tokenizer]
 
     if args.dry_run:
         print(f"  DRY RUN: nothing will be sent. Host that would receive the "
@@ -345,20 +436,33 @@ def main() -> int:
                     emit(json.dumps(row))
                     skipped += 1
                     continue
+                # The row exactly as the capture holds it, digested before this
+                # script adds anything to it. Taken here rather than after
+                # enrichment so the digest is of the capture, not of our output.
+                src_digest_row = json.loads(line)
                 try:
                     # Inside the try. Resolving the model runs the loader over
                     # the row, and a row malformed enough to break that should
                     # cost its own counts and nothing else -- outside, it took
                     # the whole run down at whichever row it met.
-                    model = row_model(row, body, args.target_id)
-                    counter_id, count = counter_for(model)
+                    models = row_models(row, body, args.target_id)
+                    if not models.tokenizer:
+                        # Nothing to ask. Raised rather than sent: the previous
+                        # version sent the literal string "unknown" and let the
+                        # endpoint refuse it, which is a request whose only
+                        # possible answer is an error.
+                        raise ValueError(
+                            "no model id on this row or its body, so there is no "
+                            "tokenizer to ask; the analyzer will estimate it")
+                    cid, count = counter_for(models)
                     row["segment_tokens"] = count_segments(body, count, cache,
-                                                      counter_id)
+                                                      cid)
                     # Written together with the counts, never separately: a row
                     # carrying an array and no record of what produced it is
                     # exactly what a stale export looks like.
-                    row[PROVENANCE_KEY] = provenance(body, model, args.endpoint,
-                                                     args.target_id)
+                    row[PROVENANCE_KEY] = provenance(
+                        src_digest_row, body, models, args.endpoint,
+                        args.target_id, args.tokenizer_id)
                     counted += 1
                 except Exception as e:                                # noqa: BLE001
                     # The row survives without counts and the analyzer falls back to
@@ -370,14 +474,19 @@ def main() -> int:
                           file=sys.stderr)
                     failed += 1
                 emit(json.dumps(row))
-                if counted % 25 == 0 and counted and not args.dry_run:
-                    # Not during a dry run. The dry-run counter returns 0 for every
-                    # prefix, and this checkpoint fires before the guard below, so
-                    # a dry run over 25+ rows wrote a cache mapping real prefix keys
-                    # to zero counts. A later real run with the same --out resumes
-                    # from those zeros and emits `segment_tokens` that look counted
-                    # and never touched a tokenizer -- while the dry run printed
-                    # "Nothing was sent and nothing was written."
+                if counted % 25 == 0 and counted and resume:
+                    # Only when the cache can be resumed from. A checkpoint whose
+                    # file will never be read back is a copy of the client's
+                    # prefix shape on disk for nothing.
+                    #
+                    # Never during a dry run. The dry-run counter returns 0 for
+                    # every prefix, and this checkpoint fired before the guard
+                    # below, so a dry run over 25+ rows wrote a cache mapping
+                    # real prefix keys to zero counts. A later real run with the
+                    # same --out resumed from those zeros and emitted
+                    # `segment_tokens` that look counted and never touched a
+                    # tokenizer -- while the dry run printed "Nothing was sent
+                    # and nothing was written."
                     with open(cache_path, "w") as cf:
                         json.dump(cache, cf)
                     print(f"  {counted:,} rows, {stats['calls']:,} calls, "
@@ -412,8 +521,9 @@ def main() -> int:
         out_path = args.out if not partial or args.allow_partial else args.out + ".partial"
         os.replace(tmp_path, out_path)
         renamed = True
-        with open(cache_path, "w") as cf:
-            json.dump(cache, cf)
+        if resume:
+            with open(cache_path, "w") as cf:
+                json.dump(cache, cf)
 
         print(f"\n  counted   {counted:,} rows")
         print(f"  skipped   {skipped:,} (no recognisable body)")
@@ -428,12 +538,17 @@ def main() -> int:
         # says the rows were not carrying the model anyone thought they were.
         print(f"  models    {', '.join(sorted(counters)) or 'none'}")
         print(f"  wrote     {out_path}")
-        print(f"  cache     {cache_path} (re-runs are free)")
+        if resume:
+            print(f"  cache     {cache_path} (re-runs with the same "
+                  f"--tokenizer-id are free)")
+        else:
+            print("  cache     not written (no --tokenizer-id, so a later run "
+                  "could not safely resume from it)")
         if partial and not args.allow_partial:
             print(f"\n  PARTIAL: {failed:,} row(s) could not be counted, so this is "
                   f"not a counted export.\n  Written to {out_path} rather than "
-                  f"{args.out}. Re-run to pick up the cached prefixes, or pass "
-                  f"--allow-partial to accept a mixed file.", file=sys.stderr)
+                  f"{args.out}. Re-run, or pass --allow-partial to accept a "
+                  f"mixed file.", file=sys.stderr)
             return 1
         return 0
     finally:

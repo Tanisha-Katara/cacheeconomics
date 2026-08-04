@@ -1056,7 +1056,11 @@ class _ModelStub(http.server.BaseHTTPRequestHandler):
     """
 
     seen = []
-    SCALE = {"claude-opus-5": 4, "claude-haiku-4-5": 1, "claude-sonnet-4-6": 2}
+    # The dated id is served alongside the bare one, which is the whole point of
+    # the tokenizer/analysis split: a real endpoint accepts both and they are not
+    # required to answer the same, so the scales differ here too.
+    SCALE = {"claude-opus-5": 4, "claude-haiku-4-5": 1, "claude-sonnet-4-6": 2,
+             "claude-opus-5-20260101": 3, "anthropic.claude-opus-5": 5}
 
     def log_message(self, *a):
         pass
@@ -1247,21 +1251,67 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         prefix text, a model the cache has never held. If the key followed
         anything but the model that answered, those prefixes would come back
         free and exact from counts a different tokenizer produced.
+
+        Run with `--tokenizer-id`, because resuming across runs is opt-in now —
+        see `test_a_rerun_does_not_resume_without_an_asserted_tokenizer`.
         """
-        self._run(self._export("claude-opus-5", "claude-haiku-4-5"))
+        tid = ("--tokenizer-id", "stub-1")
+        self._run(self._export("claude-opus-5", "claude-haiku-4-5"), *tid)
         first = len(_ModelStub.seen)
         self.assertGreater(first, 0)
 
-        self._run(self._export("claude-opus-5", "claude-haiku-4-5"))
+        self._run(self._export("claude-opus-5", "claude-haiku-4-5"), *tid)
         self.assertEqual(len(_ModelStub.seen), first,
                          "a warm cache re-counted rows it already held")
 
         self._run(self._export("claude-opus-5", "claude-haiku-4-5",
-                               "claude-sonnet-4-6"))
+                               "claude-sonnet-4-6"), *tid)
         self.assertGreater(len(_ModelStub.seen), first,
                            "counts written for two models were handed back for "
                            "a third that was never asked")
         self.assertIn("claude-sonnet-4-6", set(_ModelStub.seen))
+
+    def test_a_rerun_does_not_resume_without_an_asserted_tokenizer(self):
+        """Provenance is only as good as the cache it is stamped over.
+
+        The cache key was `model\\0endpoint`, all of which can be identical while
+        the deployment behind the endpoint has been replaced. A rerun then made
+        zero calls, reused every prefix count, and wrote rows stamped with
+        *current* provenance — which passed the freshness check downstream. So
+        the cache is neither read nor written unless the operator asserts an
+        identity for what is answering.
+        """
+        src = self._export("claude-opus-5")
+        self._run(src)
+        first = len(_ModelStub.seen)
+        self.assertGreater(first, 0)
+        self.assertFalse(os.path.exists(self.out + ".cache.json"),
+                         "a cache that can never be safely resumed was written")
+        self._run(src)
+        self.assertEqual(len(_ModelStub.seen), first * 2,
+                         "a rerun resumed from a cache nothing could vouch for")
+
+    def test_a_cache_written_under_one_tokenizer_id_is_not_read_under_another(self):
+        src = self._export("claude-opus-5")
+        self._run(src, "--tokenizer-id", "gateway-41")
+        first = len(_ModelStub.seen)
+        self._run(src, "--tokenizer-id", "gateway-42")
+        self.assertEqual(len(_ModelStub.seen), first * 2,
+                         "counts from one tokenizer deployment were handed back "
+                         "for another")
+
+    def test_the_counter_version_scopes_the_cache_too(self):
+        """A change to how a count is produced must not be resumable across."""
+        m = load("count_tokens")
+        a = m.counter_id(m.RowModels("claude-opus-5", "claude-opus-5"),
+                         "https://e", "t")
+        self.assertIn(f"v{m.COUNTER_VERSION}", a)
+        self.assertNotEqual(
+            a, m.counter_id(m.RowModels("claude-opus-5", "claude-opus-5"),
+                            "https://e", "other"))
+        self.assertNotEqual(
+            a, m.counter_id(m.RowModels("claude-haiku-4-5", "claude-haiku-4-5"),
+                            "https://e", "t"))
 
     def test_a_model_the_endpoint_rejects_degrades_to_an_estimate(self):
         """Why there is no flag to force one tokenizer over the export.
@@ -1320,8 +1370,9 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         r = self._run(self._export(None))
         self.assertNotEqual(r.returncode, 0,
                             "a run that counted nothing reported success")
-        self.assertIn("unknown", set(_ModelStub.seen),
-                      "something other than the loader's answer was asked for")
+        self.assertEqual(_ModelStub.seen, [],
+                         "a request was sent for a row with no model id; the "
+                         "only answer it can have is an error")
         rows = [json.loads(l) for l in open(self.out + ".partial") if l.strip()]
         self.assertEqual(len(rows), 1)
         self.assertNotIn("segment_tokens", rows[0])
@@ -1381,9 +1432,67 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
                 row, [], renamed={},
                 model_override=(body or {}).get("model")).model
             with self.subTest(row=row_v, body=body_v):
-                self.assertEqual(m.row_model(row, body), loader)
+                self.assertEqual(m.row_models(row, body).analysis, loader)
             checked += 1
         self.assertEqual(checked, len(self.VALUES) ** 2)
+
+    def test_the_tokenizer_model_is_the_raw_logged_id(self):
+        """The other half, and the round-4 finding.
+
+        `request_from_row` returns the *normalised* id — the snapshot date
+        stripped, the surface prefix stripped — which is right for pricing and
+        wrong for the tokenizer. A request logged as claude-opus-5-20260101 was
+        being counted as bare claude-opus-5, so if that alias has moved the
+        counts came from a tokenizer the log never named and were marked exact.
+
+        The tokenizer id is the raw resolved value: the same `or` chain the
+        loader walks, stopping before `_normalised`.
+        """
+        from cacheeconomics.trace import _first, _text
+        m = load("count_tokens")
+        for _rv, _bv, row, body in self._cases():
+            raw = _text((body or {}).get("model") or _first(row, "model"))
+            with self.subTest(row=row.get("model"), body=body.get("model")):
+                self.assertEqual(m.row_models(row, body).tokenizer, raw)
+
+    def test_a_dated_model_is_counted_dated_and_analysed_bare(self):
+        """The two answers, side by side, on the shape that produced the
+        finding. Asserting they *differ* here is the point: a version of this
+        that returns one value for both cannot pass."""
+        m = load("count_tokens")
+        body = {"model": "claude-opus-5-20260101",
+                "messages": [{"role": "user", "content": "hi"}]}
+        got = m.row_models({}, body)
+        self.assertEqual(got.tokenizer, "claude-opus-5-20260101")
+        self.assertEqual(got.analysis, "claude-opus-5")
+        self.assertNotEqual(got.tokenizer, got.analysis)
+
+    def test_the_dated_id_is_what_reaches_the_endpoint(self):
+        """Through the real command, because the split is only worth anything if
+        the raw id is what actually goes on the wire."""
+        stub_seen = []
+
+        class _Rec(_ModelStub):
+            pass
+
+        _Rec.seen = stub_seen
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Rec)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        d = tempfile.mkdtemp()
+        src = os.path.join(d, "in.jsonl")
+        with open(src, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "claude-opus-5-20260101",
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
+             "-o", os.path.join(d, "out.jsonl"), "--allow-partial",
+             "--endpoint", f"http://127.0.0.1:{srv.server_address[1]}/count"],
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        self.assertEqual(set(stub_seen), {"claude-opus-5-20260101"},
+                         "the normalised id was sent to the tokenizer")
 
     def test_the_cases_actually_disagree_with_a_naive_resolver(self):
         """Guards the guard. If every generated case resolved the same way under
@@ -1405,27 +1514,30 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
                            "the cross-product no longer contains the shapes "
                            "that broke this, so the differential proves little")
 
-    def test_a_row_the_loader_cannot_name_is_counted_as_unknown(self):
-        """No fallback, and this is the shape a fallback used to hide: nothing
-        in the export says what tokenizer the row used, so "unknown" is what
-        goes on the wire and the endpoint refusing it is the correct end."""
+    def test_a_row_naming_nothing_has_no_tokenizer_to_ask(self):
+        """No fallback. The analyzer calls such a row "unknown", and there is no
+        id anyone could send, so it is not counted at all — not counted with a
+        default, and not sent as the literal string "unknown" either."""
         m = load("count_tokens")
-        self.assertEqual(m.row_model({}, {"messages": []}), "unknown")
+        got = m.row_models({}, {"messages": []})
+        self.assertIsNone(got.tokenizer)
+        self.assertEqual(got.analysis, "unknown")
 
     def test_a_row_that_is_not_a_dict_does_not_take_the_run_down(self):
         m = load("count_tokens")
         for bad_row in (None, [], "not-a-row", 7):
             with self.subTest(row=bad_row):
-                self.assertEqual(m.row_model(bad_row, {"messages": []}),
-                                 "unknown")
+                got = m.row_models(bad_row, {"messages": []})
+                self.assertIsNone(got.tokenizer)
+                self.assertEqual(got.analysis, "unknown")
 
     def test_the_override_argument_is_still_the_one_the_adapter_passes(self):
         """The single line still transcribed from the caller.
 
-        `row_model` reproduces `bodies.load_bodies`'s `model_override=` argument
-        because that is the caller's choice rather than the resolver's logic.
-        It is the last place a divergence can hide, so it is read back out of
-        the adapter's own source.
+        `row_models` reproduces `bodies.load_bodies`'s `model_override=`
+        argument because that is the caller's choice rather than the resolver's
+        logic. It is the last place a divergence can hide, so it is read back
+        out of the adapter's own source.
         """
         import re
         src = open(os.path.join(
@@ -1434,7 +1546,7 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
         found = re.findall(r"model_override=([^,]+),", src)
         self.assertEqual(found, ['(body or {}).get("model")'],
                          "the adapter changed how it picks the override; "
-                         "count_tokens.row_model must change with it")
+                         "count_tokens.row_models must change with it")
 
     def test_the_target_id_reaches_the_resolution(self):
         """`--target-id` is an input to the resolved model: a surface's id
@@ -1444,12 +1556,23 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
         m = load("count_tokens")
         body = {"model": "anthropic.claude-opus-5",
                 "messages": [{"role": "user", "content": "hi"}]}
-        bare = m.row_model({}, body)
-        with_surface = m.row_model({}, body, "amazon-bedrock/converse")
+        bare = m.row_models({}, body).analysis
+        with_surface = m.row_models({}, body, "amazon-bedrock/converse").analysis
         self.assertEqual(with_surface, "claude-opus-5")
         self.assertNotEqual(bare, with_surface,
                             "the surface made no difference, so this test no "
                             "longer covers the axis it was written for")
+
+    def test_the_surface_prefix_is_not_stripped_from_the_tokenizer_id(self):
+        """The same split as the dated case. A gateway fronting Bedrock is
+        addressed with the id its own logs carry; stripping the prefix before
+        asking it is the round-4 defect wearing a different prefix."""
+        m = load("count_tokens")
+        body = {"model": "anthropic.claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}]}
+        got = m.row_models({}, body, "amazon-bedrock/converse")
+        self.assertEqual(got.tokenizer, "anthropic.claude-opus-5")
+        self.assertEqual(got.analysis, "claude-opus-5")
 
 
 class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
@@ -1683,11 +1806,24 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
         row = json.loads(open(out).read().strip())
         p = row[m.PROVENANCE_KEY]
-        self.assertEqual(p["model"], "claude-opus-5")
+        self.assertEqual(p["tokenizer_model"], "claude-opus-5")
+        self.assertEqual(p["analysis_model"], "claude-opus-5")
         self.assertEqual(p["endpoint"], self.endpoint)
         self.assertEqual(p["version"], m.COUNTER_VERSION)
         self.assertEqual(p["body_sha256"], m.body_sha256(row["body"]))
         self.assertIsNone(p["target_id"])
+        self.assertIsNone(p["tokenizer_id"])
+
+    def test_the_record_names_both_models_when_they_differ(self):
+        """The round-4 split, recorded. One field could only ever answer one of
+        the two questions, and a reader checking freshness may need either."""
+        m = load("count_tokens")
+        src = self._src("claude-opus-5-20260101")
+        out = os.path.join(self.dir, "out.jsonl")
+        self._count(src, out)
+        p = json.loads(open(out).read().strip())[m.PROVENANCE_KEY]
+        self.assertEqual(p["tokenizer_model"], "claude-opus-5-20260101")
+        self.assertEqual(p["analysis_model"], "claude-opus-5")
 
     def test_the_record_covers_every_input_that_changes_a_count(self):
         """Named as a set rather than field by field, so a new input to counting
@@ -1699,7 +1835,30 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
         row = json.loads(open(out).read().strip())
         self.assertEqual(
             set(row[m.PROVENANCE_KEY]),
-            {"version", "tool", "body_sha256", "model", "endpoint", "target_id"})
+            {"version", "tool", "row_sha256", "body_sha256", "tokenizer_model",
+             "analysis_model", "endpoint", "target_id", "tokenizer_id"})
+
+    def test_the_row_digest_covers_what_the_body_digest_misses(self):
+        """The body digest is blind to the top-level model, and to usage,
+        timestamps, status and session. For the shape where the model sits on
+        the row, changing it left the body digest identical."""
+        m = load("count_tokens")
+        base = {"sent_at": "2026-08-01T09:00:00Z", "model": "claude-opus-5",
+                "body": {"messages": [{"role": "user", "content": "hi"}]},
+                "usage": {"input_tokens": 500}}
+        changed = json.loads(json.dumps(base))
+        changed["model"] = "claude-haiku-4-5"
+        self.assertEqual(m.body_sha256(base["body"]),
+                         m.body_sha256(changed["body"]),
+                         "the fixture no longer isolates the row from the body")
+        self.assertNotEqual(m.row_sha256(base), m.row_sha256(changed))
+        for field, value in (("usage", {"input_tokens": 1}),
+                             ("sent_at", "2026-08-02T09:00:00Z"),
+                             ("status", 500), ("session", "other")):
+            other = json.loads(json.dumps(base))
+            other[field] = value
+            with self.subTest(field=field):
+                self.assertNotEqual(m.row_sha256(base), m.row_sha256(other))
 
     def test_it_carries_no_prompt_text(self):
         """The same rule the count cache was changed for: this lands on a
@@ -1736,7 +1895,7 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
         out = os.path.join(self.dir, "out.jsonl")
         self._count(src, out)
         rows = [json.loads(l) for l in open(out) if l.strip()]
-        self.assertEqual([r[m.PROVENANCE_KEY]["model"] for r in rows],
+        self.assertEqual([r[m.PROVENANCE_KEY]["tokenizer_model"] for r in rows],
                          ["claude-opus-5", "claude-haiku-4-5"])
 
     def test_the_record_does_not_disturb_the_analyzer(self):
@@ -1778,14 +1937,19 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
                 "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
         self.out = self.ct.counted_path(self.src)
 
-    def _write_counted(self, **overrides):
+    def _write_counted(self, extra_row=None, **overrides):
         """A counted export for `self.src`, with its provenance adjustable."""
-        row = json.loads(open(self.src).read().strip())
+        src_row = json.loads(open(self.src).read().strip())
+        row = json.loads(json.dumps(src_row))
         row["segment_tokens"] = [7]
-        prov = self.ct.provenance(row["body"], "claude-opus-5",
-                                  self.ct.DEFAULT_ENDPOINT, None)
+        prov = self.ct.provenance(
+            src_row, src_row["body"],
+            self.ct.row_models(src_row, src_row["body"]),
+            self.ct.DEFAULT_ENDPOINT, None, None)
         prov.update(overrides)
         row[self.ct.PROVENANCE_KEY] = prov
+        if extra_row:
+            row.update(extra_row)
         with open(self.out, "w") as f:
             f.write(json.dumps(row) + "\n")
 
@@ -1878,7 +2042,66 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
         row = json.loads(open(self.src).read().strip())
         with open(self.out, "w") as f:
             f.write(json.dumps(row) + "\n")
-        self.assertIsNone(self.ct and self.m.stale_reason(self.src, self.out))
+        _merged, why = self.m.reusable_counts(self.src, self.out)
+        self.assertIsNone(why)
+
+    def test_a_changed_top_level_model_is_not_reused(self):
+        """The gap the body digest could not see, and the shape round 3 was
+        spent fixing: the model sits on the row, so changing it leaves the body
+        byte-identical while the tokenizer that should answer changes."""
+        self._write_counted()
+        src_row = json.loads(open(self.src).read().strip())
+        before = self.ct.body_sha256(src_row["body"])
+        src_row["model"] = "claude-haiku-4-5"
+        del src_row["body"]["model"]
+        with open(self.src, "w") as f:
+            f.write(json.dumps(src_row) + "\n")
+        self._write_counted()          # counted under the top-level haiku
+        src_row["model"] = "claude-opus-5"
+        with open(self.src, "w") as f:
+            f.write(json.dumps(src_row) + "\n")
+        self.assertEqual(before, self.ct.body_sha256(src_row["body"]) if
+                         src_row["body"].get("model") else before)
+        got, attempts = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src,
+                         "a file counted under the row's old model was reused")
+        self.assertEqual(attempts, [])
+
+    def test_changed_usage_on_the_row_is_not_reused(self):
+        """The body digest is blind to it, and `_scale_to_measured` divides the
+        billed total the usage reports."""
+        self._write_counted()
+        src_row = json.loads(open(self.src).read().strip())
+        src_row["usage"] = {"input_tokens": 999}
+        with open(self.src, "w") as f:
+            f.write(json.dumps(src_row) + "\n")
+        got, _ = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src)
+
+    def test_a_different_tokenizer_id_is_not_reused(self):
+        self._write_counted(tokenizer_id="gateway-build-41")
+        got, _ = self._counted_never_shelling_out(tokenizer_id="gateway-build-42")
+        self.assertEqual(got, self.src)
+
+    def test_what_is_reused_is_the_counts_and_not_the_stored_row(self):
+        """The counted file contributes `segment_tokens` and its record, never
+        the rest of the row.
+
+        Returning the stored file wholesale meant it supplied usage, timestamps,
+        status and session too, and only the body digest was ever checked. Here
+        the stored row carries a field that contradicts the capture; after reuse
+        it must be gone, because the row came from the capture.
+        """
+        self._write_counted(extra_row={"usage": {"input_tokens": 123456},
+                                       "agent": "from-the-stale-file"})
+        got, _ = self._counted_never_shelling_out()
+        self.assertEqual(got, self.out)
+        row = json.loads(open(self.out).read().strip())
+        self.assertEqual(row["segment_tokens"], [7], "the counts were not kept")
+        self.assertNotIn("agent", row,
+                         "a field from the stored file survived into the "
+                         "analysed rows")
+        self.assertNotIn("usage", row)
 
 
 class TestOneCountedPathHelperForTheWholeToolchain(unittest.TestCase):
