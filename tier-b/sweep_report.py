@@ -41,16 +41,85 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # curve was drawn from byte-share estimates instead. Two copies of one
 # derivation is what produced that, so there is now one.
 sys.path.insert(0, HERE)
-from count_tokens import counted_path                            # noqa: E402
+from count_tokens import (COUNTER_VERSION, DEFAULT_ENDPOINT,     # noqa: E402
+                          PROVENANCE_KEY, body_sha256, counted_path)
+from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
 
 
-def counted(path: str) -> str:
+def stale_reason(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
+                 target_id: str | None = None) -> str | None:
+    """Why `out` cannot be treated as the counted form of `src`, or None.
+
+    This existed because the previous rule was "the file is there". Counted rows
+    carry `segment_tokens`, and the loader accepts any correctly-shaped positive
+    array as exact -- so a counted export left over from a capture that has
+    since been re-recorded, or from a different endpoint, or from an older
+    version of the counter, was analysed as exact and nothing anywhere could
+    tell. Removing the flag that produced some of those files closed the door
+    and left the window open.
+
+    Every input that changes a count is compared: the body each row was counted
+    from, the tokenizer that answered, the host it answered from, the surface
+    used to resolve the model, and the version of the script.
+    """
+    try:
+        with open(src) as f:
+            src_rows = [json.loads(l) for l in f if l.strip()]
+        with open(out) as f:
+            out_rows = [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError) as e:
+        return f"could not read it ({type(e).__name__})"
+
+    if len(src_rows) != len(out_rows):
+        return (f"it has {len(out_rows):,} rows and the capture now has "
+                f"{len(src_rows):,}")
+
+    for i, (s, o) in enumerate(zip(src_rows, out_rows)):
+        if not isinstance(o, dict) or "segment_tokens" not in o:
+            continue                     # never counted; nothing to trust
+        p = o.get(PROVENANCE_KEY)
+        if not isinstance(p, dict):
+            return (f"row {i} carries counts with no record of what produced "
+                    f"them (written before counted exports recorded it)")
+        body = _find_body(s) if isinstance(s, dict) else None
+        expected = {"version": COUNTER_VERSION,
+                    "body_sha256": body_sha256(body) if body else None,
+                    "endpoint": endpoint, "target_id": target_id}
+        for field, want in expected.items():
+            if p.get(field) != want:
+                return (f"row {i} was counted with {field}={p.get(field)!r}, "
+                        f"this run needs {want!r}")
+    return None
+
+
+def counted(path: str, endpoint: str = DEFAULT_ENDPOINT,
+            target_id: str | None = None) -> str:
     """Exact token counts, or the structural findings carry no figures."""
     out = counted_path(path)
     if os.path.exists(out):
-        return out
-    r = subprocess.run([sys.executable, os.path.join(HERE, "count_tokens.py"),
-                        path, "-o", out], capture_output=True, text=True)
+        why = stale_reason(path, out, endpoint, target_id)
+        if why is None:
+            return out
+        # Refused rather than recounted, and this is the deliberate half of the
+        # fix. Recounting on a mismatch would send this capture's prompt
+        # prefixes to `endpoint` because a file on disk happened to disagree --
+        # new egress, decided by the tool, on a path the operator approved for a
+        # different question. The stale file is also not silently believed. So
+        # the sweep says exactly what it found and analyses the capture
+        # uncounted, which the analyzer reports as estimated.
+        print(f"    refusing to reuse {os.path.basename(out)}: {why}.\n"
+              f"    analysing {os.path.basename(path)} uncounted; its segment "
+              f"sizes are estimated.\n"
+              f"    delete that file and re-run to count it again.",
+              file=sys.stderr)
+        return path
+    cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), path,
+           "-o", out]
+    if endpoint != DEFAULT_ENDPOINT:
+        cmd += ["--endpoint", endpoint]
+    if target_id:
+        cmd += ["--target-id", target_id]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         # Named, not just reported. This returns the *uncounted* capture, so
         # every figure derived from this point is estimated while its

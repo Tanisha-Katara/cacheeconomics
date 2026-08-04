@@ -1183,28 +1183,15 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                          "the --model flag reached the wire for a row that "
                          "named its own model")
 
-    def test_the_flag_does_not_override_a_row_that_names_a_model(self):
-        self._run(self._export("claude-opus-5"), "--model", "claude-haiku-4-5")
-        self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"})
-
-    def test_a_row_naming_no_model_falls_back_to_the_flag(self):
-        """What `--model` is for now. Without a fallback such a row cannot be
-        counted at all, and an uncounted row is estimated."""
-        r = self._run(self._export(None), "--model", "claude-haiku-4-5")
-        self.assertEqual(r.returncode, 0, r.stderr[-400:])
-        self.assertEqual(set(_ModelStub.seen), {"claude-haiku-4-5"})
-        self.assertTrue(any(row.get("segment_tokens") for row in self._rows()))
-
     def test_a_model_named_on_the_row_is_asked_when_the_body_omits_it(self):
         """The shape the first fix missed. `_find_body` returns the nested body,
         which carries no model, so reading the body alone resolved the fallback
         for a row that plainly declares one."""
-        r = self._run(self._top_level_export("claude-opus-5"),
-                      "--model", "claude-haiku-4-5")
+        r = self._run(self._top_level_export("claude-opus-5"))
         self.assertEqual(r.returncode, 0, r.stderr[-400:])
         self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"},
                          "a row naming its model at the top level was counted "
-                         "by the fallback tokenizer")
+                         "by something else")
 
     def test_two_top_level_models_are_both_asked(self):
         """The mixed case for that shape, which is the one that costs money:
@@ -1301,82 +1288,15 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         self.assertIn("claude-opus-5", r.stdout)
         self.assertIn("claude-haiku-4-5", r.stdout)
 
-    def test_the_precedence_is_the_one_the_loader_uses(self):
-        """Enumerated against the loader rather than against an opinion.
+    def test_there_is_no_way_to_name_the_tokenizer_from_the_cli(self):
+        """Two flags for this existed and both were removed on review.
 
-        `bodies.load_bodies` sets `model_override=(body or {}).get("model")` and
-        `request_from_row` resolves `model_override or _first(row, "model")`, so
-        for every (row-model, body-model) pair the counter must pick what the
-        analyzer will pick. Reading the body alone agreed on two of the four
-        pairs and silently used the fallback on a third.
-        """
-        m = load("count_tokens")
-        body = {"messages": [{"role": "user", "content": "hi"}]}
-
-        def with_model(d, model):
-            d = dict(d)
-            if model is not None:
-                d["model"] = model
-            return d
-
-        for row_m in (None, "claude-sonnet-4-6"):
-            for body_m in (None, "claude-opus-5"):
-                row = with_model({"body": body}, row_m)
-                expected = body_m or row_m or "fb"
-                with self.subTest(row=row_m, body=body_m):
-                    self.assertEqual(
-                        m.row_model(row, with_model(body, body_m), "fb"),
-                        expected)
-
-    def test_an_odd_model_value_resolves_to_whatever_the_loader_calls_it(self):
-        """Not cleaned up, on purpose, and this is the test that fixes the
-        direction.
-
-        A draft treated a blank or numeric model as unnamed and fell back to
-        `--model`. `_text` does not: it stringifies numbers and passes a
-        whitespace-only string through. So for `{"model": 5}` the analyzer calls
-        the model "5" while a helpful counter would have counted it with haiku
-        and marked it exact — this defect, reached by tidying up. Whatever the
-        loader will call the model is what gets counted; if the endpoint will
-        not serve it the row fails to count and is estimated.
-        """
-        m = load("count_tokens")
-        from cacheeconomics.trace import _first, _text
-
-        for value in ("claude-opus-5", "  claude-opus-5 ", "   ", 5, 1.5,
-                      "", None, True, ["claude-opus-5"],
-                      {"id": "claude-opus-5"}):
-            body = {"messages": []} if value is None else {"model": value}
-            loader_says = _text(_first(body, "model"))
-            with self.subTest(value=value):
-                self.assertEqual(m.row_model({}, body, "fb"),
-                                 loader_says or "fb")
-
-    def test_an_unusable_body_model_still_defers_to_the_rows(self):
-        """The precedence must survive a body whose model is unreadable —
-        skipping to the fallback would ignore a model the row plainly names."""
-        m = load("count_tokens")
-        for bad in ({"messages": []}, {"model": ""}, {"model": None},
-                    {"model": ["claude-opus-5"]}, {"model": {"id": "x"}}):
-            with self.subTest(body=bad):
-                self.assertEqual(
-                    m.row_model({"model": "claude-opus-5"}, bad, "fb"),
-                    "claude-opus-5")
-
-    def test_a_row_that_is_not_a_dict_does_not_take_the_run_down(self):
-        m = load("count_tokens")
-        for bad_row in (None, [], "not-a-row", 7):
-            with self.subTest(row=bad_row):
-                self.assertEqual(m.row_model(bad_row, {}, "fb"), "fb")
-
-    def test_there_is_no_way_to_force_one_tokenizer_over_the_export(self):
-        """A flag for this existed briefly and was removed on review.
-
-        Forcing a model produces counts that are wrong *and* load as exact,
-        because nothing in the output marks which tokenizer answered for which
-        row — the defect this class exists to close, behind a flag. Asserted on
-        behaviour rather than on help text: whatever the CLI is asked, a row
-        that names a model is counted by that model.
+        An override produces counts that are wrong *and* load as exact. A
+        fallback is the same defect one step quieter — the analyzer calls a row
+        with no resolvable model "unknown", so counting it with haiku attaches
+        haiku's sizes to a row the report names otherwise. Asserted on behaviour
+        rather than on help text: whatever the CLI is asked, no tokenizer the
+        rows did not name ever answers.
         """
         src = self._export("claude-opus-5")
         for extra in (("--model", "claude-haiku-4-5"),
@@ -1389,6 +1309,23 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                                  f"{extra} made another tokenizer answer for a "
                                  f"row that named claude-opus-5")
 
+    def test_a_row_with_no_resolvable_model_is_not_counted_at_all(self):
+        """The consequence of having no fallback, stated as behaviour.
+
+        The analyzer calls such a row "unknown". Counting it with anything else
+        attaches that tokenizer's sizes to a row the report names otherwise, so
+        it is not counted: it keeps its place, carries no `segment_tokens`, and
+        the analyzer estimates it by byte share.
+        """
+        r = self._run(self._export(None))
+        self.assertNotEqual(r.returncode, 0,
+                            "a run that counted nothing reported success")
+        self.assertIn("unknown", set(_ModelStub.seen),
+                      "something other than the loader's answer was asked for")
+        rows = [json.loads(l) for l in open(self.out + ".partial") if l.strip()]
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("segment_tokens", rows[0])
+
     def test_a_dry_run_names_the_tokenizers_it_would_ask(self):
         """A mixed export costs one set of prefix calls per model. The dry run
         is where permission for the egress is asked for, so it says so."""
@@ -1398,6 +1335,121 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         self.assertEqual(_ModelStub.seen, [], "a dry run sent something")
         self.assertIn("claude-opus-5", r.stdout)
         self.assertIn("claude-haiku-4-5", r.stdout)
+
+
+class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
+    """Counted-model and analysed-model must not be able to differ.
+
+    Three rounds of review found three different divergences here, each in a
+    shape the previous fix had not modelled — the CLI flag stamped over the row,
+    then the top-level model ignored, then the order of operations: the loader
+    picks the raw value first and coerces once, `_text(raw_body or raw_row,
+    "unknown")`, while the counter coerced each candidate before choosing. Six
+    shapes disagreed, and in every one `segment_tokens` is written by one model
+    and then accepted as exact under another.
+
+    Matching the loader's behaviour is what failed twice, so the counter now
+    calls it. These tests are the differential: for a generated cross-product of
+    row and body shapes, whatever `request_from_row` returns is what must have
+    been counted. They compare against the real function rather than against a
+    table, so a change inside the loader moves both sides together — which is
+    the property a re-derivation could never have.
+    """
+
+    VALUES = (None, "claude-opus-5", "claude-haiku-4-5",
+              "claude-opus-5-20260101", "anthropic/claude-opus-5",
+              "", "   ", 0, 5, 1.5, True, False,
+              ["claude-opus-5"], {"id": "claude-opus-5"})
+
+    def _cases(self):
+        for row_v in self.VALUES:
+            for body_v in self.VALUES:
+                body = {"messages": [{"role": "user", "content": "hi"}]}
+                if body_v is not None:
+                    body["model"] = body_v
+                row = {"body": body}
+                if row_v is not None:
+                    row["model"] = row_v
+                yield row_v, body_v, row, body
+
+    def test_the_resolved_model_is_always_the_loaders(self):
+        from cacheeconomics.trace import request_from_row
+        m = load("count_tokens")
+        checked = 0
+        for row_v, body_v, row, body in self._cases():
+            loader = request_from_row(
+                row, [], renamed={},
+                model_override=(body or {}).get("model")).model
+            with self.subTest(row=row_v, body=body_v):
+                self.assertEqual(m.row_model(row, body), loader)
+            checked += 1
+        self.assertEqual(checked, len(self.VALUES) ** 2)
+
+    def test_the_cases_actually_disagree_with_a_naive_resolver(self):
+        """Guards the guard. If every generated case resolved the same way under
+        any reasonable rule, the differential above would pass without
+        discriminating — so this pins that the cross-product really does contain
+        the shapes that broke it, by scoring the resolver the last round used.
+        """
+        from cacheeconomics.trace import _first, _text, request_from_row
+        disagreements = 0
+        for _rv, _bv, row, body in self._cases():
+            loader = request_from_row(
+                row, [], renamed={},
+                model_override=(body or {}).get("model")).model
+            naive = (_text(_first(body, "model")) or _text(_first(row, "model"))
+                     or "claude-haiku-4-5")
+            if naive != loader:
+                disagreements += 1
+        self.assertGreater(disagreements, 10,
+                           "the cross-product no longer contains the shapes "
+                           "that broke this, so the differential proves little")
+
+    def test_a_row_the_loader_cannot_name_is_counted_as_unknown(self):
+        """No fallback, and this is the shape a fallback used to hide: nothing
+        in the export says what tokenizer the row used, so "unknown" is what
+        goes on the wire and the endpoint refusing it is the correct end."""
+        m = load("count_tokens")
+        self.assertEqual(m.row_model({}, {"messages": []}), "unknown")
+
+    def test_a_row_that_is_not_a_dict_does_not_take_the_run_down(self):
+        m = load("count_tokens")
+        for bad_row in (None, [], "not-a-row", 7):
+            with self.subTest(row=bad_row):
+                self.assertEqual(m.row_model(bad_row, {"messages": []}),
+                                 "unknown")
+
+    def test_the_override_argument_is_still_the_one_the_adapter_passes(self):
+        """The single line still transcribed from the caller.
+
+        `row_model` reproduces `bodies.load_bodies`'s `model_override=` argument
+        because that is the caller's choice rather than the resolver's logic.
+        It is the last place a divergence can hide, so it is read back out of
+        the adapter's own source.
+        """
+        import re
+        src = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "cacheeconomics", "adapters", "bodies.py")).read()
+        found = re.findall(r"model_override=([^,]+),", src)
+        self.assertEqual(found, ['(body or {}).get("model")'],
+                         "the adapter changed how it picks the override; "
+                         "count_tokens.row_model must change with it")
+
+    def test_the_target_id_reaches_the_resolution(self):
+        """`--target-id` is an input to the resolved model: a surface's id
+        prefix is stripped before the model is looked up. Counting and analysis
+        have to be given the same one or they resolve different models from the
+        same row."""
+        m = load("count_tokens")
+        body = {"model": "anthropic.claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}]}
+        bare = m.row_model({}, body)
+        with_surface = m.row_model({}, body, "amazon-bedrock/converse")
+        self.assertEqual(with_surface, "claude-opus-5")
+        self.assertNotEqual(bare, with_surface,
+                            "the surface made no difference, so this test no "
+                            "longer covers the axis it was written for")
 
 
 class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
@@ -1580,6 +1632,255 @@ class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
                     f"stage this one")
 
 
+class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
+    """A counted row used to carry `segment_tokens` and nothing else.
+
+    The loader accepts any correctly-shaped positive array as exact, so a
+    counted export left over from a different endpoint, a different resolved
+    model, an older version of the counter, or a capture that has since been
+    re-recorded was indistinguishable from a fresh one — and
+    `sweep_report.counted` reused it on the strength of the filename existing.
+    Deleting the flag that produced some of those files closed the door and left
+    the window open.
+
+    So every counted row now records what produced it, and the record covers
+    every input that changes a count.
+    """
+
+    def setUp(self):
+        _ModelStub.seen = []
+        self.stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ModelStub)
+        self.port = self.stub.server_address[1]
+        threading.Thread(target=self.stub.serve_forever, daemon=True).start()
+        self.addCleanup(self.stub.shutdown)
+        self.dir = tempfile.mkdtemp()
+        self.endpoint = f"http://127.0.0.1:{self.port}/count"
+
+    def _src(self, *models):
+        p = os.path.join(self.dir, "cap.jsonl")
+        with open(p, "w") as f:
+            for mdl in models:
+                f.write(json.dumps({
+                    "sent_at": "2026-08-01T09:00:00Z",
+                    "body": {"model": mdl,
+                             "system": [{"type": "text", "text": "policy " * 50}],
+                             "messages": [{"role": "user", "content": "hi"}]},
+                    "usage": {"input_tokens": 500}}) + "\n")
+        return p
+
+    def _count(self, src, out, *extra):
+        return subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
+             "-o", out, "--endpoint", self.endpoint, *extra],
+            capture_output=True, text=True, timeout=90,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+
+    def test_a_counted_row_records_what_produced_it(self):
+        m = load("count_tokens")
+        src = self._src("claude-opus-5")
+        out = os.path.join(self.dir, "out.jsonl")
+        r = self._count(src, out)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        row = json.loads(open(out).read().strip())
+        p = row[m.PROVENANCE_KEY]
+        self.assertEqual(p["model"], "claude-opus-5")
+        self.assertEqual(p["endpoint"], self.endpoint)
+        self.assertEqual(p["version"], m.COUNTER_VERSION)
+        self.assertEqual(p["body_sha256"], m.body_sha256(row["body"]))
+        self.assertIsNone(p["target_id"])
+
+    def test_the_record_covers_every_input_that_changes_a_count(self):
+        """Named as a set rather than field by field, so a new input to counting
+        that is not recorded fails here."""
+        m = load("count_tokens")
+        src = self._src("claude-opus-5")
+        out = os.path.join(self.dir, "out.jsonl")
+        self._count(src, out)
+        row = json.loads(open(out).read().strip())
+        self.assertEqual(
+            set(row[m.PROVENANCE_KEY]),
+            {"version", "tool", "body_sha256", "model", "endpoint", "target_id"})
+
+    def test_it_carries_no_prompt_text(self):
+        """The same rule the count cache was changed for: this lands on a
+        client's disk, and structure plus digests are enough."""
+        m = load("count_tokens")
+        p = os.path.join(self.dir, "secret.jsonl")
+        with open(p, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "claude-opus-5",
+                "system": [{"type": "text", "text": "SECRET-POLICY"}],
+                "messages": [{"role": "user", "content": "CONFIDENTIAL"}]}}) + "\n")
+        out = os.path.join(self.dir, "out.jsonl")
+        self._count(p, out)
+        row = json.loads(open(out).read().strip())
+        blob = json.dumps(row[m.PROVENANCE_KEY])
+        self.assertNotIn("SECRET-POLICY", blob)
+        self.assertNotIn("CONFIDENTIAL", blob)
+
+    def test_an_uncounted_row_carries_no_record(self):
+        """Counts and their provenance are written together or not at all. A row
+        with a record and no counts, or counts and no record, is what a stale
+        file looks like."""
+        m = load("count_tokens")
+        src = self._src("model-this-gateway-rejects")
+        out = os.path.join(self.dir, "out.jsonl")
+        self._count(src, out)
+        row = json.loads(open(out + ".partial").read().strip())
+        self.assertNotIn("segment_tokens", row)
+        self.assertNotIn(m.PROVENANCE_KEY, row)
+
+    def test_every_counted_row_in_a_mixed_export_records_its_own_model(self):
+        m = load("count_tokens")
+        src = self._src("claude-opus-5", "claude-haiku-4-5")
+        out = os.path.join(self.dir, "out.jsonl")
+        self._count(src, out)
+        rows = [json.loads(l) for l in open(out) if l.strip()]
+        self.assertEqual([r[m.PROVENANCE_KEY]["model"] for r in rows],
+                         ["claude-opus-5", "claude-haiku-4-5"])
+
+    def test_the_record_does_not_disturb_the_analyzer(self):
+        """An extra key on the row must stay inert: `_find_body` must not mistake
+        it for a body and the counts must still load as exact."""
+        from cacheeconomics.adapters.bodies import _find_body
+        m = load("count_tokens")
+        src = self._src("claude-opus-5")
+        out = os.path.join(self.dir, "out.jsonl")
+        self._count(src, out)
+        row = json.loads(open(out).read().strip())
+        self.assertIs(_find_body(row), row["body"])
+        self.assertNotIn("messages", row[m.PROVENANCE_KEY])
+
+
+class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
+    """`sweep_report.counted` returned the sibling counted file because it
+    existed. Nothing compared it to the capture beside it.
+
+    So a stale `interval-*-counted.jsonl` — left by a removed `--force-model`
+    path, by a different endpoint, or for a capture that has since been
+    re-recorded — skipped `count_tokens.py` entirely and was analysed as exact.
+
+    On a mismatch this refuses rather than recounting. Recounting would send
+    that capture's prompt prefixes to the endpoint because a file on disk
+    disagreed: new egress, chosen by the tool, on a path an operator approved
+    for a different question. Refusing sends nothing, believes nothing, and says
+    what it found.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.m = load("sweep_report")
+        self.ct = load("count_tokens")
+        self.src = os.path.join(self.dir, "interval-10m.jsonl")
+        with open(self.src, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        self.out = self.ct.counted_path(self.src)
+
+    def _write_counted(self, **overrides):
+        """A counted export for `self.src`, with its provenance adjustable."""
+        row = json.loads(open(self.src).read().strip())
+        row["segment_tokens"] = [7]
+        prov = self.ct.provenance(row["body"], "claude-opus-5",
+                                  self.ct.DEFAULT_ENDPOINT, None)
+        prov.update(overrides)
+        row[self.ct.PROVENANCE_KEY] = prov
+        with open(self.out, "w") as f:
+            f.write(json.dumps(row) + "\n")
+
+    def _counted_never_shelling_out(self, **kw):
+        """`counted()` with the subprocess barred, so a test can never both
+        assert a refusal and quietly send the capture somewhere."""
+        attempts = []
+        real = self.m.subprocess.run
+
+        class _NoRun:
+            @staticmethod
+            def run(cmd, *a, **k):
+                attempts.append(cmd)
+                raise AssertionError("counted() shelled out")
+
+        self.m.subprocess = _NoRun
+        self.addCleanup(setattr, self.m.subprocess, "run", real)
+        return self.m.counted(self.src, **kw), attempts
+
+    def test_a_matching_counted_file_is_reused(self):
+        """The other direction. A rule that never reuses has traded a wrong
+        answer for egress on every run, which is its own kind of wrong."""
+        self._write_counted()
+        got, attempts = self._counted_never_shelling_out()
+        self.assertEqual(got, self.out)
+        self.assertEqual(attempts, [])
+
+    def test_a_changed_capture_is_not_reused(self):
+        self._write_counted()
+        with open(self.src, "w") as f:
+            f.write(json.dumps({"body": {
+                "model": "claude-opus-5",
+                "messages": [{"role": "user", "content": "DIFFERENT"}]}}) + "\n")
+        got, attempts = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src, "a stale counted export was reused")
+        self.assertEqual(attempts, [], "it recounted instead of refusing")
+
+    def test_a_different_endpoint_is_not_reused(self):
+        self._write_counted(endpoint="https://someone-elses-gateway/count")
+        got, _ = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src)
+
+    def test_an_older_counter_version_is_not_reused(self):
+        self._write_counted(version=self.ct.COUNTER_VERSION - 1)
+        got, _ = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src)
+
+    def test_a_different_surface_is_not_reused(self):
+        self._write_counted()
+        got, _ = self._counted_never_shelling_out(
+            target_id="amazon-bedrock/converse")
+        self.assertEqual(got, self.src)
+
+    def test_counts_with_no_record_at_all_are_not_reused(self):
+        """The files the old code produced. Every one of them is on disk
+        somewhere already, and this is the case that matters most."""
+        row = json.loads(open(self.src).read().strip())
+        row["segment_tokens"] = [7]
+        with open(self.out, "w") as f:
+            f.write(json.dumps(row) + "\n")
+        got, _ = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src,
+                         "a counted export from before provenance existed was "
+                         "reused as exact")
+
+    def test_a_truncated_counted_file_is_not_reused(self):
+        self._write_counted()
+        with open(self.out, "w") as f:
+            f.write("")
+        got, _ = self._counted_never_shelling_out()
+        self.assertEqual(got, self.src)
+
+    def test_a_refusal_says_what_it_found_and_what_to_do(self):
+        self._write_counted(endpoint="https://someone-elses-gateway/count")
+        buf = io.StringIO()
+        real, sys.stderr = sys.stderr, buf
+        try:
+            self.m.counted(self.src)
+        finally:
+            sys.stderr = real
+        said = buf.getvalue()
+        self.assertIn("refusing to reuse", said)
+        self.assertIn("someone-elses-gateway", said)
+        self.assertIn("estimated", said)
+        self.assertIn("delete", said)
+
+    def test_a_row_that_was_never_counted_does_not_make_the_file_stale(self):
+        """A partial export is a legitimate shape: rows the endpoint refused
+        carry no counts and no record, and they are not evidence of staleness."""
+        row = json.loads(open(self.src).read().strip())
+        with open(self.out, "w") as f:
+            f.write(json.dumps(row) + "\n")
+        self.assertIsNone(self.ct and self.m.stale_reason(self.src, self.out))
+
+
 class TestOneCountedPathHelperForTheWholeToolchain(unittest.TestCase):
     """Two copies of the derivation is what produced the bug.
 
@@ -1637,11 +1938,20 @@ class TestOneCountedPathHelperForTheWholeToolchain(unittest.TestCase):
                          "which is what let the two copies drift apart")
 
     def test_every_script_that_needs_it_imports_the_one_helper(self):
+        """Read as an import rather than as a substring: the import is a
+        parenthesised multi-name one in `sweep_report.py`, and a literal search
+        for a single-name form calls that a violation."""
+        import ast
         for name, src in self._sources():
             if "-counted" not in src or name == "count_tokens.py":
                 continue
+            imported = {
+                alias.name
+                for node in ast.walk(ast.parse(src))
+                if isinstance(node, ast.ImportFrom) and node.module == "count_tokens"
+                for alias in node.names}
             with self.subTest(script=name):
-                self.assertIn("from count_tokens import counted_path", src,
+                self.assertIn("counted_path", imported,
                               f"{name} names a counted export but does not use "
                               f"the shared derivation")
 

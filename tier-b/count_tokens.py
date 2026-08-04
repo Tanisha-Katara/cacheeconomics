@@ -47,6 +47,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -59,13 +60,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
 from cacheeconomics.tokenizer import count_segments              # noqa: E402
-from cacheeconomics.trace import _first, _text                   # noqa: E402
+from cacheeconomics.trace import request_from_row                # noqa: E402
 
 # Overridable, because the clients most likely to care about egress are the
 # ones who cannot reach this host. An enterprise gateway, a Bedrock or Vertex
 # deployment, or a self-hosted proxy all mean the counting call has to go
 # somewhere else, and a hard-coded host makes the answer "edit the source".
 DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
+
+# Bumped when anything about how a count is produced changes -- the cut
+# construction, the differencing, which model is asked. Recorded in every
+# counted row so a reader can tell an export this script produced from one an
+# older version did, and refuse to reuse the older one.
+COUNTER_VERSION = 1
+
+# Where the record of what produced `segment_tokens` lives on each counted row.
+PROVENANCE_KEY = "segment_tokens_provenance"
 
 
 def counted_path(path: str) -> str:
@@ -88,45 +98,83 @@ def counted_path(path: str) -> str:
     return os.path.join(head, f"{root}-counted{ext or '.jsonl'}")
 
 
-def row_model(row: dict, body: dict, fallback: str) -> str:
-    """Which tokenizer counts this row, by the loader's own precedence.
+def row_model(row: dict, body: dict, target_id: str | None = None) -> str:
+    """Which tokenizer counts this row: whichever model the analyzer will say
+    it is.
 
-    The row's own model, because an export is not one model. A month of a
-    client's traffic routinely mixes an opus planner with a haiku worker, and
-    the two do not tokenize the same text into the same number of tokens.
+    This calls the loader rather than reproducing it, and the history is the
+    argument. Three rounds of review found three different divergences, each in
+    a shape the previous fix had not modelled:
 
-    Body first, then the row, then the fallback -- which is exactly what the
-    analyzer resolves for the same row: `bodies.load_bodies` passes
-    `model_override=(body or {}).get("model")` into `request_from_row`, which
-    takes `model_override or _first(row, "model")`. Resolved here with the
-    loader's own `_first`/`_text` rather than a second copy of the rule, because
-    reading the extracted body alone *was* the bug: an export that names the
-    model at the top level of the row and nests the body under `body` --
-    an ordinary exporter shape -- resolved to the fallback, so a row declaring
-    claude-opus-5 was counted by haiku and still loaded as exact.
+      round 1  the CLI's --model was stamped over every row
+      round 2  only the extracted body was read, so a row naming its model at
+               the top level resolved to the fallback
+      round 3  precedence matched but the order of operations did not -- the
+               loader picks the raw value first and coerces once, this coerced
+               each candidate before choosing, and six shapes disagreed:
 
-    Nothing is cleaned up on the way through, and that is deliberate rather
-    than lazy. A first draft treated a blank or numeric model as unnamed and
-    fell back to `--model`; `_text` does not, so for such a row the analyzer
-    would call the model "5" while this counted it with haiku and marked the
-    result exact -- the defect this function exists to close, arrived at by
-    being helpful. Anything the loader will treat as a model name is sent as
-    the model name. If the endpoint will not serve it the row simply fails to
-    count and is estimated, which is the safe direction.
+                 body ["bad"], row opus  -> loader unknown,  this opus
+                 body 0,       row opus  -> loader opus,     this "0"
+                 body {...},   row opus  -> loader unknown,  this opus
+                 body True,    row opus  -> loader unknown,  this opus
+                 absent in both          -> loader unknown,  this the fallback
+                 body opus-20260101      -> loader opus,     this opus-20260101
 
-    Not normalised either. `_normalised` strips a snapshot date, and the dated
-    id is what the row says was sent and what the endpoint accepts; the same
-    string goes into the payload and into the cache key, so the two cannot
-    disagree about which tokenizer answered.
+    Each one writes `segment_tokens` that a different model produced and the
+    analyzer then accepts as exact. Matching behaviour is what failed twice, so
+    this stops matching it: `request_from_row` is the function that decides what
+    `Request.model` is, and its answer is the answer. Divergence is no longer a
+    thing that can be got wrong, only a thing that can be renamed.
 
-    Bound per row rather than read inside `count`, because `prefix_cuts`
-    rebuilds each cut out of tools/system/messages alone -- the cut it hands the
-    counter does not carry the row's model, so the caller has to say.
+    The one line still transcribed from the caller is `model_override`, which is
+    `bodies.load_bodies`'s argument rather than the resolver's own logic;
+    `TestTheCounterAsksTheLoaderWhichModelThisIs` reads it back out of that
+    source so it cannot drift either.
+
+    There is no fallback parameter. A row the loader calls "unknown" is counted
+    as "unknown", the endpoint refuses it, and the row is left for the analyzer
+    to estimate -- which is the honest outcome, because nothing in the export
+    says what tokenizer that row used. A `--model` default here counted such a
+    row with haiku while the report called it "unknown".
     """
-    def named(d):
-        return _text(_first(d, "model")) if isinstance(d, dict) else None
+    if not isinstance(row, dict):
+        row = {}
+    override = body.get("model") if isinstance(body, dict) else None
+    kwargs = {"default_target": target_id} if target_id else {}
+    return request_from_row(row, [], renamed={}, model_override=override,
+                            **kwargs).model
 
-    return named(body) or named(row) or fallback
+
+def body_sha256(body) -> str:
+    """A digest of the body these counts were taken from.
+
+    Not the body. This lands in a file on a client's disk and the whole point of
+    the enrichment is that structure and counts are enough; the count cache made
+    exactly this mistake once already and was changed to digests.
+    """
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def provenance(body, model: str, endpoint: str,
+               target_id: str | None) -> dict:
+    """What produced this row's `segment_tokens`.
+
+    Counted rows used to carry the array and nothing else, and the loader
+    accepts any correctly-shaped positive array as exact. So a counted export
+    left over from a different endpoint, a different resolved model, an older
+    version of this script, or a capture that has since changed was
+    indistinguishable from a fresh one -- and `sweep_report.counted` reused it
+    on the strength of the filename existing.
+
+    Everything here is an input that changes the counts. The digest covers the
+    body, the model and endpoint name the tokenizer that answered, `target_id`
+    is an input to the resolved model, and the version invalidates the lot when
+    this script's own arithmetic changes.
+    """
+    return {"version": COUNTER_VERSION, "tool": "tier-b/count_tokens.py",
+            "body_sha256": body_sha256(body), "model": model,
+            "endpoint": endpoint, "target_id": target_id}
 
 
 def counter(model: str, key: str, stats: dict, endpoint: str = DEFAULT_ENDPOINT,
@@ -164,22 +212,27 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("path", help="JSONL export of logged request bodies")
     p.add_argument("-o", "--out", required=True, help="where to write the enriched export")
-    # Deliberately no flag that forces one tokenizer across the export. One was
-    # added here and removed on review, and the review was right: forcing a
-    # model produces counts that are wrong *and* load as exact, because nothing
-    # in the output marks which tokenizer answered for which row. That is the
-    # defect this script was changed to close, behind a flag.
+    # Deliberately no flag naming the tokenizer -- neither an override nor a
+    # fallback. Both existed here and both were removed on review.
     #
-    # A row whose model a gateway will not accept therefore fails to count. It
-    # is written without `segment_tokens`, the analyzer estimates it by byte
-    # share, and it is not treated as exact. A stated estimate beats a confident
-    # wrong number, which is the premise the whole tool is sold on.
-    p.add_argument("--model", default="claude-haiku-4-5",
-                   help="fallback tokenizer, used only for rows that name no "
-                        "model at all (default: claude-haiku-4-5). Every other "
-                        "row is counted with the model it names, so a mixed "
-                        "export is counted by each of its models rather than by "
-                        "one. There is no flag to override a row that names one")
+    # An override produces counts that are wrong *and* load as exact, because
+    # nothing downstream marks which tokenizer answered for which row. A
+    # fallback is the same defect one step quieter: the analyzer calls a row
+    # with no resolvable model "unknown", so counting it with haiku attaches
+    # haiku's segment sizes to a row the report names otherwise.
+    #
+    # So the model is whatever `request_from_row` says it is, and a row it
+    # cannot name is not counted. It is written without `segment_tokens`, the
+    # analyzer estimates it by byte share, and it is not treated as exact. A
+    # stated estimate beats a confident wrong number, which is the premise the
+    # whole tool is sold on.
+    p.add_argument("--target-id",
+                   help="the provider surface this traffic went to, if the rows "
+                        "do not say. It resolves the model the same way "
+                        "`analyze --target-id` does -- a surface's id prefix is "
+                        "stripped before the tokenizer is asked -- so pass the "
+                        "same value to both or the counted model and the "
+                        "analysed model can differ")
     p.add_argument("--cache", help="cache file to read and write (default: <out>.cache.json)")
     p.add_argument("--allow-partial", action="store_true",
                    help="write the output and exit 0 even when some rows could "
@@ -292,16 +345,27 @@ def main() -> int:
                     emit(json.dumps(row))
                     skipped += 1
                     continue
-                counter_id, count = counter_for(
-                    row_model(row, body, args.model))
                 try:
+                    # Inside the try. Resolving the model runs the loader over
+                    # the row, and a row malformed enough to break that should
+                    # cost its own counts and nothing else -- outside, it took
+                    # the whole run down at whichever row it met.
+                    model = row_model(row, body, args.target_id)
+                    counter_id, count = counter_for(model)
                     row["segment_tokens"] = count_segments(body, count, cache,
                                                       counter_id)
+                    # Written together with the counts, never separately: a row
+                    # carrying an array and no record of what produced it is
+                    # exactly what a stale export looks like.
+                    row[PROVENANCE_KEY] = provenance(body, model, args.endpoint,
+                                                     args.target_id)
                     counted += 1
                 except Exception as e:                                # noqa: BLE001
                     # The row survives without counts and the analyzer falls back to
                     # estimating it, which is worse but is not nothing. Losing the
                     # row entirely would be.
+                    row.pop("segment_tokens", None)
+                    row.pop(PROVENANCE_KEY, None)
                     print(f"  row {counted + failed + skipped}: {type(e).__name__}: {e}",
                           file=sys.stderr)
                     failed += 1

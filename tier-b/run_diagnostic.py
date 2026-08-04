@@ -66,15 +66,19 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="report what counting would send, and send nothing")
     p.add_argument("--endpoint", help="send counting calls to your own gateway")
-    # No default here. `count_tokens.py` owns it, and this passed its own copy
-    # of the same string on every run -- which was fine while both said
-    # `claude-haiku-4-5` and silently wrong the moment one of them changed.
-    # It is a fallback for rows that name no model; rows that name one are
-    # counted with that model's tokenizer.
-    p.add_argument("--model",
-                   help="fallback tokenizer for rows whose body names no model. "
-                        "Rows that name a model are counted with it")
+    # There is no --model. The tokenizer is whichever model the analyzer will
+    # say the row used, resolved by the analyzer's own function; a flag here
+    # could only disagree with it. `--target-id` is the exception, because it is
+    # an *input* to that resolution -- a surface's id prefix is stripped before
+    # the model is looked up -- so counting and analysis have to be given the
+    # same one. It is declared here and passed on to both rather than left in
+    # the passthrough, where only `analyze` would have seen it.
+    p.add_argument("--target-id",
+                   help="the provider surface this traffic went to. Passed to "
+                        "counting and to analysis, which must agree on it")
     args, passthrough = p.parse_known_args()
+    if args.target_id:
+        passthrough += ["--target-id", args.target_id]
 
     # A sibling path, derived from the basename only -- see `counted_path`.
     # This is the one command that produces client evidence. Destroying the
@@ -94,8 +98,8 @@ def main() -> int:
     else:
         cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), args.path,
                "-o", out_path]
-        if args.model:
-            cmd += ["--model", args.model]
+        if args.target_id:
+            cmd += ["--target-id", args.target_id]
         if args.endpoint:
             cmd += ["--endpoint", args.endpoint]
         if args.dry_run:
