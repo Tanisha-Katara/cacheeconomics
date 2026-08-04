@@ -313,6 +313,30 @@ class TraceSet:
     # parsed, so a lossy export matching the invoice is a coincidence over an
     # unknown denominator rather than a reconciliation.
     skipped_rows: int = 0
+    # Which inputs to the pricing were assumed rather than read from the export,
+    # named individually: `("provider surface",)`.
+    #
+    # Structured rather than recovered from `blocking_notes`, and the three
+    # reasons are measured rather than argued. A blocking note may equally mean
+    # "these rows were excluded" -- the litellm adapter raises exactly that from
+    # the QUALIFIES_SPEND phrase -- and a trace that then reconciles is
+    # *correctly* invoice-checked, because what remains does tie to the bill; so
+    # a rule keyed on any blocking note relabels reports that were right.
+    # Deciding a release label by matching prose is the failure this file
+    # already records as the reason QUALIFIES_SPEND stopped being the
+    # classifier. And the fact is per-input: an assumed surface and an assumed
+    # effective rate are different assumptions with different remedies, which a
+    # sentence cannot distinguish.
+    #
+    # A tuple of names, not a bool, so the note downstream can say which one and
+    # a second assumed input needs no new field.
+    #
+    # `analyze` reads this to cap the release at DRAFT: an invoice can reconcile
+    # a total without checking the rate table the total was computed from, so
+    # figures priced off an assumption are released and not forwardable rather
+    # than withheld. Empty means nothing was assumed, which is the safe reading
+    # for every loader that does not set it.
+    assumed_inputs: tuple = ()
 
     def __len__(self):
         return len(self.requests)

@@ -280,7 +280,14 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
     return TraceSet(requests=requests, tier=Tier.USAGE_ONLY,
                     source=pattern, notes=notes + blocking,
                     blocking_notes=blocking,
-                    skipped_rows=skipped + corrupt)
+                    skipped_rows=skipped + corrupt,
+                    # The structured half of the note above. `analyze` reads
+                    # this to cap the release at DRAFT, so the disclosure and
+                    # the release label come from one fact rather than from a
+                    # renderer re-reading prose. Named, not a flag, so the note
+                    # downstream can say *which* input was assumed.
+                    assumed_inputs=(("provider surface",) if surface_assumed
+                                    else ()))
 
 
 def _agent_of(rec: dict) -> str:

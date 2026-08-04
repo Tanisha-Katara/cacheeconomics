@@ -634,7 +634,13 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
         out = []
         if isinstance(node, dict):
             for k, v in node.items():
-                if k == "release_state":
+                # Both encodings of provenance are skipped, not just the map.
+                # `_state_for` explicitly supports an inline `<leaf>_state`
+                # sibling -- so `computed_usd_state` contains "_usd", was walked
+                # as a money field in its own right, and was then reported as
+                # money with no provenance. One of this walk's own supported
+                # shapes could not pass it.
+                if k == "release_state" or k.endswith("_state"):
                     continue
                 out.extend(cls._money_paths(v, f"{path}.{k}" if path else k, k))
             return out
@@ -664,11 +670,23 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
         covered. Measured on a synthetic payload: `new_section.input_usd`
         returned 'draft' with nothing local vouching for it.
 
-        The top-level `release_state` map is `analysis_json`'s spend map, so it
-        vouches for `spend.*` and nothing else. Anything deeper has to carry its
-        own state, either in a sibling `release_state` map or inline beside the
-        value; which of the two a section uses is that section's business, and
-        having neither is the defect.
+        The top-level `release_state` map vouches for `spend.*` and nothing
+        else. Anything deeper carries its own state, in a sibling
+        `release_state` map or inline beside the value.
+
+        That is not an assumption about how the serialiser *might* be written;
+        it is what `analysis_json` emits, checked against the real thing rather
+        than reasoned about. `_release_state(mapping)` is keyed by field name
+        within a section, and it is called three times: once at top level for
+        `a.spend`, once inside `_reconciliation_json` for the reconciliation
+        block, and once inside each finding. Run over that payload, this
+        resolver leaves nothing unresolved.
+
+        A centralised full-path map -- `release_state["reconciliation.
+        computed_usd"]` -- would resolve to None here and the marker would stay
+        red through a legitimate fix, which is why this is pinned by
+        `test_only_spend_is_vouched_for_by_the_top_level_map` rather than left
+        as a comment.
         """
         parts = path.split(".")
         leaf = parts[-1]
@@ -732,6 +750,77 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
         be an over-block -- and name-based detection would otherwise catch it."""
         self.assertEqual([], self._money_paths(
             {"reconciliation": {"invoice_usd": 1.25}}))
+
+    def test_the_allow_list_is_exactly_one_field(self):
+        """Guarded in both directions, because an allow-list only removes
+        things. Widening it silently removes fields from every check above, and
+        the previous version of these tests asserted only that the one entry was
+        honoured -- never that it was the only one."""
+        self.assertEqual({"reconciliation.invoice_usd"},
+                         set(self._INPUT_ONLY_MONEY))
+
+    def test_the_neighbours_of_the_allow_listed_field_are_still_walked(self):
+        """The two Figures that sit in the same dict as `invoice_usd`, and which
+        the allow-list must not take with it."""
+        synthetic = {"reconciliation": {"invoice_usd": 1.25,
+                                        "computed_usd": "$1.25",
+                                        "delta_usd": "$0.00"}}
+        self.assertEqual(["reconciliation.computed_usd",
+                          "reconciliation.delta_usd"],
+                         sorted(self._money_paths(synthetic)))
+
+    def test_the_allow_list_is_scoped_by_path_not_by_field_name(self):
+        """`invoice_usd` anywhere other than the reconciliation block is not the
+        client's invoice and has to be walked like any other money."""
+        synthetic = {"some_other_section": {"invoice_usd": "$99.00"}}
+        self.assertEqual(["some_other_section.invoice_usd"],
+                         self._money_paths(synthetic))
+
+    def test_an_inline_state_key_vouches_without_becoming_money_itself(self):
+        """`_state_for` supports an inline `<leaf>_state` sibling, and the walk
+        promoted it to a money field because the name contains "_usd" -- so one
+        of this walk's own supported encodings could not pass it."""
+        synthetic = {"reconciliation": {"computed_usd": "$1.25",
+                                        "computed_usd_state": "draft"}}
+        self.assertEqual(["reconciliation.computed_usd"],
+                         self._money_paths(synthetic))
+        self.assertEqual("draft",
+                         self._state_for(synthetic, "reconciliation.computed_usd"))
+
+    def test_only_spend_is_vouched_for_by_the_top_level_map(self):
+        """Pinned because it is a merge-time contract, not a preference.
+
+        `analysis_json` calls `_release_state(mapping)` per section: once at top
+        level for `a.spend`, once inside the reconciliation block, once inside
+        each finding. So state for anything outside `spend` is local, and this
+        resolver requires it to be. If that ever becomes a centralised full-path
+        map, this test fails and says so rather than the marker quietly staying
+        red through a real fix.
+        """
+        local = {"release_state": {"input_usd": "draft"},
+                 "spend": {"input_usd": "$1.00"},
+                 "reconciliation": {"computed_usd": "$1.00",
+                                    "release_state": {"computed_usd": "draft"}}}
+        self.assertEqual("draft", self._state_for(local, "spend.input_usd"))
+        self.assertEqual("draft",
+                         self._state_for(local, "reconciliation.computed_usd"))
+        full_path = {"release_state": {"reconciliation.computed_usd": "draft"},
+                     "reconciliation": {"computed_usd": "$1.00"}}
+        self.assertIsNone(
+            self._state_for(full_path, "reconciliation.computed_usd"),
+            "the serialiser moved to a centralised full-path map; this resolver "
+            "and the xfail markers that depend on it need updating together")
+
+    def test_a_findings_release_state_resolves_through_the_list_index(self):
+        """The third section `_release_state` is called for, and the only one
+        reached through a list index."""
+        synthetic = {"findings": [
+            {"code": "EFF-1", "avoidable_usd_month": "$542",
+             "release_state": {"avoidable_usd_month": "draft"}}]}
+        self.assertEqual(["findings[0].avoidable_usd_month"],
+                         self._money_paths(synthetic))
+        self.assertEqual("draft", self._state_for(
+            synthetic, "findings[0].avoidable_usd_month"))
 
     def test_the_json_walk_finds_money_outside_the_spend_section(self):
         """Guard the guard. The previous version of this test read

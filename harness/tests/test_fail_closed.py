@@ -2049,20 +2049,48 @@ class TestAnAssumedSurfaceMustNotReconcileWithoutTheCLI(unittest.TestCase):
     """
 
     def _fixture(self, tmp):
+        """A trace that releases money in every category the marker walks.
+
+        Shaped deliberately, because the first version of this fixture was
+        twelve requests minutes apart and produced released figures in `spend`
+        and `reconciliation` only: its findings were CAC-1 with no
+        `avoidable_usd_month`, and `total_avoidable_month` was withheld for
+        having no priceable parts. So the marker walked four categories and
+        *exercised* two, and a fix that downgraded spend and reconciliation
+        while forgetting per-finding release would still have flipped it green.
+
+        What earns what, measured rather than assumed -- the first draft of this
+        docstring credited the length for the finding category and that was
+        wrong:
+
+          - The *shape* earns the findings and total categories. 15-minute gaps
+            with 5m writes and no reads mean every entry is dead before the next
+            request, which makes EFF-1 fire carrying money instead of CAC-1
+            reporting that caching is fine. That holds at 12 requests as well as
+            at 300; the count is not what does it.
+          - The *length* earns one more figure. At 300 requests the window is
+            3.1 days, clearing the one-day projection floor so
+            `spend.monthly_input_usd` publishes too. At 12 it is withheld by the
+            floor -- correctly, and for a reason unrelated to this marker.
+          - An invoice equal to computed spend, so the gate genuinely passes and
+            RECONCILED is what the figures would otherwise wear.
+        """
         proj = os.path.join(tmp, "proj")
         os.makedirs(proj)
+        start = datetime(2026, 7, 10, 9, tzinfo=timezone.utc)
         with open(os.path.join(proj, "s.jsonl"), "w") as f:
-            for i in range(12):
+            for i in range(300):
+                at = (start + timedelta(seconds=900 * i)).strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z")
                 f.write(json.dumps({
                     "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
-                    "requestId": f"r{i}",
-                    "timestamp": f"2026-07-29T09:{i:02d}:00.000Z",
+                    "requestId": f"r{i}", "timestamp": at,
                     "message": {"model": "claude-opus-5", "usage": {
-                        "input_tokens": 100, "output_tokens": 10,
-                        "cache_read_input_tokens": 20_000,
-                        "cache_creation_input_tokens": 1_000,
+                        "input_tokens": 300, "output_tokens": 40,
+                        "cache_read_input_tokens": 0,
+                        "cache_creation_input_tokens": 150_000,
                         "cache_creation": {
-                            "ephemeral_5m_input_tokens": 1_000,
+                            "ephemeral_5m_input_tokens": 150_000,
                             "ephemeral_1h_input_tokens": 0}}}}) + "\n")
         return tmp
 
@@ -2129,26 +2157,49 @@ class TestAnAssumedSurfaceMustNotReconcileWithoutTheCLI(unittest.TestCase):
                 if isinstance(v, Figure):
                     out.append((f"{section}.{k}", v))
         for f in a.findings:
-            if isinstance(f.avoidable_usd_month, Figure):
-                out.append((f"findings[{f.code}].avoidable_usd_month",
-                            f.avoidable_usd_month))
+            # `avoidable_usd_window` is read through getattr because it exists
+            # on some versions of `Finding` and not others; a marker that
+            # silently stopped covering a money field the day one was added is
+            # the failure mode this whole class is about.
+            for field in ("avoidable_usd_month", "avoidable_usd_window"):
+                v = getattr(f, field, None)
+                if isinstance(v, Figure):
+                    out.append((f"findings[{f.code}].{field}", v))
         if isinstance(a.total_avoidable_month, Figure):
             out.append(("total_avoidable_month", a.total_avoidable_month))
         return out
 
-    def test_the_walk_reaches_past_the_spend_section(self):
-        """Guard the guard. If `_figures` only ever found `spend.*`, the marker
-        below would be the narrow check it was written to replace."""
+    # The categories the marker claims to cover, and how to recognise each in a
+    # path. Named here so the guard below checks the claim rather than a proxy
+    # for it.
+    CATEGORIES = {
+        "spend": lambda p: p.startswith("spend."),
+        "reconciliation": lambda p: p.startswith("reconciliation."),
+        "findings": lambda p: p.startswith("findings["),
+        "total": lambda p: p == "total_avoidable_month",
+    }
+
+    def test_the_fixture_releases_money_in_every_category_the_marker_walks(self):
+        """Guard the guard, and the guard was too weak.
+
+        Its first version asked only for "some non-spend path" and "some
+        released figure", both of which `reconciliation` satisfies alone. So it
+        certified that the *walk* reached four categories while the *fixture*
+        exercised two -- and a fix that forgot per-finding release would still
+        have turned the marker green. Proving a walk is capable of finding
+        something is not proving it was given something to find.
+        """
         with tempfile.TemporaryDirectory() as tmp:
             _ts, a = self._analyse(tmp)
-        found = [p for p, _ in self._figures(a)]
-        self.assertTrue(found, "no figures discovered; the marker is vacuous")
-        self.assertTrue(
-            [p for p in found if not p.startswith("spend.")],
-            f"the walk never leaves the spend section: {sorted(found)}")
-        self.assertTrue(
-            [p for p, f in self._figures(a) if f.released],
-            "nothing was released, so 'nothing says reconciled' proves nothing")
+        released = [p for p, f in self._figures(a) if f.released]
+        self.assertTrue(released, "nothing was released; the marker is vacuous")
+        missing = sorted(name for name, matches in self.CATEGORIES.items()
+                         if not any(matches(p) for p in released))
+        self.assertEqual(
+            [], missing,
+            "the fixture releases no money in these categories, so the marker "
+            "cannot detect a fix that forgets them: " + ", ".join(missing)
+            + f"\n    released: {sorted(released)}")
 
     @unittest.expectedFailure
     def test_an_assumed_surface_is_never_labelled_reconciled(self):
@@ -2161,3 +2212,115 @@ class TestAnAssumedSurfaceMustNotReconcileWithoutTheCLI(unittest.TestCase):
             [], wrong,
             "these were published as invoice-checked over an assumed rate "
             "table, without the CLI in the call: " + ", ".join(wrong))
+
+
+class TestTheLoaderStatesWhichPricingInputsWereAssumed(unittest.TestCase):
+    """The producer half of `assumed_inputs`, driven through the real loader.
+
+    `analyze` caps the release at DRAFT when `ts.assumed_inputs` is non-empty.
+    That consumer is useless until a loader sets the field, and for one round it
+    did not exist at all: the analyzer read `getattr(ts, "assumed_inputs", ())`,
+    every real adapter populated only `blocking_notes`, and a genuine
+    assumed-surface trace with a matching invoice was still released as
+    `reconciled`. Both sides' tests passed because both attached the attribute
+    to synthetic TraceSets by hand.
+
+    So these go through `load_sessions` against transcripts on disk. Nothing
+    here constructs a TraceSet or sets the attribute itself.
+    """
+
+    def _root(self, tmp):
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "s.jsonl"), "w") as f:
+            for i in range(4):
+                f.write(json.dumps({
+                    "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
+                    "requestId": f"r{i}",
+                    "timestamp": f"2026-07-29T09:0{i}:00.000Z",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 100, "output_tokens": 10,
+                        "cache_read_input_tokens": 20_000,
+                        "cache_creation_input_tokens": 1_000}}}) + "\n")
+        return tmp
+
+    def _load(self, tmp, **kw):
+        from cacheeconomics.adapters.claude_code import load_sessions
+        return load_sessions(root=self._root(tmp),
+                             target_id="anthropic/direct", **kw)
+
+    def test_an_assumed_surface_names_itself_in_the_field(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._load(tmp, surface_assumed=True)
+        self.assertTrue(ts.requests, "fixture produced no requests")
+        self.assertEqual(("provider surface",), tuple(ts.assumed_inputs))
+
+    def test_a_stated_surface_assumes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._load(tmp)
+        self.assertTrue(ts.requests, "fixture produced no requests")
+        self.assertEqual((), tuple(ts.assumed_inputs))
+
+    def test_the_field_is_set_alongside_the_note_and_not_instead_of_it(self):
+        """Both, because they serve different readers. The note is what a human
+        sees in the caveats; the field is what the release gate reads. Replacing
+        the note with the field would have moved the disclosure off the page."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._load(tmp, surface_assumed=True)
+        self.assertTrue(any("surface assumed" in n.lower()
+                            for n in ts.blocking_notes),
+                        "the human-readable caveat was dropped")
+        self.assertEqual(("provider surface",), tuple(ts.assumed_inputs))
+
+    def test_it_names_the_input_rather_than_being_a_flag(self):
+        """A tuple of names, so a second assumed input -- an effective rate, say
+        -- needs no new field and the note downstream can say which one it was.
+        A bool could not distinguish two assumptions with different remedies."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ts = self._load(tmp, surface_assumed=True)
+        self.assertIsInstance(tuple(ts.assumed_inputs), tuple)
+        self.assertNotIsInstance(ts.assumed_inputs, bool)
+        self.assertTrue(all(isinstance(x, str) for x in ts.assumed_inputs))
+
+    def test_a_traceset_that_predates_the_field_assumes_nothing(self):
+        """Track A reads this with `getattr(ts, "assumed_inputs", ())` so an
+        older object degrades to "assumed nothing". Confirmed rather than
+        assumed, because hand-built and pickled TraceSets exist in these tests.
+
+        The guarantee is stronger than the getattr default: the dataclass
+        default is a class attribute, so even an instance whose own `__dict__`
+        lacks the key reads `()` through ordinary attribute access.
+        """
+        import pickle
+        from cacheeconomics.trace import Tier, TraceSet
+        old = pickle.loads(pickle.dumps(TraceSet(requests=[],
+                                                 tier=Tier.USAGE_ONLY)))
+        old.__dict__.pop("assumed_inputs", None)
+        self.assertEqual((), tuple(getattr(old, "assumed_inputs", ()) or ()))
+        self.assertEqual((), tuple(old.assumed_inputs))
+
+    def test_the_loaders_that_read_their_surface_assume_nothing(self):
+        """The survey, so "only this adapter assumes" is checked rather than
+        claimed. `litellm` reads `custom_llm_provider` off each row and
+        otherwise takes the operator's stated `--target-id`; `bodies` keeps an
+        absent surface absent as UNATTRIBUTED. Every path there is read or
+        stated, so neither may claim an assumption -- and if one starts
+        assuming, this fails until it says so.
+        """
+        from cacheeconomics.trace import Tier, TraceSet
+        blank = TraceSet(requests=[], tier=Tier.USAGE_ONLY)
+        self.assertEqual((), tuple(blank.assumed_inputs),
+                         "the default must be 'assumed nothing'")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "rows.jsonl")
+            with open(path, "w") as f:
+                f.write(json.dumps({
+                    "model": "claude-opus-5",
+                    "usage": {"input_tokens": 10,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0}}) + "\n")
+            from cacheeconomics.adapters.litellm import load_litellm
+            ts = load_litellm(path)
+        self.assertEqual((), tuple(getattr(ts, "assumed_inputs", ())),
+                         "this loader reads or is told its surface; it assumes "
+                         "nothing and must not say it did")
