@@ -1056,7 +1056,7 @@ class _ModelStub(http.server.BaseHTTPRequestHandler):
     """
 
     seen = []
-    SCALE = {"claude-opus-5": 4, "claude-haiku-4-5": 1}
+    SCALE = {"claude-opus-5": 4, "claude-haiku-4-5": 1, "claude-sonnet-4-6": 2}
 
     def log_message(self, *a):
         pass
@@ -1066,7 +1066,14 @@ class _ModelStub(http.server.BaseHTTPRequestHandler):
             int(self.headers.get("content-length") or 0)) or b"{}")
         model = body.get("model")
         type(self).seen.append(model)
-        n = len(json.dumps(body, default=str)) // 4 * type(self).SCALE.get(model, 1)
+        if model not in type(self).SCALE:
+            # Like a gateway handed a model id it does not serve. The row then
+            # fails to count rather than being counted by something else.
+            self.send_response(400)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        n = len(json.dumps(body, default=str)) // 4 * type(self).SCALE[model]
         payload = json.dumps({"input_tokens": n}).encode()
         self.send_response(200)
         self.send_header("content-type", "application/json")
@@ -1093,6 +1100,16 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
     The scoping property `TestTheCountCacheIsScopedToItsCounter` establishes is
     only worth something if the model in the key is the one that answered, which
     is why these two classes belong next to each other.
+
+    The first fix read the model out of the *extracted body* only, which closed
+    one row shape and left the class open. An exporter that names the model at
+    the top level of the row and nests the body under `body` is ordinary, and
+    for those rows `body.get("model")` is None: a row declaring claude-opus-5
+    resolved to the fallback claude-haiku-4-5, was cached under the fallback's
+    counter_id, and still loaded as exact. So the shapes are enumerated here,
+    and the precedence is the loader's own rather than a second opinion —
+    `bodies.load_bodies` passes `model_override=(body or {}).get("model")` into
+    `request_from_row`, which resolves `model_override or _first(row, "model")`.
     """
 
     def setUp(self):
@@ -1104,8 +1121,12 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         self.dir = tempfile.mkdtemp()
         self.out = os.path.join(self.dir, "counted.jsonl")
 
+    def _body(self):
+        return {"system": [{"type": "text", "text": "policy " * 200}],
+                "messages": [{"role": "user", "content": "hi"}]}
+
     def _export(self, *models):
-        """One row per model, bodies otherwise identical.
+        """One row per model, named in the body. Bodies otherwise identical.
 
         Identical text on purpose: any difference in the counts that come back
         is then attributable to the tokenizer and nothing else.
@@ -1113,13 +1134,26 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         p = os.path.join(self.dir, "mixed.jsonl")
         with open(p, "w") as f:
             for m in models:
-                body = {"system": [{"type": "text", "text": "policy " * 200}],
-                        "messages": [{"role": "user", "content": "hi"}]}
+                body = self._body()
                 if m is not None:
                     body["model"] = m
                 f.write(json.dumps({"sent_at": "2026-08-01T09:00:00Z",
                                     "body": body,
                                     "usage": {"input_tokens": 500}}) + "\n")
+        return p
+
+    def _top_level_export(self, *models):
+        """The other ordinary shape: model on the row, body nested under it and
+        carrying no model of its own. This is the shape the first fix missed."""
+        p = os.path.join(self.dir, "toplevel.jsonl")
+        with open(p, "w") as f:
+            for m in models:
+                row = {"sent_at": "2026-08-01T09:00:00Z", "body": self._body(),
+                       "usage": {"input_tokens": 500}}
+                if m is not None:
+                    row["model"] = m
+                assert "model" not in row["body"]
+                f.write(json.dumps(row) + "\n")
         return p
 
     def _run(self, src, *extra):
@@ -1161,13 +1195,49 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         self.assertEqual(set(_ModelStub.seen), {"claude-haiku-4-5"})
         self.assertTrue(any(row.get("segment_tokens") for row in self._rows()))
 
-    def test_force_model_is_the_only_way_to_override_a_row(self):
-        """The escape hatch for a gateway that will not accept the model ids the
-        export happens to contain. Explicit, and named in the run's output."""
-        r = self._run(self._export("claude-opus-5", "claude-haiku-4-5"),
-                      "--force-model", "claude-haiku-4-5")
-        self.assertEqual(set(_ModelStub.seen), {"claude-haiku-4-5"})
-        self.assertIn("(forced)", r.stdout)
+    def test_a_model_named_on_the_row_is_asked_when_the_body_omits_it(self):
+        """The shape the first fix missed. `_find_body` returns the nested body,
+        which carries no model, so reading the body alone resolved the fallback
+        for a row that plainly declares one."""
+        r = self._run(self._top_level_export("claude-opus-5"),
+                      "--model", "claude-haiku-4-5")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"},
+                         "a row naming its model at the top level was counted "
+                         "by the fallback tokenizer")
+
+    def test_two_top_level_models_are_both_asked(self):
+        """The mixed case for that shape, which is the one that costs money:
+        different top-level models, neither named in the body."""
+        r = self._run(self._top_level_export("claude-opus-5",
+                                             "claude-haiku-4-5"))
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(set(_ModelStub.seen),
+                         {"claude-opus-5", "claude-haiku-4-5"})
+        rows = self._rows()
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[0]["segment_tokens"], rows[1]["segment_tokens"],
+                            "identical bodies under two top-level models were "
+                            "counted identically")
+
+    def test_the_body_wins_over_the_row_as_the_loader_says(self):
+        """Precedence, not merely presence — and the direction the analyzer
+        uses, so the counts are attributed to the model the report will name.
+
+        `request_from_row` takes `model_override or _first(row, "model")` with
+        `model_override` set from the body, so the body is the more
+        authoritative of the two. Counting has to agree, or the segment sizes
+        belong to one model and the row they are attached to names another.
+        """
+        p = os.path.join(self.dir, "both.jsonl")
+        body = self._body()
+        body["model"] = "claude-opus-5"
+        with open(p, "w") as f:
+            f.write(json.dumps({"sent_at": "2026-08-01T09:00:00Z",
+                                "model": "claude-haiku-4-5", "body": body,
+                                "usage": {"input_tokens": 500}}) + "\n")
+        self._run(p)
+        self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"})
 
     def test_two_rows_differing_only_in_model_get_different_counts(self):
         """The consequence, in the output rather than on the wire. Same text,
@@ -1184,19 +1254,45 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
 
     def test_the_cache_is_keyed_by_the_model_that_answered(self):
         """A warm cache must resume for the models it was written for, and must
-        not answer for one it was not."""
-        src = self._export("claude-opus-5", "claude-haiku-4-5")
-        self._run(src)
+        not answer for one it was not.
+
+        The third model arrives as a third row rather than a flag: the same
+        prefix text, a model the cache has never held. If the key followed
+        anything but the model that answered, those prefixes would come back
+        free and exact from counts a different tokenizer produced.
+        """
+        self._run(self._export("claude-opus-5", "claude-haiku-4-5"))
         first = len(_ModelStub.seen)
         self.assertGreater(first, 0)
-        self._run(src)
+
+        self._run(self._export("claude-opus-5", "claude-haiku-4-5"))
         self.assertEqual(len(_ModelStub.seen), first,
                          "a warm cache re-counted rows it already held")
-        self._run(src, "--force-model", "claude-sonnet-4-6")
+
+        self._run(self._export("claude-opus-5", "claude-haiku-4-5",
+                               "claude-sonnet-4-6"))
         self.assertGreater(len(_ModelStub.seen), first,
                            "counts written for two models were handed back for "
                            "a third that was never asked")
         self.assertIn("claude-sonnet-4-6", set(_ModelStub.seen))
+
+    def test_a_model_the_endpoint_rejects_degrades_to_an_estimate(self):
+        """Why there is no flag to force one tokenizer over the export.
+
+        A row whose model the endpoint will not accept fails to count. It keeps
+        its place in the export, carries no `segment_tokens`, and the run exits
+        non-zero so nothing downstream mistakes it for a counted file — the
+        analyzer estimates that row by byte share and says so. Forcing a model
+        would instead have produced a number that is wrong and indistinguishable
+        from an exact one.
+        """
+        r = self._run(self._export("model-this-gateway-rejects"))
+        self.assertNotEqual(r.returncode, 0,
+                            "a run that counted nothing reported success")
+        rows = [json.loads(l) for l in open(self.out + ".partial") if l.strip()]
+        self.assertEqual(len(rows), 1, "the row was dropped rather than kept")
+        self.assertNotIn("segment_tokens", rows[0],
+                         "a row the tokenizer refused was marked as counted")
 
     def test_the_run_reports_which_tokenizers_answered(self):
         """These counts load as exact, so which model produced them belongs in
@@ -1205,21 +1301,93 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
         self.assertIn("claude-opus-5", r.stdout)
         self.assertIn("claude-haiku-4-5", r.stdout)
 
-    def test_a_model_that_is_not_a_usable_string_falls_back(self):
-        """Directly, for the shapes an export can carry that a subprocess run
-        cannot easily produce. A blank or non-string model is not a tokenizer
-        name, and sending it would fail every row rather than one."""
+    def test_the_precedence_is_the_one_the_loader_uses(self):
+        """Enumerated against the loader rather than against an opinion.
+
+        `bodies.load_bodies` sets `model_override=(body or {}).get("model")` and
+        `request_from_row` resolves `model_override or _first(row, "model")`, so
+        for every (row-model, body-model) pair the counter must pick what the
+        analyzer will pick. Reading the body alone agreed on two of the four
+        pairs and silently used the fallback on a third.
+        """
         m = load("count_tokens")
-        self.assertEqual(m.row_model({"model": "claude-opus-5"}, "fb"),
-                         "claude-opus-5")
-        self.assertEqual(m.row_model({"model": "  claude-opus-5 "}, "fb"),
-                         "claude-opus-5")
-        for bad in ({}, {"model": ""}, {"model": "   "}, {"model": None},
-                    {"model": 5}, {"model": ["claude-opus-5"]}):
+        body = {"messages": [{"role": "user", "content": "hi"}]}
+
+        def with_model(d, model):
+            d = dict(d)
+            if model is not None:
+                d["model"] = model
+            return d
+
+        for row_m in (None, "claude-sonnet-4-6"):
+            for body_m in (None, "claude-opus-5"):
+                row = with_model({"body": body}, row_m)
+                expected = body_m or row_m or "fb"
+                with self.subTest(row=row_m, body=body_m):
+                    self.assertEqual(
+                        m.row_model(row, with_model(body, body_m), "fb"),
+                        expected)
+
+    def test_an_odd_model_value_resolves_to_whatever_the_loader_calls_it(self):
+        """Not cleaned up, on purpose, and this is the test that fixes the
+        direction.
+
+        A draft treated a blank or numeric model as unnamed and fell back to
+        `--model`. `_text` does not: it stringifies numbers and passes a
+        whitespace-only string through. So for `{"model": 5}` the analyzer calls
+        the model "5" while a helpful counter would have counted it with haiku
+        and marked it exact — this defect, reached by tidying up. Whatever the
+        loader will call the model is what gets counted; if the endpoint will
+        not serve it the row fails to count and is estimated.
+        """
+        m = load("count_tokens")
+        from cacheeconomics.trace import _first, _text
+
+        for value in ("claude-opus-5", "  claude-opus-5 ", "   ", 5, 1.5,
+                      "", None, True, ["claude-opus-5"],
+                      {"id": "claude-opus-5"}):
+            body = {"messages": []} if value is None else {"model": value}
+            loader_says = _text(_first(body, "model"))
+            with self.subTest(value=value):
+                self.assertEqual(m.row_model({}, body, "fb"),
+                                 loader_says or "fb")
+
+    def test_an_unusable_body_model_still_defers_to_the_rows(self):
+        """The precedence must survive a body whose model is unreadable —
+        skipping to the fallback would ignore a model the row plainly names."""
+        m = load("count_tokens")
+        for bad in ({"messages": []}, {"model": ""}, {"model": None},
+                    {"model": ["claude-opus-5"]}, {"model": {"id": "x"}}):
             with self.subTest(body=bad):
-                self.assertEqual(m.row_model(bad, "fb"), "fb")
-        self.assertEqual(m.row_model({"model": "claude-opus-5"}, "fb", "forced"),
-                         "forced")
+                self.assertEqual(
+                    m.row_model({"model": "claude-opus-5"}, bad, "fb"),
+                    "claude-opus-5")
+
+    def test_a_row_that_is_not_a_dict_does_not_take_the_run_down(self):
+        m = load("count_tokens")
+        for bad_row in (None, [], "not-a-row", 7):
+            with self.subTest(row=bad_row):
+                self.assertEqual(m.row_model(bad_row, {}, "fb"), "fb")
+
+    def test_there_is_no_way_to_force_one_tokenizer_over_the_export(self):
+        """A flag for this existed briefly and was removed on review.
+
+        Forcing a model produces counts that are wrong *and* load as exact,
+        because nothing in the output marks which tokenizer answered for which
+        row — the defect this class exists to close, behind a flag. Asserted on
+        behaviour rather than on help text: whatever the CLI is asked, a row
+        that names a model is counted by that model.
+        """
+        src = self._export("claude-opus-5")
+        for extra in (("--model", "claude-haiku-4-5"),
+                      ("--force-model", "claude-haiku-4-5"),
+                      ("--model", "claude-haiku-4-5", "--allow-partial")):
+            with self.subTest(extra=extra):
+                _ModelStub.seen = []
+                self._run(src, *extra)
+                self.assertNotIn("claude-haiku-4-5", set(_ModelStub.seen),
+                                 f"{extra} made another tokenizer answer for a "
+                                 f"row that named claude-opus-5")
 
     def test_a_dry_run_names_the_tokenizers_it_would_ask(self):
         """A mixed export costs one set of prefix calls per model. The dry run
@@ -1282,8 +1450,8 @@ class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
 
     def _input_derived(self):
         """Every name the toolchain derives from an *input* path."""
-        counted_path = load("run_diagnostic")._counted_path
-        return sorted({counted_path(p) for p in self.INPUT_SHAPES})
+        derive = load("count_tokens").counted_path
+        return sorted({derive(p) for p in self.INPUT_SHAPES})
 
     def test_the_source_still_derives_what_we_think_it_does(self):
         """Guards the guard: if either derivation stops looking like this, the
@@ -1412,10 +1580,150 @@ class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
                     f"stage this one")
 
 
+class TestOneCountedPathHelperForTheWholeToolchain(unittest.TestCase):
+    """Two copies of the derivation is what produced the bug.
+
+    `run_diagnostic.py` had `_counted_path` and `sweep_report.py` had its own
+    `counted`, and only the first was fixed. Months later the second still read
+    `path.replace(".jsonl", "-counted.jsonl")`, so a sweep directory named
+    `a.jsonl` turned `sweep/a.jsonl/interval-10m.jsonl` into
+    `sweep/a-counted.jsonl/interval-10m-counted.jsonl` — a directory that does
+    not exist. Counting failed, the sweep fell back to the uncounted capture,
+    and that point on the curve was estimated while its neighbours were counted.
+
+    Fixing the second copy would have left the third to be written. So this
+    asserts there is one implementation and that nothing carries a private
+    version of it, by reading the sources rather than by trusting the imports.
+    """
+
+    def _sources(self):
+        import glob
+        for path in sorted(glob.glob(os.path.join(TIER_B, "*.py"))):
+            yield os.path.basename(path), open(path).read()
+
+    def test_no_script_derives_a_path_by_string_replacement(self):
+        """The exact idiom that survived in the copy, in any file at all.
+
+        `path.replace(".jsonl", ...)` is wrong for a directory component, for a
+        name containing the extension twice, and for a name without it. There is
+        no correct use of it on a path here, so its presence anywhere in tier-b
+        is the finding.
+
+        Read as code rather than as text: both files now quote the bad line in a
+        comment explaining why it is gone, and a substring search calls that a
+        violation.
+        """
+        import ast
+        offenders = []
+        for name, src in self._sources():
+            for node in ast.walk(ast.parse(src)):
+                if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "replace"
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and isinstance(node.args[0].value, str)
+                        and node.args[0].value.startswith(".")):
+                    offenders.append(f"{name}:{node.lineno}")
+        self.assertEqual(offenders, [],
+                         "a script derives a path by string replacement instead "
+                         "of using count_tokens.counted_path")
+
+    def test_exactly_one_module_defines_the_derivation(self):
+        offenders = [name for name, src in self._sources()
+                     if "def counted_path(" in src]
+        self.assertEqual(offenders, ["count_tokens.py"],
+                         "the derivation is defined in more than one place, "
+                         "which is what let the two copies drift apart")
+
+    def test_every_script_that_needs_it_imports_the_one_helper(self):
+        for name, src in self._sources():
+            if "-counted" not in src or name == "count_tokens.py":
+                continue
+            with self.subTest(script=name):
+                self.assertIn("from count_tokens import counted_path", src,
+                              f"{name} names a counted export but does not use "
+                              f"the shared derivation")
+
+    def test_they_all_agree_on_every_shape(self):
+        """Behaviour, not imports. If a script ever shadows the helper, the
+        answers diverge here."""
+        mods = {n: load(n) for n in
+                ("count_tokens", "run_diagnostic", "sweep_report")}
+        for p in ("run.jsonl", "capture", "run.jsonl.gz", "a.jsonl/b.jsonl",
+                  "my.jsonl.backup.jsonl", ".jsonl", "no-ext-at-all",
+                  "sweep/a.jsonl/interval-10m.jsonl"):
+            answers = {n: m.counted_path(p) for n, m in mods.items()}
+            with self.subTest(path=p):
+                self.assertEqual(len(set(answers.values())), 1,
+                                 f"scripts disagree on {p}: {answers}")
+
+    def _sweep_dir(self):
+        """A sweep whose directory is named `a.jsonl`, with one capture in it
+        and its counted sibling already present."""
+        d = tempfile.mkdtemp()
+        sub = os.path.join(d, "a.jsonl")
+        os.makedirs(sub)
+        src = os.path.join(sub, "interval-10m.jsonl")
+        row = json.dumps({"request": {
+            "model": "claude-opus-5",
+            "messages": [{"role": "user", "content": "hi"}]}})
+        for p in (src, os.path.join(sub, "interval-10m-counted.jsonl")):
+            with open(p, "w") as f:
+                f.write(row + "\n")
+        return sub, src
+
+    def test_the_sweep_caller_reuses_the_counted_capture_beside_it(self):
+        """Through `sweep_report.counted`, which is the function that had the
+        bug — asserting on the helper alone tests the fix and not the caller.
+
+        The counted sibling already exists, so a correct derivation finds it and
+        returns it without counting anything. The broken one aimed at
+        `a-counted.jsonl/interval-10m-counted.jsonl`, a directory that does not
+        exist: it missed the existing file, tried to count, failed, and returned
+        the *uncounted* capture, so that point on the curve was drawn from byte
+        estimates while its neighbours were counted.
+        """
+        m = load("sweep_report")
+        sub, src = self._sweep_dir()
+
+        # Nothing may shell out here: in the broken state the miss falls through
+        # to `count_tokens.py` with no `--endpoint`, whose default host is the
+        # provider. Recorded rather than allowed, and the recording is asserted.
+        attempts = []
+        real_run = m.subprocess.run
+
+        class _NoRun:
+            @staticmethod
+            def run(cmd, *a, **k):
+                attempts.append(cmd)
+                raise AssertionError("counted() shelled out")
+
+        m.subprocess = _NoRun
+        self.addCleanup(setattr, m.subprocess, "run", real_run)
+
+        got = m.counted(src)
+        self.assertEqual(attempts, [],
+                         "counted() did not find the counted capture sitting "
+                         "beside the input and tried to recount it")
+        self.assertEqual(got, os.path.join(sub, "interval-10m-counted.jsonl"))
+
+    def test_the_sweep_caller_never_aims_outside_the_capture_directory(self):
+        """The same defect stated as the property, for every shape a sweep
+        directory can have."""
+        m = load("sweep_report")
+        for d in ("sweep", "a.jsonl", "x.jsonl.bak", "2026.jsonl"):
+            for base in ("interval-10m.jsonl", "interval-1h.jsonl", "capture"):
+                p = os.path.join("/tmp", d, base)
+                with self.subTest(path=p):
+                    self.assertEqual(os.path.dirname(m.counted_path(p)),
+                                     os.path.dirname(p))
+
+
 class TestTheDiagnosticCannotOverwriteItsOwnInput(unittest.TestCase):
-    """`run_diagnostic.py` derived the counted export with
-    `args.path.replace(".jsonl", "-counted.jsonl")`, which is wrong in three
-    ways an operator can hit:
+    """The toolchain derived the counted export with
+    `path.replace(".jsonl", "-counted.jsonl")`, which is wrong in three ways an
+    operator can hit:
 
       capture               -> capture            output *is* the input
       a.jsonl/b.jsonl       -> a-counted.jsonl/…  a directory rewritten
@@ -1425,42 +1733,66 @@ class TestTheDiagnosticCannotOverwriteItsOwnInput(unittest.TestCase):
     for writing while reading the source. This is the one command that produces
     client evidence, and losing the evidence it was handed is the worst thing
     in its reach.
+
+    It was fixed in `run_diagnostic.py` and not in `sweep_report.py`, which had
+    its own copy of the same line — so every one of these cases was still live
+    one file over. The derivation is now `count_tokens.counted_path` and there
+    is one of it; `TestOneCountedPathHelperForTheWholeToolchain` holds that
+    line, and these cases are asserted against every script that derives a
+    counted path rather than against the one that was fixed first.
     """
 
-    def _mod(self):
-        return load("run_diagnostic")
+    SCRIPTS = ("count_tokens", "run_diagnostic", "sweep_report")
+
+    def _derivers(self):
+        return [(n, load(n).counted_path) for n in self.SCRIPTS]
 
     def test_an_extensionless_input_gets_a_distinct_output(self):
-        m = self._mod()
-        self.assertNotEqual(m._counted_path("capture"), "capture")
-        self.assertTrue(m._counted_path("capture").endswith(".jsonl"))
+        for name, d in self._derivers():
+            with self.subTest(script=name):
+                self.assertNotEqual(d("capture"), "capture")
+                self.assertTrue(d("capture").endswith(".jsonl"))
 
     def test_a_directory_named_like_the_file_is_left_alone(self):
-        m = self._mod()
-        self.assertEqual(m._counted_path("a.jsonl/b.jsonl"),
-                         os.path.join("a.jsonl", "b-counted.jsonl"))
+        for name, d in self._derivers():
+            with self.subTest(script=name):
+                self.assertEqual(d("a.jsonl/b.jsonl"),
+                                 os.path.join("a.jsonl", "b-counted.jsonl"))
 
     def test_only_the_extension_is_replaced_not_every_occurrence(self):
-        m = self._mod()
-        self.assertEqual(m._counted_path("my.jsonl.backup.jsonl"),
-                         "my.jsonl.backup-counted.jsonl")
+        for name, d in self._derivers():
+            with self.subTest(script=name):
+                self.assertEqual(d("my.jsonl.backup.jsonl"),
+                                 "my.jsonl.backup-counted.jsonl")
 
     def test_the_ordinary_case_is_unchanged(self):
-        m = self._mod()
-        self.assertEqual(m._counted_path("run.jsonl"), "run-counted.jsonl")
-        self.assertEqual(m._counted_path("/tmp/x/run.jsonl"),
-                         "/tmp/x/run-counted.jsonl")
+        for name, d in self._derivers():
+            with self.subTest(script=name):
+                self.assertEqual(d("run.jsonl"), "run-counted.jsonl")
+                self.assertEqual(d("/tmp/x/run.jsonl"), "/tmp/x/run-counted.jsonl")
 
     def test_no_input_shape_produces_a_colliding_output(self):
         """The property, not the four cases: whatever the shape, the counted
         path is never the path being read."""
-        m = self._mod()
-        for p in ("run.jsonl", "capture", "run.jsonl.gz", "a.jsonl/b.jsonl",
-                  "my.jsonl.backup.jsonl", "/tmp/x/run.jsonl", ".jsonl",
-                  "x/y.jsonl", "no-ext-at-all"):
-            with self.subTest(path=p):
-                self.assertNotEqual(os.path.abspath(m._counted_path(p)),
-                                    os.path.abspath(p))
+        for name, d in self._derivers():
+            for p in ("run.jsonl", "capture", "run.jsonl.gz", "a.jsonl/b.jsonl",
+                      "my.jsonl.backup.jsonl", "/tmp/x/run.jsonl", ".jsonl",
+                      "x/y.jsonl", "no-ext-at-all"):
+                with self.subTest(script=name, path=p):
+                    self.assertNotEqual(os.path.abspath(d(p)),
+                                        os.path.abspath(p))
+
+    def test_the_output_never_leaves_the_inputs_directory(self):
+        """The sweep case. `a.jsonl/b.jsonl` -> `a-counted.jsonl/b-counted.jsonl`
+        does not merely rename the file, it names a directory that does not
+        exist — so counting fails, `sweep_report` falls back to the uncounted
+        capture, and that point on the curve is drawn from byte estimates while
+        its neighbours are counted."""
+        for name, d in self._derivers():
+            for p in ("a.jsonl/b.jsonl", "sweep/a.jsonl/interval-10m.jsonl",
+                      "/tmp/x.jsonl/y.jsonl", "d.jsonl/capture"):
+                with self.subTest(script=name, path=p):
+                    self.assertEqual(os.path.dirname(d(p)), os.path.dirname(p))
 
     def test_end_to_end_the_source_survives(self):
         """The consequence, driven through the real command."""

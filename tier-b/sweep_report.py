@@ -31,16 +31,34 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# The same helper `run_diagnostic.py` uses, imported rather than copied. This
+# file derived the counted path itself with
+# `path.replace(".jsonl", "-counted.jsonl")`, which `run_diagnostic.py` was
+# fixed for and this copy was not -- so a sweep directory named `a.jsonl` turned
+# `sweep/a.jsonl/interval-10m.jsonl` into
+# `sweep/a-counted.jsonl/interval-10m-counted.jsonl`, a directory that does not
+# exist. Counting then failed, this fell back to the uncounted capture, and the
+# curve was drawn from byte-share estimates instead. Two copies of one
+# derivation is what produced that, so there is now one.
+sys.path.insert(0, HERE)
+from count_tokens import counted_path                            # noqa: E402
+
 
 def counted(path: str) -> str:
     """Exact token counts, or the structural findings carry no figures."""
-    out = path.replace(".jsonl", "-counted.jsonl")
+    out = counted_path(path)
     if os.path.exists(out):
         return out
     r = subprocess.run([sys.executable, os.path.join(HERE, "count_tokens.py"),
                         path, "-o", out], capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"    counting failed: {r.stderr.strip()[:120]}", file=sys.stderr)
+        # Named, not just reported. This returns the *uncounted* capture, so
+        # every figure derived from this point is estimated while its
+        # neighbours in the same sweep are counted -- and a curve mixing the
+        # two says nothing about the difference between them.
+        print(f"    counting failed for {path}: {r.stderr.strip()[:120]}\n"
+              f"    analysing it uncounted; its segment sizes are estimated",
+              file=sys.stderr)
         return path
     return out
 
@@ -149,7 +167,11 @@ def main() -> int:
 
     rows = []
     for f in files:
-        label = os.path.basename(f).replace("interval-", "").replace(".jsonl", "")
+        # `splitext`, not `.replace(".jsonl", "")`: the same idiom that made the
+        # counted path wrong, here only cosmetic (it would eat both extensions
+        # of `interval-10m.jsonl.jsonl` and label the point wrongly), but there
+        # is no reason to keep the one shape of this that reads as correct.
+        label = os.path.splitext(os.path.basename(f))[0].replace("interval-", "")
         print(f"  {label} ...", file=sys.stderr)
         c = cadence(f)
         if not c.get("n"):

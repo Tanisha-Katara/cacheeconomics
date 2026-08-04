@@ -59,6 +59,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
 from cacheeconomics.tokenizer import count_segments              # noqa: E402
+from cacheeconomics.trace import _first, _text                   # noqa: E402
 
 # Overridable, because the clients most likely to care about egress are the
 # ones who cannot reach this host. An enterprise gateway, a Bedrock or Vertex
@@ -67,24 +68,65 @@ from cacheeconomics.tokenizer import count_segments              # noqa: E402
 DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
 
 
-def row_model(body: dict, fallback: str, force: str | None = None) -> str:
-    """Which tokenizer counts this row.
+def counted_path(path: str) -> str:
+    """`run.jsonl` -> `run-counted.jsonl`, beside it.
+
+    The one implementation. `run_diagnostic.py` and `sweep_report.py` both
+    derive this name and both used to do it themselves, so when the first was
+    fixed the second kept the bug: `path.replace(".jsonl", "-counted.jsonl")`
+    rewrites a *directory* component that happens to contain `.jsonl`, replaces
+    every occurrence in a name that contains it twice, and returns the input
+    unchanged when there is no extension at all -- which makes `count_tokens.py`
+    open the capture it is reading for writing.
+
+    Split on the basename so a directory named `something.jsonl` is left alone,
+    and give an extensionless input a real extension rather than a name
+    identical to itself.
+    """
+    head, base = os.path.split(path)
+    root, ext = os.path.splitext(base)
+    return os.path.join(head, f"{root}-counted{ext or '.jsonl'}")
+
+
+def row_model(row: dict, body: dict, fallback: str) -> str:
+    """Which tokenizer counts this row, by the loader's own precedence.
 
     The row's own model, because an export is not one model. A month of a
     client's traffic routinely mixes an opus planner with a haiku worker, and
     the two do not tokenize the same text into the same number of tokens.
 
+    Body first, then the row, then the fallback -- which is exactly what the
+    analyzer resolves for the same row: `bodies.load_bodies` passes
+    `model_override=(body or {}).get("model")` into `request_from_row`, which
+    takes `model_override or _first(row, "model")`. Resolved here with the
+    loader's own `_first`/`_text` rather than a second copy of the rule, because
+    reading the extracted body alone *was* the bug: an export that names the
+    model at the top level of the row and nests the body under `body` --
+    an ordinary exporter shape -- resolved to the fallback, so a row declaring
+    claude-opus-5 was counted by haiku and still loaded as exact.
+
+    Nothing is cleaned up on the way through, and that is deliberate rather
+    than lazy. A first draft treated a blank or numeric model as unnamed and
+    fell back to `--model`; `_text` does not, so for such a row the analyzer
+    would call the model "5" while this counted it with haiku and marked the
+    result exact -- the defect this function exists to close, arrived at by
+    being helpful. Anything the loader will treat as a model name is sent as
+    the model name. If the endpoint will not serve it the row simply fails to
+    count and is estimated, which is the safe direction.
+
+    Not normalised either. `_normalised` strips a snapshot date, and the dated
+    id is what the row says was sent and what the endpoint accepts; the same
+    string goes into the payload and into the cache key, so the two cannot
+    disagree about which tokenizer answered.
+
     Bound per row rather than read inside `count`, because `prefix_cuts`
     rebuilds each cut out of tools/system/messages alone -- the cut it hands the
     counter does not carry the row's model, so the caller has to say.
-
-    `force` wins when set, for a gateway that will not accept the model ids the
-    export happens to contain. `fallback` is for rows that name no model at all.
     """
-    if force:
-        return force
-    m = body.get("model") if isinstance(body, dict) else None
-    return m.strip() if isinstance(m, str) and m.strip() else fallback
+    def named(d):
+        return _text(_first(d, "model")) if isinstance(d, dict) else None
+
+    return named(body) or named(row) or fallback
 
 
 def counter(model: str, key: str, stats: dict, endpoint: str = DEFAULT_ENDPOINT,
@@ -122,16 +164,22 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("path", help="JSONL export of logged request bodies")
     p.add_argument("-o", "--out", required=True, help="where to write the enriched export")
+    # Deliberately no flag that forces one tokenizer across the export. One was
+    # added here and removed on review, and the review was right: forcing a
+    # model produces counts that are wrong *and* load as exact, because nothing
+    # in the output marks which tokenizer answered for which row. That is the
+    # defect this script was changed to close, behind a flag.
+    #
+    # A row whose model a gateway will not accept therefore fails to count. It
+    # is written without `segment_tokens`, the analyzer estimates it by byte
+    # share, and it is not treated as exact. A stated estimate beats a confident
+    # wrong number, which is the premise the whole tool is sold on.
     p.add_argument("--model", default="claude-haiku-4-5",
-                   help="fallback tokenizer, used only for rows whose body names "
-                        "no model (default: claude-haiku-4-5). Every other row is "
-                        "counted with the model it names, so a mixed export is "
-                        "counted by each of its models rather than by one")
-    p.add_argument("--force-model",
-                   help="count every row with this model's tokenizer, ignoring the "
-                        "model each row names. For a gateway that does not accept "
-                        "the model ids in the export. The counts are then that "
-                        "model's, for every row, and are cached under it")
+                   help="fallback tokenizer, used only for rows that name no "
+                        "model at all (default: claude-haiku-4-5). Every other "
+                        "row is counted with the model it names, so a mixed "
+                        "export is counted by each of its models rather than by "
+                        "one. There is no flag to override a row that names one")
     p.add_argument("--cache", help="cache file to read and write (default: <out>.cache.json)")
     p.add_argument("--allow-partial", action="store_true",
                    help="write the output and exit 0 even when some rows could "
@@ -245,7 +293,7 @@ def main() -> int:
                     skipped += 1
                     continue
                 counter_id, count = counter_for(
-                    row_model(body, args.model, args.force_model))
+                    row_model(row, body, args.model))
                 try:
                     row["segment_tokens"] = count_segments(body, count, cache,
                                                       counter_id)
@@ -314,8 +362,7 @@ def main() -> int:
         # run's own output where an operator reading a mixed export can see it
         # was counted by more than one -- and where a single unexpected name
         # says the rows were not carrying the model anyone thought they were.
-        print(f"  models    {', '.join(sorted(counters)) or 'none'}"
-              + (" (forced)" if args.force_model else ""))
+        print(f"  models    {', '.join(sorted(counters)) or 'none'}")
         print(f"  wrote     {out_path}")
         print(f"  cache     {cache_path} (re-runs are free)")
         if partial and not args.allow_partial:
