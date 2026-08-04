@@ -696,94 +696,108 @@ class TestPerModelLifetimeNarrowingCannotBeSilentlyDropped(unittest.TestCase):
     treating a rejected lifetime as available. A schema drift or a careless
     edit re-enables it with nothing watching.
 
-    So the narrowing is pinned here rather than alerted on at runtime. The
-    table records the *effect*, not the mechanism, which is what makes this
-    non-circular: a test that discovered "rows that narrow" by looking for
-    narrowing would go green the moment the narrowing disappeared.
+    So the narrowing is pinned here rather than alerted on at runtime, and
+    pinned as a set of *effects* -- `(target, model, lifetime)` triples the
+    registry withholds -- compared for equality against what the shipped rows
+    actually produce.
+
+    Equality, not containment, and against effects rather than row ids. The
+    first version of this class registered *targets*: it asked which rows
+    carry a narrowing map and whether each was in the table. That treated a
+    row already in the table as fully covered, so `amazon-bedrock/converse`
+    could grow a second narrowed lifetime -- a surface-wide 30m the map
+    withholds, say -- and nothing would require the expectation to change.
+    Drift inside a registered row was silent, which is the same mistake as
+    checking the mechanism instead of the effect, one level in.
     """
 
-    # target -> (lifetimes the surface lists that are NOT available to every
-    #            model, the models that do get them).
+    # target -> {lifetime the surface lists: models that actually get it}.
     #
     # Source: `amazon-bedrock/converse`'s own provenance note -- 1h went GA on
     # 2026-01-26 for these three models only. Everything else on that surface
     # falls to the map's `_default` of 5m.
+    #
+    # Written per lifetime rather than per model so that adding a model to the
+    # rate card changes both sides of the comparison identically and does not
+    # need an edit here; adding or removing a *narrowing* changes only the
+    # derived side and does.
     NARROWED = {
-        "amazon-bedrock/converse": (
-            {"1h"},
-            {"claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5"},
-        ),
+        "amazon-bedrock/converse": {
+            "1h": {"claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5"},
+        },
     }
 
     def _priced_models(self):
         from cacheeconomics import registry
         return sorted(registry.pricing()["models"])
 
-    def test_the_table_is_not_vacuous(self):
-        self.assertTrue(self.NARROWED)
-        self.assertTrue(self._priced_models())
+    def _expected_effects(self):
+        """`(target, model, lifetime)` this class says the registry withholds."""
+        out = set()
+        for target, per_ttl in self.NARROWED.items():
+            for ttl, allowed in per_ttl.items():
+                for model in self._priced_models():
+                    if model not in allowed:
+                        out.add((target, model, ttl))
+        return out
 
-    def test_a_narrowed_model_is_not_offered_the_withheld_lifetime(self):
-        """The enforcement half. Deleting the map fails here."""
+    def _actual_effects(self):
+        """The same triples, derived from the shipped registry."""
         from cacheeconomics import registry
-        leaked = []
-        for target, (withheld, allowed) in self.NARROWED.items():
-            surface = set(registry.supported_ttls(target))
-            self.assertTrue(
-                withheld <= surface,
-                f"{target} no longer lists {withheld} surface-wide, so this "
-                f"entry describes a narrowing that cannot happen")
-            for model in self._priced_models():
-                if model in allowed:
-                    continue
-                offered = set(registry.supported_ttls(target, model))
-                for ttl in withheld & offered:
-                    leaked.append(f"{target}+{model} offered {ttl}")
-        self.assertEqual(
-            [], sorted(leaked),
-            "the per-model narrowing is gone, so these models are being "
-            "offered a lifetime the surface does not support for them. Every "
-            "reader of `supported_ttls` -- the allocator, the tier planner and "
-            "RT-TTL's recommendation -- will now treat it as available:\n    "
-            + "\n    ".join(sorted(leaked)))
-
-    def test_the_models_that_do_have_it_still_do(self):
-        """The other direction, so the fix for the above cannot be to withhold
-        the lifetime from everybody."""
-        from cacheeconomics import registry
-        for target, (withheld, allowed) in self.NARROWED.items():
-            for model in sorted(allowed):
-                with self.subTest(target=target, model=model):
-                    offered = set(registry.supported_ttls(target, model))
-                    self.assertTrue(
-                        withheld <= offered,
-                        f"{target}+{model} lost {withheld - offered}")
-
-    def test_every_row_that_narrows_is_registered_here(self):
-        """The sync half, so a narrowing added tomorrow is protected without
-        anyone remembering this class exists. Same shape as
-        `test_the_round_trip_table_covers_every_state_carrying_slot`: the
-        members are found at runtime, the expectations are written down."""
-        from cacheeconomics import registry
-        unregistered = []
+        out = set()
         for row in registry.providers()["targets"]:
-            caps = row.get("capabilities") or {}
-            by_model = caps.get("supported_ttls_by_model")
-            if not isinstance(by_model, dict):
+            target = row["id"]
+            try:
+                surface = set(registry.supported_ttls(
+                    target, allow_contested=True))
+            except registry.RegistryError:
                 continue
-            surface = set(caps.get("supported_ttls") or [])
-            narrows = any(
-                surface - set(allowed)
-                for name, allowed in by_model.items()
-                if not name.startswith("_comment")
-                and isinstance(allowed, list))
-            if narrows and row["id"] not in self.NARROWED:
-                unregistered.append(row["id"])
+            for model in self._priced_models():
+                try:
+                    offered = set(registry.supported_ttls(
+                        target, model, allow_contested=True))
+                except registry.RegistryError:
+                    continue
+                for ttl in surface - offered:
+                    out.add((target, model, ttl))
+        return out
+
+    def test_the_table_is_not_vacuous(self):
+        self.assertTrue(self._priced_models())
+        self.assertTrue(self._expected_effects(),
+                        "no narrowing expected, so the comparison below would "
+                        "pass by describing nothing")
+
+    def test_the_registry_withholds_exactly_what_is_pinned_here(self):
+        """Enforcement and sync in one assertion, because they are one fact.
+
+        Deleting the map drops triples from the derived side. Narrowing a new
+        lifetime, on this row or any other, adds triples the table does not
+        claim. Widening a model that should be narrowed does the first;
+        withholding from a model that should have it does the second. All four
+        land here.
+        """
+        expected, actual = self._expected_effects(), self._actual_effects()
         self.assertEqual(
-            [], sorted(unregistered),
-            "these rows narrow a lifetime per model with nothing pinning it, "
-            "so deleting the map would widen them silently: "
-            + ", ".join(sorted(unregistered)))
+            expected, actual,
+            "the per-model lifetime narrowing the registry performs is not "
+            "what is pinned here.\n"
+            "  no longer withheld (a reader will now treat these as "
+            "available): " + repr(sorted(expected - actual)) + "\n"
+            "  newly withheld (real, but nothing pins it, so deleting the map "
+            "would widen it silently): " + repr(sorted(actual - expected)))
+
+    def test_a_named_model_still_gets_the_lifetime(self):
+        """Spelled out separately so the equality above cannot be satisfied by
+        withholding the lifetime from everybody."""
+        from cacheeconomics import registry
+        for target, per_ttl in self.NARROWED.items():
+            for ttl, allowed in per_ttl.items():
+                for model in sorted(allowed):
+                    with self.subTest(target=target, model=model, ttl=ttl):
+                        self.assertIn(
+                            ttl, registry.supported_ttls(target, model),
+                            f"{target}+{model} lost {ttl}")
 
 
 class TestAnUnknownCacheLifetimeIsNotFree(unittest.TestCase):

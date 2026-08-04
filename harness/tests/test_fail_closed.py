@@ -596,16 +596,35 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         sufficient one. A `_pre_call` that performs the lookup, discards it and
         deletes the `marker_count` comparison satisfies all of them.
 
-        So the assertion is behavioural and the surface is the lever. The spy
-        answers the post-patch recheck with a budget of 1 -- but only when the
-        recheck asks about the resolved surface -- while `_decide` and the
-        runtime monitor keep seeing Vertex's real budget of 4. The prompt is
-        shaped so the allocator places 2 markers, which is over that budget of
-        1 and under the real one. A veto is then the only way the returned body
-        can come back unmarked, and a veto requires the recheck to read the
-        budget, read it *for the resolved surface*, and compare it against what
-        was patched. Remove any one of those three and the body comes back
-        carrying its markers.
+        The fifth was behavioural but only proved the body came back unmarked
+        *under* a forced budget, so an implementation that vetoed whenever this
+        recheck ran -- without ever comparing -- passed while also suppressing
+        perfectly legal requests.
+
+        The obvious repair, one budget per surface seen by every call site, was
+        tried and does not isolate this guard. `_decide` enforces the same
+        predicate earlier against its own view of the body, so lowering the
+        budget everywhere makes `_decide` refuse first and the post-patch
+        recheck is never the cause of anything. Measured: with a uniform Vertex
+        budget of 1, deleting this recheck's enforcement entirely still left
+        the body unmarked and the test green. On correct code the two sites
+        count the same number -- verified, `_decide` and `_pre_call` both see 2
+        -- so there is no body that is legal at one and illegal at the other
+        without changing what one of them is told.
+
+        So the budget is answered only for this call site, and the *body* is
+        what varies. Same forced budget, two prompts, opposite required
+        outcomes:
+
+          one stable block  -> 1 marker placed, budget 1, body KEEPS it
+          two stable blocks -> 2 markers placed, budget 1, body comes back EMPTY
+
+        That pair is what makes the veto prove it is a function of
+        `marker_count(patched)`. A recheck that vetoes unconditionally fails
+        the first. One that never compares fails the second. One pinned to the
+        handler's `anthropic/direct` default fails the second too, because that
+        surface is left at its real budget of 4 and shows headroom the resolved
+        surface does not have.
         """
         import asyncio
         import os
@@ -616,7 +635,7 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         from cacheeconomics.plugin import CachePlugin, litellm_handler
         from cacheeconomics.segment import marker_count
 
-        # The function that holds the post-patch recheck. Named rather than
+        # The function holding the post-patch recheck. Named rather than
         # line-numbered so ordinary edits to plugin.py do not move it, and so a
         # rename fails loudly here instead of quietly matching nothing.
         RECHECK_SITE = ("plugin.py", "_pre_call")
@@ -624,21 +643,25 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         t0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
         real = registry.capability
 
-        def drive(budget_at_recheck=None):
-            """Returns the marker count on the body the hook handed back."""
+        def drive(blocks, recheck_budget=None):
+            """Returns the marker count on the body the hook handed back.
+
+            `blocks` is how many stable sections the prompt carries, which is
+            how many markers the allocator places. That is the variable the
+            assertions turn on; the budget is held constant across the pair.
+            """
             def spy(target_id, name, *a, **kw):
                 value = real(target_id, name, *a, **kw)
-                if name != "max_breakpoints" or budget_at_recheck is None:
+                if name != "max_breakpoints" or recheck_budget is None:
                     return value
                 frame = _sys._getframe(1)
                 site = (os.path.basename(frame.f_code.co_filename),
                         frame.f_code.co_name)
-                # Only the recheck, and only when it asks about the surface the
-                # request actually resolved to. A recheck pinned to the
-                # handler's `anthropic/direct` default falls through to the
-                # real budget of 4 and never vetoes.
+                # Only this guard, and only when it asks about the surface the
+                # request resolved to. Pinned to `anthropic/direct` it falls
+                # through to that surface's real budget of 4 and never vetoes.
                 if site == RECHECK_SITE and target_id == RESOLVED:
-                    return budget_at_recheck
+                    return recheck_budget
                 return value
 
             p = CachePlugin(key=b"k" * 32, warmup=4)
@@ -662,17 +685,16 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
             async def go():
                 nonlocal out
                 for i in range(24):
+                    msgs = [{"role": "system", "content": "policy " * 4000}]
+                    if blocks == 2:
+                        msgs.append({"role": "system",
+                                     "content": "tool docs " * 4000})
+                    msgs.append({"role": "user", "content": f"t{i}"})
                     data = {"model": "claude-opus-5",
                             "litellm_call_id": f"c{i}",
                             "metadata": {"session_id": "conv"},
                             "custom_llm_provider": "vertex_ai",
-                            # Two stable blocks, so the allocator has two
-                            # markers to place and a budget of 1 is breachable.
-                            "messages": [
-                                {"role": "system", "content": "policy " * 4000},
-                                {"role": "system",
-                                 "content": "tool docs " * 4000},
-                                {"role": "user", "content": f"t{i}"}]}
+                            "messages": msgs}
                     out = await h.async_pre_call_hook(None, None, data,
                                                       "completion")
 
@@ -683,14 +705,36 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
                 registry.capability = real
             return marker_count(out)
 
-        # Control. Without it the veto below could pass because nothing was
-        # ever placed, which is the vacuity three earlier versions shipped.
-        placed = drive()
-        self.assertGreater(placed, 1,
-                           "the allocator placed nothing to breach a budget "
-                           "with, so the veto assertion would be vacuous")
+        # Control, on the registry exactly as it ships. Both halves of the pair
+        # below rest on these counts being 1 and 2; if the allocator's
+        # behaviour moves, the pair stops straddling the budget and proves
+        # nothing, which is the vacuity three earlier versions shipped.
+        # It is also itself a within-budget case -- two markers against
+        # Vertex's real budget of four -- so a guard that strips
+        # unconditionally lands here rather than on the pair.
         self.assertEqual(
-            0, drive(budget_at_recheck=1),
+            (1, 2), (drive(blocks=1), drive(blocks=2)),
+            "on the shipped registry a one-block prompt must come back with "
+            "one marker and a two-block prompt with two. Either the allocator "
+            "stopped placing them, or something stripped a body that is well "
+            "inside Vertex's real budget of four; the pair below assumes both "
+            "counts and a budget of 1 sitting between them")
+
+        # Same budget, legal body: the guard has to leave it alone. Fails if
+        # the recheck vetoes whenever it runs, or on the budget merely being
+        # small, rather than on the comparison.
+        self.assertEqual(
+            1, drive(blocks=1, recheck_budget=1),
+            "a patched body inside the surface's breakpoint budget was "
+            "stripped anyway. The recheck must veto on what was patched "
+            "exceeding the budget, not on having run at all.")
+
+        # Same budget, illegal body: the guard has to fire. Fails if the
+        # recheck never compares, or compares against the handler's default
+        # surface -- `anthropic/direct` still answers 4 here, so a pinned
+        # literal sees headroom the resolved surface does not have.
+        self.assertEqual(
+            0, drive(blocks=2, recheck_budget=1),
             "the patched body went out carrying more markers than the resolved "
             "surface allows. The post-patch recheck must read the budget for "
             "the surface the request resolved to and veto the patch when the "
