@@ -1060,11 +1060,26 @@ class TestCoverageThatGatesMoneyIsWeightedByMoney(unittest.TestCase):
 
     def test_small_unstructured_rows_do_not_over_block(self):
         """Immaterial dark rows must still release. Refusing on any unstructured
-        row at all would make the gate useless on real exports."""
+        row at all would make the gate useless on real exports.
+
+        `avoidable_usd_window`: these thirty requests span an hour, so the
+        monthly figure is withheld by the projection floor whatever the billed
+        coverage is. The window figure is what this gate decides.
+        """
         ts = self._trace(100)
         self.assertGreaterEqual(ts.structural_coverage_billed, 0.90)
         a = analyze(ts, allow_unreconciled=True)
-        self.assertTrue(self._vol(a).avoidable_usd_month.released)
+        self.assertTrue(self._vol(a).avoidable_usd_window.released)
+
+    def test_a_dominant_unstructured_row_withholds_the_window_figure_too(self):
+        """The pair to the test above. The report falls back to the window
+        figure exactly where the monthly one is missing, so a gate that reached
+        only the monthly figure would put the withheld amount back on the page
+        under a different label."""
+        a = analyze(self._trace(3_000_000), allow_unreconciled=True)
+        self.assertFalse(self._vol(a).avoidable_usd_window.released)
+        self.assertIn("billed input tokens",
+                      self._vol(a).avoidable_usd_window.withheld_because)
 
     def test_alignment_is_weighted_by_billed_tokens_too(self):
         from cacheeconomics.adapters.bodies import score_alignment
@@ -1771,13 +1786,22 @@ class TestStructuralMoneyNeedsCountedTokens(unittest.TestCase):
         return next((f for f in a.findings if f.code == "VOL-1"), None)
 
     def test_estimated_tokens_carry_no_dollar_figure(self):
-        fig = self._vol(self._trace(tokens_counted=0.0)).avoidable_usd_month
-        self.assertFalse(fig.released)
-        self.assertIn("19.2%", fig.withheld_because)
+        v = self._vol(self._trace(tokens_counted=0.0))
+        for name in ("avoidable_usd_month", "avoidable_usd_window"):
+            with self.subTest(figure=name):
+                # Both, not just the monthly one. The report falls back to the
+                # window figure wherever the monthly one is missing, so a gate
+                # reaching one of them would print the amount it refused.
+                fig = getattr(v, name)
+                self.assertFalse(fig.released)
+                self.assertIn("19.2%", fig.withheld_because)
 
     def test_counted_tokens_do(self):
+        """`avoidable_usd_window`: this fixture is forty requests two minutes
+        apart, so its monthly figure is withheld by the projection floor however
+        the tokens were sized. The window figure is what counting gates."""
         self.assertTrue(self._vol(self._trace(tokens_counted=1.0))
-                        .avoidable_usd_month.released)
+                        .avoidable_usd_window.released)
 
     def test_the_finding_still_reports_without_the_figure(self):
         """Withholding the number must not withhold the diagnosis. The volatile
@@ -1942,6 +1966,14 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
         self.assertLess(len(brief), len(full),
                         "--detail added nothing, so the default hid nothing")
 
+    # Any amount the money column can print, as one pattern. Written against
+    # the column rather than against `/mo` alone: this fixture runs 78 minutes,
+    # so the projection floor withholds every monthly figure on it and a check
+    # spelled `~\$[\d,]+/mo` went vacuous the moment that floor reached the
+    # per-finding figures -- it stopped finding an amount, and its own guard is
+    # the only reason that was visible rather than silent.
+    ANY_AMOUNT = r"~\$[\d,]+(?:\.\d+)?/(?:mo|window)"
+
     def test_the_money_column_never_shows_a_number_the_gate_withheld(self):
         """The table is a new surface for a figure to escape through. It reads
         each Figure's own release state, so this checks the wiring rather than
@@ -1950,13 +1982,34 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
 
         from cacheeconomics.report import render_text
         released = self._analysis()
-        self.assertRegex(render_text(released), r"~\$[\d,]+/mo",
+        self.assertRegex(render_text(released), self.ANY_AMOUNT,
                          "fixture produces no amounts, so the check is vacuous")
 
         gated = self._gated()
         self.assertFalse(any(f.avoidable_usd_month and f.avoidable_usd_month.released
                              for f in gated.findings))
-        self.assertIsNone(re.search(r"~\$[\d,]+/mo", render_text(gated)))
+        self.assertFalse(any(f.avoidable_usd_window and f.avoidable_usd_window.released
+                             for f in gated.findings))
+        self.assertIsNone(re.search(self.ANY_AMOUNT, render_text(gated)))
+
+    def test_the_column_prints_the_window_amount_when_the_month_is_withheld(self):
+        """What the released run above is actually showing, named rather than
+        left to a regex alternation.
+
+        Without this the migration of that pattern reads as loosening it. The
+        claim is specific: this fixture reconciles, its monthly figures are
+        withheld because 78 minutes cannot be scaled to a month, and the amount
+        the window *did* support is printed instead of nothing at all.
+        """
+        from cacheeconomics.report import render_text
+        a = self._analysis()
+        eff = next(f for f in a.findings if f.code == "EFF-1")
+        self.assertFalse(eff.avoidable_usd_month.released,
+                         "fixture no longer sits below the projection floor")
+        self.assertTrue(eff.avoidable_usd_window.released)
+        out = render_text(a)
+        self.assertIn(f"~{eff.avoidable_usd_window}/window", out)
+        self.assertNotIn("/mo", out)
 
     def _gated(self):
         """The same analysis with the gate left on."""

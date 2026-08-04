@@ -1457,18 +1457,28 @@ class TestAnInvoiceDoesNotUnderwriteAProjection(unittest.TestCase):
         self.assertNotIn("reconcil", why.lower())
 
     def test_the_reason_says_what_it_did_not_withhold(self):
-        """`_monthly` has seven callers and this gates one. The note said
-        "monthly figures need at least 1 day", which reads as all of them —
-        while six per-finding monthly figures are ungated and can print below
-        it. Overstating what was protected is worse than gating nothing,
-        because the reader stops looking."""
+        """The reason has to describe the code, in both directions.
+
+        It used to end "...and any per-finding monthly figure below rests on the
+        same extrapolation and has not been gated by it", which was an accurate
+        confession while `_monthly` had seven callers and this floor gated one
+        of them. It gates all seven now, so that sentence became a false
+        confession -- a reader is sent hunting for a leak that no longer exists,
+        and the next person to read it concludes the gate is narrower than it
+        is. Overstating and understating what was protected are the same defect
+        pointed opposite ways.
+
+        What has to stay true is that the reason names both halves: what is
+        withheld (every monthly figure) and what is not (the measured window).
+        """
         from cacheeconomics.analyzer import _projection_supported
         for window, n in ((0.04, 12), (3.0, 2)):
             with self.subTest(window=window, requests=n):
                 ok, why = _projection_supported(window, n)
                 self.assertFalse(ok)
-                self.assertIn("monthly spend total", why)
-                self.assertIn("has not been gated by it", why)
+                self.assertIn("every monthly figure", why)
+                self.assertIn("observed window still publish", why)
+                self.assertNotIn("has not been gated", why)
 
     def test_a_supported_window_carries_no_reason_at_all(self):
         from cacheeconomics.analyzer import _projection_supported
@@ -1489,6 +1499,113 @@ class TestAnInvoiceDoesNotUnderwriteAProjection(unittest.TestCase):
         ok, _ = _projection_supported(a.window_days, len(ts.requests))
         self.assertTrue(ok, f"demo window {a.window_days:.2f}d is below the floor")
         self.assertTrue(a.spend["monthly_input_usd"].released)
+
+
+class TestTheProjectionFloorReachesEveryProjectedFigure(unittest.TestCase):
+    """The floor above gated the spend total and nothing else.
+
+    Measured on this fixture before the gate was widened: two requests one
+    minute apart, with an invoice reconciling to 0.0%, published
+    `findings[0].avoidable_usd_month` = $180 marked `released_as='reconciled'`,
+    directly below a `monthly_input_usd` withheld for being an extrapolation the
+    window could not support. Same window, same 30/window multiplier, one gate
+    between them -- and the ungated figure was the one a client reads first.
+
+    The figures are found by walking the analysis rather than by naming
+    `findings[0]`. Naming the member I had just fixed is how the previous
+    version of this claim came to be false: the test asserted the edit and the
+    commit message asserted the class.
+    """
+
+    def _analysis(self):
+        """Two minutes of traffic against an invoice that reconciles exactly.
+
+        Synthetic. Both halves are load-bearing: the window has to be far below
+        the floor, and the invoice has to *pass*, or every figure is withheld
+        for an unrelated reason and the leak cannot be seen at all.
+        """
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(seconds=60 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 0,
+                               "cache_creation_input_tokens": 100_000,
+                               "cache_read_input_tokens": 0},
+                        segments=[])
+                for i in range(2)]
+        ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY)
+        spend = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return analyze(ts, invoice_usd=spend)
+
+    def _figures(self, a):
+        """Every Figure the analysis exposes, as `(path, figure)`.
+
+        Discovery by field list and by property, not by name: `spend` is a dict,
+        a finding's figures are whichever of its fields hold one, and
+        `total_avoidable_month` is a property that a `dataclasses.fields()` walk
+        skips entirely -- which is how the single most client-facing number in
+        the package would have gone unchecked here.
+        """
+        import dataclasses
+        from cacheeconomics.money import Figure
+        out = [(f"spend[{k!r}]", v) for k, v in a.spend.items()
+               if isinstance(v, Figure)]
+        out += [(f"reconciliation[{k!r}]", v)
+                for k, v in (a.reconciliation or {}).items()
+                if isinstance(v, Figure)]
+        for i, finding in enumerate(a.findings):
+            out += [(f"findings[{i}].{fld.name}", getattr(finding, fld.name))
+                    for fld in dataclasses.fields(finding)
+                    if isinstance(getattr(finding, fld.name), Figure)]
+        for name, attr in vars(type(a)).items():
+            if isinstance(attr, property) and isinstance(getattr(a, name), Figure):
+                out.append((name, getattr(a, name)))
+        return out
+
+    def test_the_fixture_reproduces_the_conditions(self):
+        """Guard the guard. An invoice that failed, or a window that cleared the
+        floor, and every assertion below passes for the wrong reason."""
+        a = self._analysis()
+        self.assertLess(a.window_days, 1.0)
+        self.assertEqual(a.reconciliation["delta_pct"], 0.0)
+        self.assertTrue(a.reconciliation["within_ship_gate"])
+
+    def test_there_are_projected_figures_to_check(self):
+        a = self._analysis()
+        self.assertTrue([p for p, f in self._figures(a) if f.projected],
+                        "no projected figures found; the check below would pass "
+                        "while examining nothing")
+
+    def test_no_projected_figure_is_released_below_the_floor(self):
+        a = self._analysis()
+        leaked = [(p, f) for p, f in self._figures(a) if f.projected and f.released]
+        self.assertEqual(
+            [], leaked,
+            "extrapolated past a window that cannot support it:\n" +
+            "\n".join(f"    {p} = {f} (released_as={f.released_as})"
+                      for p, f in leaked))
+
+    def test_the_measured_window_figures_still_publish(self):
+        """The other direction, and the reason this is two fields rather than
+        one gate. Withholding everything would also pass the test above, and
+        would throw away exactly what the invoice does prove."""
+        a = self._analysis()
+        published = [p for p, f in self._figures(a) if f.released]
+        self.assertIn("spend['input_usd']", published)
+        self.assertTrue(
+            [p for p in published if p.endswith(".avoidable_usd_window")],
+            "no finding published its window amount, so the floor is "
+            "withholding the measurement as well as the projection")
+
+    def test_the_withheld_reason_names_the_window_not_the_invoice(self):
+        """This reader supplied a correct invoice. Telling them reconciliation
+        failed sends them to fix something that is not broken."""
+        a = self._analysis()
+        for path, fig in self._figures(a):
+            if fig.projected and not fig.released:
+                with self.subTest(figure=path):
+                    self.assertIn("day of traffic", fig.withheld_because)
+                    self.assertNotIn("reconcil", fig.withheld_because.lower())
 
 
 class TestSilenceUnderAnUnnamedSurfaceIsSpokenAloud(unittest.TestCase):

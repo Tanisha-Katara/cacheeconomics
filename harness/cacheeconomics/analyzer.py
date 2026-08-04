@@ -11,7 +11,7 @@ supports and no more, and every figure carries its evidence class.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 
 from . import cost, money, registry
@@ -76,6 +76,19 @@ class Finding:
     detail: str
     affected_requests: int
     avoidable_usd_month: money.Figure | None = None
+    # The same claim over the window that was actually observed, never
+    # extrapolated. Two fields because they are two claims with two different
+    # burdens of proof: this one needs the reconciliation gate, the monthly one
+    # needs that *and* a window long enough to scale from. With only the monthly
+    # field, gating the projection threw away a measurement the trace fully
+    # supported, so the projection floor was left off the per-finding figures
+    # entirely and a one-hour trace published $180/mo as `reconciled`.
+    #
+    # Declared after `avoidable_usd_month` rather than beside the amount it
+    # belongs with, because the positional order of this dataclass is part of
+    # its interface and a caller passing the seventh argument means the monthly
+    # figure. Inserting ahead of it would have silently rebound that argument.
+    avoidable_usd_window: money.Figure | None = None
     confidence: str = "medium"
     quality_risk: str = "low"
     fix: str = ""
@@ -117,11 +130,18 @@ class Finding:
         figure is marked the same way the totals are. Releasing the spend map
         as DRAFT and leaving every finding saying RECONCILED would put both
         states in one report -- the same fix-one-site-leave-the-rest shape this
-        distinction exists to expose."""
-        if self.avoidable_usd_month is None:
-            return self
-        return replace(self, avoidable_usd_month=self.avoidable_usd_month.release(
-            ok, because, as_=as_))
+        distinction exists to expose.
+
+        Every Figure on the finding, discovered from the field list rather than
+        named. Naming `avoidable_usd_month` here is what would have left
+        `avoidable_usd_window` released on a failed reconciliation the day it
+        was added -- a second field threaded through some of the paths that
+        carry the first, which is this package's most-repeated defect.
+        """
+        figures = {f.name: getattr(self, f.name).release(ok, because, as_=as_)
+                   for f in fields(self)
+                   if isinstance(getattr(self, f.name), money.Figure)}
+        return replace(self, **figures) if figures else self
 
 
 @dataclass
@@ -289,6 +309,23 @@ PROJECTION_MIN_DAYS = 1.0
 PROJECTION_MIN_REQUESTS = 10
 
 
+# What this floor does and does not withhold, said once because it is appended
+# to both reasons below and because the previous version of this sentence
+# described the code as it was *not*: it said any per-finding monthly figure
+# "has not been gated by it", which was true and is now false. A reason string
+# that overstates what was protected is bad; one that understates it sends a
+# reader hunting for a leak that no longer exists.
+#
+# The word "reconciled" is deliberately not in it, and a test asserts that:
+# this reader supplied a correct invoice, and any mention of reconciliation in
+# the refusal sends them to fix something that is not broken.
+_PROJECTION_SCOPE = (
+    "This withholds every monthly figure -- the spend total and each finding's. "
+    "Nothing measured over the window itself is affected: measured spend and "
+    "each finding's avoidable amount over the observed window still publish, "
+    "because the invoice does establish those.")
+
+
 def _projection_supported(window_days, n_requests) -> tuple[bool, str]:
     """May a per-month figure be published from this window?"""
     if not window_days or window_days < PROJECTION_MIN_DAYS:
@@ -298,17 +335,13 @@ def _projection_supported(window_days, n_requests) -> tuple[bool, str]:
             f"traffic and this trace covers {got}. Agent workloads have a daily "
             f"cycle, so a shorter sample cannot be scaled to a month -- an "
             f"invoice proves the measured subtotal, not that the window is "
-            f"typical. This withholds the monthly spend total; measured spend "
-            f"is unaffected, and any per-finding monthly figure below rests on "
-            f"the same extrapolation and has not been gated by it.")
+            f"typical. " + _PROJECTION_SCOPE)
     if n_requests < PROJECTION_MIN_REQUESTS:
         return False, (
             f"monthly figures need at least {PROJECTION_MIN_REQUESTS} requests "
             f"and this trace has {n_requests}. Below that a single request moves "
             f"the projected total more than the rest of the trace combined. "
-            f"This withholds the monthly spend total; measured spend is "
-            f"unaffected, and any per-finding monthly figure below rests on the "
-            f"same extrapolation and has not been gated by it.")
+            + _PROJECTION_SCOPE)
     return True, ""
 
 
@@ -329,6 +362,53 @@ def _monthly(amount: float, window_days: float | None) -> money.Figure | None:
     return money.Figure(amount * (30.0 / window_days), money.MODELED,
                         released=False, withheld_because="not yet reconciled",
                         projected=True)
+
+
+def _withhold_projection(fig, why: str):
+    """Withhold an extrapolation the observed window cannot support.
+
+    One function because it is applied in two places -- the spend total and
+    every per-finding monthly figure -- and a rule enforced twice is a rule that
+    has already started to diverge somewhere else in this file.
+
+    It only ever downgrades a figure that is *released*. A figure already
+    withheld carries a reason somebody can act on -- segment sizes that
+    disagree with the bill, an invoice outside the gate -- and
+    `release(False, because)` replaces that reason with this one. Both refusals
+    are true and this is the weaker of the two: "this cannot be scaled to a
+    month" tells nothing further to a reader who has just been told the
+    underlying number does not tie to the bill.
+    """
+    return fig.release(False, why) if fig is not None and fig.released else fig
+
+
+def _avoidable(amount: float | None, window_days: float | None) -> dict:
+    """Both halves of a finding's dollar claim, built at one site.
+
+    Returned as kwargs so a rule cannot supply one and forget the other. Every
+    rule that priced something used to write `avoidable_usd_month=_monthly(...)`
+    by hand, and a per-rule pair of hand-written fields is how the two would
+    come to disagree about the same arithmetic.
+
+    `amount is None` means the rule declined to price this finding -- VOL-1 when
+    a second blocker makes the move recover nothing, TTL-1 when the trace
+    carries no segment identity. Both figures are absent then, which is what
+    "not costed" means in the report.
+
+    The window figure is deliberately not `projected`: it is the amount over the
+    window that was observed, so there is no extrapolation in it for the
+    projection floor to gate. It carries MODELED because it is still a
+    counterfactual -- what the workload would not have spent under a different
+    configuration -- and no counterfactual was run.
+    """
+    if amount is None:
+        return {"avoidable_usd_window": None, "avoidable_usd_month": None}
+    return {
+        "avoidable_usd_window": money.Figure(
+            amount, money.MODELED, released=False,
+            withheld_because="not yet reconciled"),
+        "avoidable_usd_month": _monthly(amount, window_days),
+    }
 
 
 # --- diagnosis rules -------------------------------------------------------
@@ -410,7 +490,7 @@ def _f_prefix_efficiency(reqs, ratios, window, rate_for) -> Finding | None:
                 + (f" {unprovable} request(s) had writes of unprovable lifetime and are "
                    f"excluded from the figure." if unprovable else "")),
         affected_requests=sum(1 for r in reqs if write_tokens(r.usage)),
-        avoidable_usd_month=_monthly(wasted, window),
+        **_avoidable(wasted, window),
         confidence="high", quality_risk="low",
         fix="Find what invalidates the prefix between requests before changing any TTL. "
             "A longer lifetime on an unstable prefix buys nothing.")
@@ -590,7 +670,7 @@ def _f_volatile_prefix(reqs, ratios, window, rate_for) -> Finding | None:
         # No figure when a second blocker means this move recovers nothing on
         # its own. The observation stands; the arithmetic for the full move set
         # is not something this rule models.
-        avoidable_usd_month=None if stuck else _monthly(wasted, window),
+        **_avoidable(None if stuck else wasted, window),
         confidence="medium" if stuck else "high", quality_risk="medium",
         fix=("Move that segment after the last breakpoint. Where it carries operator "
              "authority, a mid-conversation system message preserves that while keeping "
@@ -834,8 +914,37 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                                           _minimum):
                         match = (prev_at, prev_tokens)
                         break
+                # The share of this request's write that each span accounts for,
+                # not the whole write against every one of them.
+                #
+                # A request with nested markers writes one billed total covering
+                # its outermost span, and this list is what a *later* request
+                # matches against. Storing `tokens` on every entry meant a match
+                # on an inner span was credited with the outer span's write --
+                # and that is the common case rather than a corner one, because
+                # the lookback window rejects the outer marker of a request that
+                # has since appended a few turns, leaving the inner one to match.
+                #
+                # Measured on a synthetic ten-request trace with a 50k inner
+                # marker inside a 100k outer one, ten minutes apart, appending 22
+                # blocks a turn past a recorded lookback of 20: $4.80 recoverable
+                # over the window against $2.21 once each span carries only its
+                # own share. The rule was crediting a one-hour lifetime with
+                # converting a write it never made.
+                #
+                # Proportional to the segment estimate, applied to the billed
+                # figure -- not the segment estimate itself. The estimate is a
+                # split of the billed total, not a second opinion on it, and
+                # substituting it cut a fixture writing 200,000 tokens down to
+                # its 7,000-token segment sum and silenced the rule entirely. A
+                # ratio of two estimates is scale-invariant, so it survives an
+                # estimate that is uniformly wrong, and it is exactly 1.0 for a
+                # single marker -- which is why every existing figure is
+                # unchanged.
+                outermost_tokens = spans[-1][1] or 0
                 for span in spans:
-                    earlier.append((sent_at, span, tokens))
+                    share = (span[1] / outermost_tokens) if outermost_tokens else 1.0
+                    earlier.append((sent_at, span, tokens * share))
                 gap = None if match is None else (sent_at - match[0]).total_seconds()
                 if gap is not None and gap <= 300:
                     non_ttl_misses += 1        # a 5m entry was still alive; not a TTL problem
@@ -921,14 +1030,35 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                    "same prefix rather than a drifted one. A longer lifetime only helps if "
                    "the same span is being rewritten. Instrument the workload to settle it.")
     return Finding(
-        code="TTL-1", title=f"'{agent}' request cadence sits inside the one-hour window",
+        code="TTL-1",
+        # Structural exactly when it carries money, because that is exactly
+        # when the claim rests on `marked_spans`. Both figures above are built
+        # from the span walk -- which spans matched, and since the nested-marker
+        # fix, what share of a write each span accounts for -- so on an
+        # unaligned or uncounted trace they are costed from boundaries nobody
+        # measured. Without this flag they walked past the structural trust gate
+        # entirely, which is the gate that exists for precisely that.
+        #
+        # `monetizable` is `unkeyed == 0` here: the branch above drops any agent
+        # with no unkeyed requests and nothing recoverable, so the two are the
+        # same condition. Not a coincidence to rely on quietly -- it is what
+        # makes this flag mean "the figure came from spans" rather than
+        # "somebody thought this looked structural".
+        #
+        # Not unconditional. The other arm fires when the trace carries no
+        # segment identity, says so in its own detail, and publishes nothing;
+        # marking it structural would attach the report's "these rest on
+        # segment boundaries inferred from logged bodies" note to a finding
+        # whose text says there are no segments to rest on.
+        structural=monetizable,
+        title=f"'{agent}' request cadence sits inside the one-hour window",
         severity="high" if monetizable else "medium", evidence_class=MODELED,
         detail=(f"{in_band:.0%} of gaps between requests fall between five minutes and one "
                 f"hour (median {median/60:.1f} min across {n} requests). In that band a "
                 f"five-minute cache expires before the next request and rewrites at 1.25x, "
                 f"while a one-hour cache would have read at 0.1x.{caveat}"),
         affected_requests=n,
-        avoidable_usd_month=_monthly(extra, window) if monetizable else None,
+        **_avoidable(extra if monetizable else None, window),
         confidence="medium" if monetizable else "low", quality_risk="low",
         fix="Set a one-hour TTL on the static prefix for this agent. Outside the "
             "five-minute-to-one-hour band the five-minute default is cheaper, so this "
@@ -1062,7 +1192,6 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
     # signal that the prefix itself is the problem, and shortening the lifetime
     # buries that. Report the observation, publish no saving.
     unread_band = band_gaps - band_priced
-    monthly = _monthly(abs(net), window)
     common = (
         f"{written_1h:,} tokens were written at the one-hour lifetime, which "
         f"bills at {w1h}x where the five-minute lifetime bills at {w5}x. "
@@ -1109,7 +1238,7 @@ def _f_ttl_premium_unearned(reqs, ratios, window, rate_for) -> Finding | None:
                 f"out ahead. This is a projection, not an observation -- the "
                 f"five-minute arm was never run."),
             affected_requests=sum(len(v) for v in by_scope.values()),
-            avoidable_usd_month=monthly,
+            **_avoidable(abs(net), window),
             confidence="medium" if band_gaps else "high", quality_risk="medium",
             fix="Drop the static prefix to the five-minute lifetime and measure "
                 "again before assuming it held. Where a scope genuinely idles "
@@ -1226,7 +1355,7 @@ def _f_cold_fanout(reqs, ratios, window, rate_for) -> Finding | None:
         # Unique requests, not pairs times two. Three requests fanning out form
         # two adjacent pairs and would have been reported as four requests.
         affected_requests=len(affected),
-        avoidable_usd_month=_monthly(waste, window),
+        **_avoidable(waste, window),
         confidence="medium", quality_risk="low",
         fix="Send one request, wait for its first token, then release the rest of the batch.")
 
@@ -2070,20 +2199,22 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             f"the requests structure was recorded for are the ones the spend came "
             f"from -- and here they are not")
 
-    # CLASS, stated rather than narrowed: `_monthly` has seven callers and six
-    # of them are per-finding `avoidable_usd_month`. Every one is a projection
-    # and every one deserves this gate.
+    # CLASS, closed rather than narrowed: `_monthly` has seven callers, six of
+    # them per-finding, and every one of them is now gated here. It used to gate
+    # the spend total alone -- measured on a two-request, one-minute trace with
+    # a matching invoice, `findings[0].avoidable_usd_month` published $180/mo
+    # marked `reconciled` directly under a `monthly_input_usd` withheld for
+    # being an unsupportable extrapolation. Two figures, one extrapolation, and
+    # the more client-facing of them was the ungated one.
     #
-    # Only the spend total is gated here. Extending it to the finding figures
-    # withholds money in ten existing tests whose fixtures run 9 to 18 minutes
-    # of traffic, and those fixtures are cadence-sensitive -- widening their
-    # gaps to clear a one-day floor moved requests across the 5m/1h band
-    # boundaries and broke eight *more* tests than it fixed, because the gaps
-    # are what several of those rules measure.
-    #
-    # That migration is real work and it is recorded in PENDING.md with this
-    # measurement rather than skipped quietly. Splitting it out is the honest
-    # move; pretending the class has one member is not.
+    # The reason it stayed open was real and is now answered rather than
+    # deferred: extending the gate withheld money in eleven existing tests whose
+    # fixtures run 9 to 18 minutes, and widening those windows was not an option
+    # because the request gaps are the quantity several of those rules measure.
+    # None of the eleven was about projections -- each needed *some* released
+    # figure to exist so it could assert a different gate -- so what they needed
+    # was a figure the observed window supports. That is `avoidable_usd_window`,
+    # and they assert it now.
     projection_ok, projection_why = _projection_supported(window, len(reqs))
     if not projection_ok:
         notes.append(projection_why[0].upper() + projection_why[1:])
@@ -2095,6 +2226,17 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
                                     confidence="low", severity="medium"))
         else:
             released.append(f.released(gate_ok, why, as_=released_as))
+    # Only the extrapolation loses its release; the measured window keeps it,
+    # exactly as `input_usd` does beside `monthly_input_usd` below. Applied
+    # after the loop above rather than inside each rule, so a rule added
+    # tomorrow is covered without knowing this floor exists.
+    #
+    # `Analysis.total_avoidable_month` needs no line of its own: it reads its
+    # release off its parts, so withholding them withholds it. Verified rather
+    # than assumed -- INV-1 walks the analysis and would find it either way.
+    if not projection_ok:
+        released = [replace(f, avoidable_usd_month=_withhold_projection(
+            f.avoidable_usd_month, projection_why)) for f in released]
     findings = released
     if not structure_trusted and any(f.structural for f in findings):
         notes.append(
@@ -2112,8 +2254,8 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     # The measured window keeps its release; only the extrapolation loses it.
     # An invoice does establish that `input_usd` matches the bill.
     if not projection_ok and isinstance(spend.get("monthly_input_usd"), money.Figure):
-        spend["monthly_input_usd"] = spend["monthly_input_usd"].release(
-            False, projection_why)
+        spend["monthly_input_usd"] = _withhold_projection(
+            spend["monthly_input_usd"], projection_why)
 
     # Classified once, here, where every note has been collected and the code
     # still knows why each was raised. Renderers read the field; none of them
