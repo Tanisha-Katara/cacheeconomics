@@ -367,6 +367,81 @@ class TestCadenceAgainstLifetime(unittest.TestCase):
         self.assertEqual([a for a in fired if a.code == "RT-TTL"], [])
 
 
+class TestTheCadenceEvidenceIsTheLifetimesOwn(unittest.TestCase):
+    """RT-TTL evaluates 5m and 1h. It abstains on any other lifetime -- but the
+    rewrite-gap window it reads was filled by every marked request regardless.
+
+    Measured: ten 30m requests ten minutes apart on `anthropic/direct` built
+    nine gaps, and the very next 5m request emitted RT-TTL reporting a median
+    "over the last 10" -- off ten observations of traffic the rule says it
+    cannot read, and zero observations at 5m. Gating the wording on the
+    lifetime while leaving the state pooled is the worse half of the original
+    defect: silence became a confident number.
+    """
+
+    def _at(self, i, ttl, minutes):
+        return req(i, [sg(0, "system", 8000, "sys", marked=True, ttl=ttl),
+                       sg(1, "user", 100, f"t{i}")],
+                   ttl=ttl, at=T0 + timedelta(minutes=minutes), session="s")
+
+    def test_a_lifetime_it_cannot_evaluate_builds_no_evidence(self):
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(10):
+            fired += m.observe(self._at(i, "30m", minutes))
+            minutes += 10
+        late = m.observe(self._at(99, "5m", minutes))
+        self.assertEqual([], [a for a in fired + late if a.code == "RT-TTL"])
+
+    def test_the_buckets_stay_empty_for_an_unevaluable_lifetime(self):
+        m = Monitor()
+        minutes = 0
+        for i in range(10):
+            m.observe(self._at(i, "30m", minutes))
+            minutes += 10
+        st = next(s for k, s in m._scopes.items() if len(k) > 3)
+        self.assertEqual({k: len(v) for k, v in st.rewrite_gaps.items()},
+                         {"5m": 0, "1h": 0})
+
+    def test_one_lifetimes_history_does_not_answer_for_another(self):
+        """A scope can legitimately carry both -- a durable prefix under an
+        advancing turn is a documented pattern -- so the fix is to partition
+        the evidence, not to refuse a mixed scope."""
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(14):            # sparse 1h traffic: fires the 1h way
+            fired += m.observe(self._at(i, "1h", minutes))
+            minutes += 70
+        for i in range(14):            # in-band 5m traffic: fires the 5m way
+            fired += m.observe(self._at(100 + i, "5m", minutes))
+            minutes += 10
+        by_subject = {a.subject for a in fired if a.code == "RT-TTL"}
+        self.assertEqual({"to-5m", "to-1h"}, by_subject)
+
+    def test_the_alert_says_how_many_observations_at_that_lifetime(self):
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(14):
+            fired += m.observe(self._at(i, "5m", minutes))
+            minutes += 10
+        a = next(x for x in fired if x.code == "RT-TTL")
+        self.assertIn("at this lifetime", a.detail)
+
+    def test_the_bucket_map_cannot_grow(self):
+        """Keys come only from `_ttl_rt_ttl_can_read`, which returns a member
+        of TTL_SECONDS or None. A lifetime nobody evaluates must not create a
+        bucket, or a long-lived process grows one per string it ever sees."""
+        m = Monitor()
+        minutes = 0
+        for i, ttl in enumerate(["30m", "12h", "1d", "5m", "1h", None] * 6):
+            m.observe(self._at(i, ttl, minutes))
+            minutes += 10
+        for k, st in m._scopes.items():
+            with self.subTest(scope=k):
+                self.assertEqual(sorted(monitor.TTL_SECONDS),
+                                 sorted(st.rewrite_gaps))
+
+
 class TestColdFanOut(unittest.TestCase):
 
     def test_concurrent_writers_of_one_prefix_fire(self):
@@ -922,20 +997,24 @@ class TestTheNoticeNamesTheRealCause(unittest.TestCase):
         self.assertEqual(1, len(notices), "the genuine abstention was swallowed")
         self.assertIn("max_breakpoints", notices[0].detail)
 
-    def test_a_contested_row_is_not_reported_as_missing_data(self):
+    def test_a_contested_row_is_reported_as_contested(self):
         """`ContestedRow` subclasses `RegistryError`, so one `except` clause
-        told the reader to add a value that is already on file. The remedy is
-        the opposite: settle the row, or accept the checks stay off. This
-        repo's standing rule is that a contested row is never fact, so
-        conflating the two is the more serious half."""
+        reported a disputed row as missing data and sent the reader to add a
+        value already on file. This repo's standing rule is that a contested
+        row is never fact, so the dispute has to be named and the settle
+        remedy has to appear.
+
+        This test asserted the opposite exclusion in its first form -- that a
+        contested row says *nothing* about absence -- which encoded the very
+        collapse the next review found: contested and absent are independent,
+        and `openai/bedrock` is both. Naming the dispute is the requirement;
+        suppressing the other half never was."""
         for target in ("openai/bedrock", "google/gemini-explicit"):
             with self.subTest(target=target):
                 a = next(iter(self._notices(target=target)), None)
                 self.assertIsNotNone(a, f"{target} abstains in silence")
                 self.assertIn("contested", a.detail)
-                self.assertNotIn("not recorded for this surface", a.detail)
                 self.assertIn("settle the contested row", a.fix.lower())
-                self.assertNotIn("record the missing limits", a.fix.lower())
 
     def test_a_genuinely_absent_row_still_says_so(self):
         """The other direction, so the fix above cannot be "call everything
@@ -978,6 +1057,53 @@ class TestTheNoticeNamesTheRealCause(unittest.TestCase):
                 r = req(0, [sg(0, "system", 8000, "sys", marked=True, ttl=ttl)],
                         ttl=ttl)
                 self.assertEqual(expected, m._ttl_rt_ttl_can_read(r))
+
+    def test_a_contested_row_that_also_lacks_the_key_says_both(self):
+        """Contested and absent are flags, not alternatives. Shipped
+        `openai/bedrock` is flagged contested AND carries
+        `capabilities: {"_unknown": true}`, so the keys are missing too.
+
+        Catching ContestedRow first fixed the label and introduced a second
+        collapse: every key on a contested row was reported present-but-
+        disputed without checking, and only the settle remedy was emitted. An
+        operator was told to settle a row that also needs values recorded."""
+        a = next(iter(self._notices(target="openai/bedrock")))
+        self.assertIn("contested", a.detail)
+        self.assertIn("not recorded for this surface", a.detail)
+        self.assertIn("settle the contested row", a.fix.lower())
+        self.assertIn("record the missing limits", a.fix.lower())
+
+    def test_a_contested_row_that_does_record_the_key_says_only_that(self):
+        """The other direction, inspected rather than assumed. Nothing may
+        report a key as absent without having looked."""
+        from cacheeconomics import registry as reg
+        real = reg.capability
+
+        def cap(target_id, name, allow_contested=False):
+            if not allow_contested:
+                raise reg.ContestedRow("test: contested")
+            return 4        # on file, and inspectable without publishing
+
+        reg.capability = cap
+        try:
+            a = next(iter(self._notices(target="anthropic/direct")))
+        finally:
+            reg.capability = real
+        self.assertIn("contested", a.detail)
+        self.assertNotIn("not recorded for this surface", a.detail)
+        self.assertNotIn("record the missing limits", a.fix.lower())
+
+    def test_a_lookup_with_no_inspecting_form_says_it_did_not_look(self):
+        """`min_cacheable_tokens` takes no `allow_contested`, so on a contested
+        row its presence is genuinely unknown here. Saying so beats guessing
+        either way: "present" understates a row needing values recorded,
+        "absent" invents a gap. Reproducing the registry's inheritance walk to
+        answer it would be a second copy of that logic."""
+        a = next(iter(self._notices(target="openai/bedrock")))
+        self.assertIn("was not inspected", a.detail)
+        segment = next(p for p in a.detail.split(";")
+                       if "min_cacheable_tokens (" in p)
+        self.assertIn("not inspected", segment)
 
     def test_two_lifetimes_in_one_request_are_still_ambiguous(self):
         """`_cadence_vs_ttl` abstains when a request carries a durable prefix

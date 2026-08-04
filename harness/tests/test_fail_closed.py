@@ -437,29 +437,14 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         asyncio.run(go())
         return max((list(p) for p in placed), key=len, default=[])
 
-    def _run(self, h, model, calls=6, provider=None, marked=False):
-        """`marked` places a caller's own cache breakpoint on the body.
-
-        Off by default, so the four surface-resolution tests below are
-        unchanged. The budget test turns it on because a request carrying no
-        markers has no budget question to ask -- zero cannot exhaust any
-        non-negative budget -- and the live budget check now answers that case
-        without consulting the registry at all. Marker-free traffic therefore
-        produces no observable question, and asserting on one was asserting
-        that a check reads the registry when it does not need to.
-        """
+    def _run(self, h, model, calls=6, provider=None):
         import asyncio
         scopes = []
 
         async def go():
             for i in range(calls):
-                content = [{"type": "text", "text": "policy " * 3000}]
-                if marked:
-                    content[0]["cache_control"] = {"type": "ephemeral"}
                 data = {"model": model, "litellm_call_id": f"c{i}",
-                        "messages": [{"role": "user",
-                                      "content": content if marked
-                                      else "policy " * 3000}]}
+                        "messages": [{"role": "user", "content": "policy " * 3000}]}
                 if provider:
                     data["custom_llm_provider"] = provider
                 await h.async_pre_call_hook(None, None, data, "completion")
@@ -591,17 +576,30 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         observable property is not the result but the question: which surface
         did the guard actually ask about.
 
-        `marked=True` because the question only exists on traffic that has
-        markers to budget. This ran on marker-free bodies and passed on the
-        strength of the runtime monitor's `_marker_budget`, which used to read
-        the budget before checking whether the request carried any markers --
-        so the guard being observed was one that should not have been asking.
-        Measured: 6 reads of `max_breakpoints` on `google-cloud/vertex` from a
-        body with no cache_control anywhere. With a caller-placed marker the
-        same 6 reads happen for a real reason, and the assertions below are
-        unchanged.
+        It also has to reach the recheck it is named after, and it did not.
+        `_hook()` builds the handler with `mutate=False`, so `decision.applied`
+        is false and `async_pre_call_hook` returns before the post-patch guard
+        ever runs. Every `max_breakpoints` read the spy saw came from the
+        runtime monitor's `_marker_budget` -- measured: 6 reads on
+        `google-cloud/vertex` from a body with no `cache_control` anywhere,
+        while `plugin.py`'s own guards never executed. A regression pinning the
+        literal at the actual recheck passed all three assertions.
+
+        So: drive the mutating path, and make the handler's own `target_id` the
+        *wrong* surface on purpose. `custom_llm_provider` outranks it, so
+        everything must resolve to Vertex, and any use of the handler default
+        at the recheck shows up as `anthropic/direct` in the reads. Asserting
+        the marker reached the returned body is what proves the recheck ran at
+        all: the body is only patched past `if not decision.applied`, which is
+        the branch that used to skip the guard entirely.
         """
+        import asyncio
+        from datetime import datetime, timedelta, timezone
+
         from cacheeconomics import registry
+        from cacheeconomics.plugin import CachePlugin, litellm_handler
+
+        t0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
         asked = []
         real = registry.capability
 
@@ -609,13 +607,46 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
             asked.append((target_id, name))
             return real(target_id, name, *a, **kw)
 
+        p = CachePlugin(key=b"k" * 32, warmup=4)
+        # Spaced timestamps: a tight loop on wall-clock time reads as
+        # concurrent traffic, which is correctly modelled as a cache miss, and
+        # nothing is ever placed.
+        inner, n = p.on_request, {"i": 0}
+
+        def timed(body, **kw):
+            kw["at"] = t0 + timedelta(seconds=90 * n["i"])
+            n["i"] += 1
+            return inner(body, **kw)
+
+        p.on_request = timed
+        # Deliberately not Vertex. `mutate=True` requires a surface, and making
+        # it the wrong one turns "did the recheck use the handler default"
+        # into an observable rather than an argument.
+        h = litellm_handler(p, mutate=True, target_id="anthropic/direct")
+        out = None
+
+        async def go():
+            nonlocal out
+            for i in range(20):
+                data = {"model": "claude-opus-5", "litellm_call_id": f"c{i}",
+                        "metadata": {"session_id": "conv"},
+                        "custom_llm_provider": "vertex_ai",
+                        "messages": [
+                            {"role": "system", "content": "policy " * 4000},
+                            {"role": "user", "content": f"t{i}"}]}
+                out = await h.async_pre_call_hook(None, None, data, "completion")
+
         registry.capability = spy
         try:
-            self._run(self._hook(), "claude-haiku-4-5", provider="vertex_ai",
-                      marked=True)
+            asyncio.run(go())
         finally:
             registry.capability = real
 
+        marked = any(isinstance(m.get("content"), list)
+                     and any("cache_control" in b for b in m["content"])
+                     for m in out["messages"])
+        self.assertTrue(marked, "nothing was patched, so the post-patch recheck "
+                                "never ran and the assertions below are vacuous")
         budgets = [t for t, n in asked if n == "max_breakpoints"]
         self.assertTrue(budgets, "the budget guard never ran")
         self.assertNotIn("anthropic/direct", budgets,
