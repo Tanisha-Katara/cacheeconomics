@@ -211,24 +211,73 @@ def surface_fallback_sites():
             if isinstance(node, ast.arguments):
                 for d in list(node.defaults) + [k for k in node.kw_defaults if k]:
                     if surface(d):
-                        out.append(f"{rel}:{d.lineno} parameter default")
+                        out.append(f"{rel} parameter default")
             elif isinstance(node, (ast.AnnAssign, ast.Assign)):
                 v = node.value
                 if v is not None and surface(v):
-                    out.append(f"{rel}:{v.lineno} field default")
+                    out.append(f"{rel} field default")
             elif isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
                 for v in node.values[1:]:
                     if surface(v):
-                        out.append(f"{rel}:{v.lineno} `or` fallback")
+                        out.append(f"{rel} `or` fallback")
             elif isinstance(node, ast.Call):
                 fn = node.func
                 if (isinstance(fn, ast.Attribute) and fn.attr == "get"
                         and len(node.args) == 2 and surface(node.args[1])):
-                    out.append(f"{rel}:{node.args[1].lineno} dict.get fallback")
+                    out.append(f"{rel} dict.get fallback")
                 for kw in node.keywords:
                     if kw.arg in ("default", "target_id") and surface(kw.value):
-                        out.append(f"{rel}:{kw.value.lineno} {kw.arg}= keyword")
-    return sorted(set(out))
+                        out.append(f"{rel} {kw.arg}= keyword")
+    # Counted, not de-duplicated, and keyed on file+shape rather than
+    # file:line. Line numbers churn on every unrelated edit in the same file --
+    # the first version went red because a help string three lines above moved
+    # two entries -- and an invariant that cries wolf on unrelated edits gets
+    # its expected-set pasted over without reading, which is worse than not
+    # having it.
+    from collections import Counter
+    return sorted(f"{k} x{n}" for k, n in Counter(out).items())
+
+
+
+def help_text_surface_claims():
+    """argparse help strings that name a surface the default does not supply.
+
+    Found by Track B, invisible to `surface_fallback_sites()` because it is not
+    a fallback shape -- the CODE is right and the SENTENCE is wrong. `cli.py`'s
+    `--target-id` correctly uses `default=None`, with a comment explaining that
+    "the operator chose anthropic/direct" and "the operator said nothing" must
+    stay distinguishable, and then tells the operator in its help text
+    "(default: anthropic/direct)".
+
+    That is this whole project's failure mode in one line: prose asserting a
+    behaviour nothing checked, sitting directly above the code that contradicts
+    it. An operator reading `--help` to decide whether they need the flag is
+    told they do not.
+    """
+    import ast
+    import pathlib
+    ids = {t for t in registry.target_ids() if t != registry.UNATTRIBUTED}
+    out = []
+    root = pathlib.Path(registry.HERE)
+    for f in sorted(root.rglob("*.py")):
+        for node in ast.walk(ast.parse(f.read_text())):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "add_argument"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords}
+            h = kw.get("help")
+            if not (isinstance(h, ast.Constant) and isinstance(h.value, str)):
+                continue
+            named = {i for i in ids if i in h.value}
+            if not named:
+                continue
+            d = kw.get("default")
+            actual = d.value if isinstance(d, ast.Constant) else None
+            if actual not in named:
+                out.append(f"{f.relative_to(root.parent)} "
+                           f"help says {sorted(named)} but default is {actual!r}")
+    return sorted(out)
 
 
 # --- known defects, as exact sets -----------------------------------------
@@ -285,18 +334,26 @@ KNOWN_MUTATE_BY_DEFAULT = (
 # `inspect.signature` cannot see. Line numbers move -- re-run
 # `surface_fallback_sites()` and paste, do not hand-edit.
 KNOWN_SURFACE_FALLBACKS = (
-    "cacheeconomics/adapters/claude_code.py:83 parameter default",
-    "cacheeconomics/checks.py:101 parameter default",
-    "cacheeconomics/checks.py:240 parameter default",
-    "cacheeconomics/checks.py:63 parameter default",
-    "cacheeconomics/cli.py:292 `or` fallback",
-    "cacheeconomics/cli.py:446 default= keyword",
-    "cacheeconomics/cost.py:389 parameter default",
-    "cacheeconomics/plugin.py:276 parameter default",
-    "cacheeconomics/plugin.py:528 `or` fallback",
-    "cacheeconomics/recorder.py:119 parameter default",
-    "cacheeconomics/relocate.py:385 `or` fallback",
-    "cacheeconomics/trace.py:179 field default",
+    "cacheeconomics/adapters/claude_code.py parameter default x1",
+    "cacheeconomics/checks.py parameter default x3",
+    "cacheeconomics/cli.py `or` fallback x1",
+    "cacheeconomics/cli.py default= keyword x1",
+    "cacheeconomics/cost.py parameter default x1",
+    "cacheeconomics/plugin.py `or` fallback x1",
+    "cacheeconomics/plugin.py parameter default x1",
+    "cacheeconomics/recorder.py parameter default x1",
+    "cacheeconomics/relocate.py `or` fallback x1",
+    "cacheeconomics/trace.py field default x1",
+)
+
+# INV-6b. argparse help text naming a surface its default does not supply.
+# The shared ingest flag is fixed. The remaining entry belongs to
+# `cmd_claude_code`, whose flags Track B is rewriting to add an explicit
+# `--assume-anthropic-direct` opt-in -- its help text changes with that work, so
+# correcting the sentence here would collide with the fix for the behaviour it
+# describes.
+KNOWN_HELP_TEXT_CLAIMS = (
+    "cacheeconomics/cli.py help says ['anthropic/direct'] but default is None",
 )
 
 # INV-5, Track C. Registry dependencies that disable a check in silence.
@@ -984,13 +1041,26 @@ class TestNoSurfaceIsFabricatedAnywhereInTheSource(unittest.TestCase):
                          "the provider translation table is being reported as "
                          "a fabricated surface")
 
+
+    def test_no_help_text_promises_a_surface_the_default_does_not_supply(self):
+        """The documentation half of the same class.
+
+        INV-6 above reads what the code DOES. This reads what the code SAYS it
+        does, because an operator deciding whether they need `--target-id`
+        reads the help string, not the source.
+        """
+        self.assertEqual(
+            sorted(KNOWN_HELP_TEXT_CLAIMS), help_text_surface_claims(),
+            "argparse help text names a surface its default does not actually "
+            "supply, so `--help` tells the operator something the code does "
+            "not do:\n    " + "\n    ".join(help_text_surface_claims()))
+
     def test_no_new_site_fabricates_a_surface(self):
         self.assertEqual(
             sorted(KNOWN_SURFACE_FALLBACKS), surface_fallback_sites(),
             "the set of places the package supplies a first-party surface "
             "when nobody named one has CHANGED. If you closed some, update "
-            "KNOWN_SURFACE_FALLBACKS (or set it to `()`). Line numbers move, "
-            "so re-run and paste the current list rather than editing by hand.")
+            "KNOWN_SURFACE_FALLBACKS (or set it to `()`).")
 
 
 if __name__ == "__main__":

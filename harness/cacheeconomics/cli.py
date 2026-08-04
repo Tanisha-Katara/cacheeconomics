@@ -357,9 +357,11 @@ def _ingest_args(p, need_path=True):
     # The LiteLLM adapter reads the surface off each row and must only be
     # overridden when a choice was actually made.
     p.add_argument("--target-id", default=None,
-                   help="provider surface for rows that do not name one "
-                        "(default: anthropic/direct). Honoured on every ingest "
-                        "mode; a row that names its own surface still wins")
+                   help="provider surface for rows that do not name one. There "
+                        "is no default: a row naming no surface stays "
+                        "unattributed and unpriced rather than being assumed "
+                        "first-party. Honoured on every ingest mode; a row that "
+                        "names its own surface still wins")
 
 
 def _pricing_args(p):
