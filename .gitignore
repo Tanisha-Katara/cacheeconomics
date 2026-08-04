@@ -51,3 +51,6 @@ __pycache__/
 # is our job. `*.partial-write` was added and this one, one suffix over, was
 # not.
 *.partial
+
+# Agent worktrees. Live git repos; never part of this one.
+.claude/worktrees/

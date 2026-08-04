@@ -128,6 +128,33 @@ STATE_SLOTS = ("basis", "released", "released_as", "projected",
                "withheld_because")
 
 
+def _unwrap_callable(raw):
+    """The underlying function behind a class attribute, or None.
+
+    `inspect.isfunction` is False for `classmethod` and `staticmethod` entries
+    in `vars(cls)` -- they are descriptors, not functions -- so a signature walk
+    built on it skips every factory. Measured: `cost.Usage.from_anthropic` is a
+    classmethod and was absent from the 164 callables INV-4 claimed to inspect.
+
+    Also unwraps `functools.wraps` chains and `functools.partial`, both of which
+    hide the real signature INV-4 reads.
+    """
+    import functools
+    for _ in range(8):
+        if isinstance(raw, (classmethod, staticmethod)):
+            raw = raw.__func__
+            continue
+        if isinstance(raw, functools.partial):
+            raw = raw.func
+            continue
+        wrapped = getattr(raw, "__wrapped__", None)
+        if wrapped is not None and wrapped is not raw:
+            raw = wrapped
+            continue
+        break
+    return raw if inspect.isfunction(raw) else None
+
+
 def renderers():
     """Every renderer the report module exposes, found by name at runtime.
 
@@ -138,6 +165,62 @@ def renderers():
     return [(n, getattr(report, n)) for n in dir(report)
             if n.startswith("render_") and callable(getattr(report, n))]
 
+
+
+# --- known defects, as exact sets -----------------------------------------
+#
+# These replace `@unittest.expectedFailure`, which round 3 of external review
+# killed and was right to. `unittest.expectedFailure` treats an ERROR as an
+# expected failure too, so a discovery helper that regressed to returning
+# nothing, or raised before reaching its assertion, still reported OK. The
+# marker was introduced to stop a red board hiding regressions and would have
+# hidden them itself. Measured: a test that raises under @expectedFailure exits 0.
+#
+# An exact set is strictly better and needs no marker. Verified in all three
+# directions before being relied on:
+#
+#   harness breaks (discovery empty)  -> guard tests fail          (3 failed)
+#   defect fixed, set not updated     -> set shrinks, fails        (1 failed)
+#   defect widens or a new one lands  -> set grows, fails          (1 failed)
+#   nothing changes                   -> green, and honestly so
+#
+# A track closing one of these edits its set to `()`. Leaving it stale fails.
+
+# INV-1, Track A. A 1-hour window publishes these as released projections.
+KNOWN_PROJECTION_LEAKS = (
+    "root.findings[0].avoidable_usd_month",
+    "root.total_avoidable_month",
+)
+
+# INV-2, Track A. Money in --format json with no state scoped to that field.
+KNOWN_JSON_UNPROVENANCED = (
+    "findings[0].avoidable_usd_month",
+    "reconciliation.computed_usd",
+    "reconciliation.delta_usd",
+)
+
+# INV-4, Track B. Public callables defaulting target_id to a named surface.
+KNOWN_SURFACE_DEFAULTS = (
+    "adapters.claude_code.load_sessions(target_id='anthropic/direct')",
+    "checks.check_breakpoint_budget(target_id='anthropic/direct')",
+    "checks.check_minimum(target_id='anthropic/direct')",
+    "checks.run_all(target_id='anthropic/direct')",
+    "cost.ttl_crossover(target_id='anthropic/direct')",
+    "plugin.CachePlugin.on_request(target_id='anthropic/direct')",
+    "recorder.Recorder.__init__(target_id='anthropic/direct')",
+    "trace.Request.__init__(target_id='anthropic/direct')",
+)
+
+# INV-4, Track B. Entry points that mutate unless told not to.
+KNOWN_MUTATE_BY_DEFAULT = (
+    "plugin.CachePlugin.on_request(apply=True)",
+)
+
+# INV-5, Track C. Registry dependencies that disable a check in silence.
+KNOWN_SILENT_ABSTENTIONS = (
+    "capability(lookback_blocks)",
+    "capability(max_breakpoints)",
+)
 
 # --- fixtures --------------------------------------------------------------
 
@@ -187,26 +270,14 @@ class TestEveryProjectedFigureRespectsTheProjectionFloor(unittest.TestCase):
                                "the `projected` tag is broken, and INV-1 would "
                                "pass while checking nothing")
 
-    # KNOWN-FAILING: finding M1/F1, assigned to Track A.
-    #
-    # `expectedFailure` rather than a red board, and the difference matters.
-    # Under pytest a still-broken expected failure exits 0, so CI stays
-    # meaningful for everyone else; the moment the defect is fixed this reports
-    # "Unexpected success" and exits 1. Verified, both directions, before being
-    # used here. So the marker cannot outlive the defect it documents -- the
-    # track that fixes this is forced to delete this line, and CI goes red if
-    # it does not.
-    #
-    # This is the opposite of silencing a failure: a skip would hide both
-    # states, and a red board hides new regressions among known ones.
-    @unittest.expectedFailure
     def test_no_projected_figure_is_released_below_the_floor(self):
         a = short_window_analysis()
         leaked = [(p, f) for p, f in walk_figures(a) if f.projected and f.released]
         self.assertEqual(
-            [], leaked,
-            "these projected figures published from a window that cannot "
-            "support a projection:\n" +
+            sorted(KNOWN_PROJECTION_LEAKS), sorted(q for q, _ in leaked),
+            "the set of projected figures published from a window that cannot "
+            "support one has CHANGED. If you closed some, update "
+            "KNOWN_PROJECTION_LEAKS (or set it to `()`):\n" +
             "\n".join(f"    {p} = {f} (released_as={f.released_as})"
                       for p, f in leaked))
 
@@ -338,11 +409,6 @@ class TestEveryFigureCarriesItsReleaseProvenance(unittest.TestCase):
                 self.assertNotEqual(a, b, f"__eq__ ignores {slot}")
                 self.assertNotEqual(hash(a), hash(b), f"__hash__ ignores {slot}")
 
-    # KNOWN-FAILING: finding M2, assigned to Track A. Measured: 7 money
-    # fields in --format json, 3 with no release state (the finding figure
-    # and both reconciliation figures). See the note on INV-1's marker for
-    # why this is expectedFailure and not a red board.
-    @unittest.expectedFailure
     def test_the_json_output_carries_release_state_for_every_figure(self):
         """Every dollar field in `--format json`, found by scanning the payload.
 
@@ -363,7 +429,7 @@ class TestEveryFigureCarriesItsReleaseProvenance(unittest.TestCase):
                                "this invariant would pass vacuously")
         missing = [p for p in found if not _has_release_state(payload, p)]
         self.assertEqual(
-            [], missing,
+            sorted(KNOWN_JSON_UNPROVENANCED), sorted(missing),
             "dollar fields in --format json with no release state, so a script "
             "consuming this cannot tell a published figure from a withheld or "
             "draft one:\n    " + "\n    ".join(missing))
@@ -398,8 +464,16 @@ def _money_paths(node, path="") -> list:
     and then it protects nothing.
     """
     out = []
+    leaf = path.rsplit(".", 1)[-1].split("[")[0]
     if isinstance(node, str):
         if node.startswith("[withheld") or _looks_like_usd(node):
+            out.append(path)
+    elif isinstance(node, (int, float)) and not isinstance(node, bool):
+        # A raw number under a money-shaped name. Only rendered strings were
+        # matched before, so a future field emitting a bare float -- the most
+        # likely way this JSON grows -- was invisible to a scan claiming to
+        # cover every dollar field.
+        if leaf.endswith("_usd") and leaf not in _INPUT_ONLY_MONEY:
             out.append(path)
     elif isinstance(node, dict):
         for k, v in node.items():
@@ -412,36 +486,86 @@ def _money_paths(node, path="") -> list:
     return out
 
 
+# Money the client supplied, not money this tool computed. It carries no
+# release state because there is nothing to release: echoing an invoice back is
+# not a claim. Exempting it explicitly beats letting the scan quietly skip
+# whatever it fails to match.
+_INPUT_ONLY_MONEY = frozenset({"invoice_usd"})
+
+
 def _looks_like_usd(s: str) -> bool:
     import re
     return bool(re.fullmatch(r"\$-?[\d,]+(?:\.\d+)?", s.strip()))
 
 
 def _has_release_state(payload: dict, path: str) -> bool:
-    """Is there provenance for the money at `path`?
+    """Is there provenance for the money at `path`, specifically?
 
-    Accepts either a sibling `release_state` map keyed by the field name, or an
-    inline state key beside the value. Which of the two a section uses is that
-    section's business; having neither is the defect.
+    Three ways the first version said yes when the answer was no, all the same
+    mistake -- accepting evidence about *something else* as evidence about this
+    field:
+
+      - `leaf in payload['release_state']` matched by leaf name at any depth, so
+        a top-level entry vouched for a same-named field nested anywhere else;
+      - `'release_state' in node` was true if the container had a state map at
+        all, whatever it covered: `{'avoidable_usd_month': '$12',
+        'release_state': {'other': 'draft'}}` passed;
+      - presence alone counted, so state recorded as `""` read as provenance.
+
+    Now the state must be scoped to the container the money sits in, keyed by
+    that exact leaf, and *consistent with what was rendered* -- `""` for a
+    withheld figure, a RELEASES member for a published one. Requiring merely
+    non-empty flagged `monthly_input_usd`, which is correctly withheld, and an
+    invariant that fails on correct code gets switched off.
     """
     parts = path.split(".")
     leaf = parts[-1]
-    if leaf in payload.get("release_state", {}):
-        return True
     node = payload
     for p in parts[:-1]:
         if "[" in p:
             name, idx = p.split("[")
-            node = node.get(name, [])[int(idx.rstrip("]"))]
+            node = node.get(name, [])
+            i = int(idx.rstrip("]"))
+            if not isinstance(node, list) or i >= len(node):
+                return False
+            node = node[i]
         else:
             node = node.get(p, {})
         if not isinstance(node, (dict, list)):
             return False
-    if isinstance(node, dict):
-        return (leaf in node.get("release_state", {})
-                or f"{leaf}_state" in node
-                or "release_state" in node)
-    return False
+    if not isinstance(node, dict):
+        return False
+    if len(parts) == 2 and parts[0] == "spend":
+        state = payload.get("release_state", {})
+    else:
+        state = node.get("release_state", {})
+    if not isinstance(state, dict):
+        return False
+    sentinel = object()
+    value = state.get(leaf, node.get(f"{leaf}_state", sentinel))
+    if value is sentinel:
+        return False
+    rendered = _rendered_at(payload, path)
+    if isinstance(rendered, str) and rendered.startswith("[withheld"):
+        return value == ""
+    return value in money.RELEASES
+
+
+def _rendered_at(payload: dict, path: str):
+    node = payload
+    for p in path.split("."):
+        if "[" in p:
+            name, idx = p.split("[")
+            node = node.get(name, [])
+            i = int(idx.rstrip("]"))
+            if not isinstance(node, list) or i >= len(node):
+                return None
+            node = node[i]
+        elif isinstance(node, dict):
+            node = node.get(p)
+        else:
+            return None
+    return node
 
 
 # --- INV-3 -----------------------------------------------------------------
@@ -566,22 +690,21 @@ class TestNoMutatingEntryPointDefaultsToASurface(unittest.TestCase):
                         seen.add(key)
                         yield key, obj
                 elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
-                    for mname, m in vars(obj).items():
-                        if inspect.isfunction(m) and (not mname.startswith("_")
-                                                      or mname == "__init__"):
-                            key = f"{short}.{name}.{mname}"
-                            if key not in seen:
-                                seen.add(key)
-                                yield key, m
+                    for mname, raw in vars(obj).items():
+                        m = _unwrap_callable(raw)
+                        if m is None:
+                            continue
+                        if mname.startswith("_") and mname != "__init__":
+                            continue
+                        key = f"{short}.{name}.{mname}"
+                        if key not in seen:
+                            seen.add(key)
+                            yield key, m
 
     def test_there_are_entry_points_to_check(self):
         found = [n for n, _ in self._public_callables()]
         self.assertTrue(found, "no public plugin callables discovered")
 
-    # KNOWN-FAILING: assigned to Track B. 8 offenders, of which adversarial
-    # review found 2 by hand. Measured harm: check_minimum(768,
-    # 'claude-opus-5') is PASS by default and FAIL on openai/direct.
-    @unittest.expectedFailure
     def test_no_entry_point_defaults_to_a_named_surface(self):
         """Not "no *mutating* entry point" -- no entry point at all.
 
@@ -610,14 +733,12 @@ class TestNoMutatingEntryPointDefaultsToASurface(unittest.TestCase):
                 continue
             offenders.append(f"{name}(target_id={p.default!r})")
         self.assertEqual(
-            [], sorted(offenders),
-            "these default to a named surface, so a caller that never chose one "
-            "is priced and bounded as though it had:\n    " +
+            sorted(KNOWN_SURFACE_DEFAULTS), sorted(offenders),
+            "the set of entry points defaulting to a named surface has CHANGED. "
+            "If you closed some, update KNOWN_SURFACE_DEFAULTS (or set it to "
+            "`()`):\n    " +
             "\n    ".join(sorted(offenders)))
 
-    # KNOWN-FAILING: finding L2, assigned to Track B.
-    # `on_request(apply=True)` mutates by default.
-    @unittest.expectedFailure
     def test_mutation_defaults_to_off(self):
         """The other half of the same door. A surface guard does not help if
         mutation happens by default before anyone considered the surface."""
@@ -628,8 +749,10 @@ class TestNoMutatingEntryPointDefaultsToASurface(unittest.TestCase):
                 p = sig.parameters.get(switch)
                 if p is not None and p.default is True:
                     offenders.append(f"{name}({switch}=True)")
-        self.assertEqual([], offenders,
-                         "mutation is on by default at: " + ", ".join(offenders))
+        self.assertEqual(sorted(KNOWN_MUTATE_BY_DEFAULT), sorted(offenders),
+                         "the set of entry points mutating by default has "
+                         "CHANGED; update KNOWN_MUTATE_BY_DEFAULT (or set it "
+                         "to `()`): " + ", ".join(offenders))
 
 
 # --- INV-5 -----------------------------------------------------------------
@@ -677,10 +800,6 @@ class TestEveryRegistryDependencyThatDisablesACheckIsAnnounced(unittest.TestCase
         self.assertTrue(self._observed_dependencies(),
                         "no registry reads observed; INV-5 is vacuous")
 
-    # KNOWN-FAILING: finding L4 plus a second member the invariant found,
-    # assigned to Track C. capability('max_breakpoints') and
-    # capability('lookback_blocks') both disable a check with no alert.
-    @unittest.expectedFailure
     def test_each_registry_dependency_announces_itself_when_unavailable(self):
         """For every key the checks read, a surface that cannot answer it must
         produce an alert rather than a silent early return."""
@@ -692,9 +811,10 @@ class TestEveryRegistryDependencyThatDisablesACheckIsAnnounced(unittest.TestCase
                 if not alerts:
                     silent.append(f"{kind}({name})" if name else kind)
         self.assertEqual(
-            [], silent,
-            "these registry dependencies disable a check with no alert, so the "
-            "operator sees silence and reads it as healthy: " + ", ".join(silent))
+            sorted(KNOWN_SILENT_ABSTENTIONS), sorted(silent),
+            "the set of registry dependencies that disable a check with no "
+            "alert has CHANGED; update KNOWN_SILENT_ABSTENTIONS (or set it to "
+            "`()`): " + ", ".join(silent))
 
 
 def _shape_request(i):
