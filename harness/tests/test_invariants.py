@@ -105,8 +105,13 @@ def figure_round_trips():
     import pickle
     return [
         ("abs()", lambda f: abs(f)),
-        ("release(True)", lambda f: f.release(True, as_=f.released_as or None)
-         if f.released_as else f.release(True)),
+        # The literal default call, with no `as_`. The first version of this
+        # entry passed `as_=f.released_as`, so the one path whose label it bore
+        # -- plain `release(True)` on an already-released draft -- was the exact
+        # path it never took. A lambda that steps around the case its label
+        # names is worse than no case at all: it reports coverage it does not
+        # have. Found by external review, not by me.
+        ("release(True)", lambda f: f.release(True)),
         ("release(True, as_=DRAFT)", lambda f: f.release(True, as_=money.DRAFT)),
         ("release(False)", lambda f: f.release(False, "test")),
         ("pickle", lambda f: pickle.loads(pickle.dumps(f))),
@@ -262,7 +267,9 @@ class TestEveryFigureCarriesItsReleaseProvenance(unittest.TestCase):
                 if out.released:
                     self.assertTrue(out.released_as,
                                     f"{label} released a figure with no provenance")
-                if label in ("abs()", "pickle", "copy", "deepcopy"):
+                if label != "release(False)":
+                    # Includes the bare `release(True)`: re-releasing a draft
+                    # must not silently upgrade it to invoice-checked.
                     self.assertEqual(
                         money.DRAFT, out.released_as,
                         f"{label} laundered DRAFT into {out.released_as!r}")
@@ -319,22 +326,29 @@ class TestEveryFigureCarriesItsReleaseProvenance(unittest.TestCase):
                 self.assertNotEqual(hash(a), hash(b), f"__hash__ ignores {slot}")
 
     def test_the_json_output_carries_release_state_for_every_figure(self):
-        """Every dollar field in `--format json`, not only `spend`.
+        """Every dollar field in `--format json`, found by scanning the payload.
 
-        A consumer cannot tell a withheld figure from a published one if the
-        state is attached to one section and not the others.
+        Was a hand-listed pair of sections -- `spend` and `findings` -- which
+        is how `reconciliation.computed_usd` and `reconciliation.delta_usd`
+        shipped as bare dollar strings with no provenance while a test named
+        "every figure" passed. Named sections are the same mistake as named
+        modules and named methods, which this file has now made three times.
+
+        So: walk the whole decoded payload for anything that looks like money,
+        and require state for each. A section added to `analysis_json`
+        tomorrow is covered without editing this test.
         """
         a = short_window_analysis()
         payload = json.loads(_analysis_json(a))
-        missing = []
-        for section, entries in _json_money_sections(payload).items():
-            for key in entries:
-                if key not in payload.get("release_state", {}) and \
-                        not _has_inline_state(payload, section, key):
-                    missing.append(f"{section}.{key}")
-        self.assertEqual([], missing,
-                         "dollar fields in the JSON with no release state: " +
-                         ", ".join(missing))
+        found = sorted(_money_paths(payload))
+        self.assertTrue(found, "no money-like fields found in the JSON; "
+                               "this invariant would pass vacuously")
+        missing = [p for p in found if not _has_release_state(payload, p)]
+        self.assertEqual(
+            [], missing,
+            "dollar fields in --format json with no release state, so a script "
+            "consuming this cannot tell a published figure from a withheld or "
+            "draft one:\n    " + "\n    ".join(missing))
 
 
 def _analysis_json(a: Analysis) -> str:
@@ -353,28 +367,62 @@ def _analysis_json(a: Analysis) -> str:
     return cli.analysis_json(a, tier_name="USAGE_ONLY", coverage=1.0)
 
 
-def _json_money_sections(payload: dict) -> dict:
-    """Only the entries that actually carry money.
+def _money_paths(node, path="") -> list:
+    """Every path in the decoded JSON whose value looks like a money figure.
 
-    `a.spend` also holds `window_days`, a plain float. Reading every key of the
-    section flagged it as an ungoverned dollar field, which would have been a
-    permanently-failing invariant reporting a defect that does not exist -- as
-    corrosive as one that passes while a real defect ships, because the fix for
-    a noisy invariant is always to stop reading it.
+    A `Figure` serialises through `str`, so it is either "$..." or
+    "[withheld: ...]". Both are money: a withheld one still needs to be
+    identifiable as withheld rather than absent.
+
+    Plain floats are deliberately not money-like. `window_days` lives in the
+    same dict as the figures and flagging it produced a permanently-failing
+    invariant reporting a defect that does not exist -- which gets switched off,
+    and then it protects nothing.
     """
-    money_like = [k for k, v in payload.get("spend", {}).items()
-                  if isinstance(v, str) and ("$" in v or v.startswith("[withheld"))]
-    return {"spend": money_like,
-            "findings": [f["code"] for f in payload.get("findings", [])
-                         if f.get("avoidable_usd_month") is not None]}
+    out = []
+    if isinstance(node, str):
+        if node.startswith("[withheld") or _looks_like_usd(node):
+            out.append(path)
+    elif isinstance(node, dict):
+        for k, v in node.items():
+            if k == "release_state":
+                continue
+            out.extend(_money_paths(v, f"{path}.{k}" if path else k))
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            out.extend(_money_paths(v, f"{path}[{i}]"))
+    return out
 
 
-def _has_inline_state(payload: dict, section: str, key: str) -> bool:
-    if section != "findings":
-        return False
-    for f in payload.get("findings", []):
-        if f.get("code") == key:
-            return "release_state" in f or "avoidable_usd_month_state" in f
+def _looks_like_usd(s: str) -> bool:
+    import re
+    return bool(re.fullmatch(r"\$-?[\d,]+(?:\.\d+)?", s.strip()))
+
+
+def _has_release_state(payload: dict, path: str) -> bool:
+    """Is there provenance for the money at `path`?
+
+    Accepts either a sibling `release_state` map keyed by the field name, or an
+    inline state key beside the value. Which of the two a section uses is that
+    section's business; having neither is the defect.
+    """
+    parts = path.split(".")
+    leaf = parts[-1]
+    if leaf in payload.get("release_state", {}):
+        return True
+    node = payload
+    for p in parts[:-1]:
+        if "[" in p:
+            name, idx = p.split("[")
+            node = node.get(name, [])[int(idx.rstrip("]"))]
+        else:
+            node = node.get(p, {})
+        if not isinstance(node, (dict, list)):
+            return False
+    if isinstance(node, dict):
+        return (leaf in node.get("release_state", {})
+                or f"{leaf}_state" in node
+                or "release_state" in node)
     return False
 
 
@@ -470,23 +518,43 @@ class TestNoMutatingEntryPointDefaultsToASurface(unittest.TestCase):
         import pkgutil
         import cacheeconomics
 
-        for mod_info in pkgutil.iter_modules(cacheeconomics.__path__):
-            if mod_info.name.startswith("_"):
+        # `walk_packages`, not `iter_modules`: the latter stops at the top
+        # level, and `cacheeconomics.adapters.claude_code.load_sessions`
+        # defaults `target_id='anthropic/direct'` one package down. So the
+        # invariant reported seven offenders with confidence while an eighth
+        # sat in a subpackage it never opened. Twice now this test has picked
+        # its own scope too small and gone green on the strength of it.
+        seen = set()
+        for mod_info in pkgutil.walk_packages(cacheeconomics.__path__,
+                                              prefix="cacheeconomics."):
+            short = mod_info.name[len("cacheeconomics."):]
+            if any(p.startswith("_") for p in short.split(".")):
                 continue
             try:
-                mod = importlib.import_module(f"cacheeconomics.{mod_info.name}")
-            except Exception:
-                continue
+                mod = importlib.import_module(mod_info.name)
+            except Exception as e:                                # noqa: BLE001
+                # Loud, not silent. A module that fails to import is a module
+                # this invariant cannot vouch for, and swallowing that turns an
+                # unopened door into a clean bill of health.
+                raise AssertionError(
+                    f"cannot import {mod_info.name}, so INV-4 cannot claim to "
+                    f"have inspected it: {e!r}") from e
             for name, obj in vars(mod).items():
                 if name.startswith("_"):
                     continue
                 if inspect.isfunction(obj) and obj.__module__ == mod.__name__:
-                    yield f"{mod_info.name}.{name}", obj
+                    key = f"{short}.{name}"
+                    if key not in seen:
+                        seen.add(key)
+                        yield key, obj
                 elif inspect.isclass(obj) and obj.__module__ == mod.__name__:
                     for mname, m in vars(obj).items():
                         if inspect.isfunction(m) and (not mname.startswith("_")
                                                       or mname == "__init__"):
-                            yield f"{mod_info.name}.{name}.{mname}", m
+                            key = f"{short}.{name}.{mname}"
+                            if key not in seen:
+                                seen.add(key)
+                                yield key, m
 
     def test_there_are_entry_points_to_check(self):
         found = [n for n, _ in self._public_callables()]

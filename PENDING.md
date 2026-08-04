@@ -14,25 +14,21 @@ something, attach what you actually observed, not what you suspect.
 
 ---
 
-## 1. `Figure.release()` upgrades DRAFT to RECONCILED on re-release
+## 1. ~~`Figure.release()` upgrades DRAFT to RECONCILED on re-release~~ — FIXED
 
-`release(ok, as_="")` defaults `as_` to `RECONCILED`, so calling it on a figure
-that is *already* released as `DRAFT` silently relabels it as invoice-checked.
+Kept as a record of why it moved from deferred to fixed within one stage.
 
-**Measured:** unreachable today. All three call sites
-(`analyzer.py:123`, `analyzer.py:2115`, `money.release_map`) operate on a
-withheld figure straight from `_monthly`, whose output is `released=False`.
-Verified by inspection of every `.release(` site in `harness/cacheeconomics/`.
+Deferred first on the grounds that it was unreachable — all three call sites
+take a withheld figure straight from `_monthly` — and that the `RECONCILED`
+default was deliberate and documented.
 
-**Why deferred rather than fixed:** the `RECONCILED` default is deliberate and
-documented — it exists so figures that predate the distinction are not
-relabelled as drafts. Changing it to "preserve existing provenance if already
-released" is strictly safer, but nothing exercises the path, and a speculative
-fix to a documented choice is how a design acquires two rules.
-
-**When to pick it up:** the moment any caller releases an already-released
-figure. `abs()` had the identical shape and *was* reachable; it was fixed in
-`d394523`.
+Fixed anyway, because the invariant written to cover Figure round-trips had a
+`release(True)` table entry that passed `as_=f.released_as` and therefore never
+called the path its own label named. Given the choice between a test that
+reports coverage it does not have and fixing a latent sharp edge, the fix is
+cheaper and honest. `release()` now keeps existing provenance when the figure
+is already released, and still defaults to `RECONCILED` for a withheld one —
+which was the whole point of the documented default.
 
 ---
 
@@ -77,18 +73,38 @@ no fixture, no number.
 
 ---
 
-## 5. `Recorder.target_id` has a surface default
+## 5. Surface defaults: 8 members, not the 2 the review found
 
-The same class as `on_request` and `trace.Request`, both closed in the current
-round. `Recorder` was named in review and not closed with them.
+**This entry was stale within one commit of being written** and is corrected
+here. It previously said INV-4 walks only `plugin` and does not catch
+`Recorder`. INV-4 was widened in the same commit, and the claim was false by
+the time it was committed — the same "prose nothing can contradict" failure
+this file exists to record, occurring in the file that records it. Caught by
+external review, not by me.
 
-**Measured:** confirmed present by signature inspection. INV-4 does not
-currently catch it — the invariant walks `plugin`'s public callables, and
-`Recorder` is not among them, which is a known gap in that invariant's
-discovery mechanism rather than evidence of absence.
+**Measured, current:** INV-4 walks the package recursively via
+`pkgutil.walk_packages` and inspects 164 callables. Eight default `target_id`
+to the named surface `'anthropic/direct'`:
 
-**Extending INV-4 to cover the recorder is the fix, not a one-line default
-change** — otherwise the next entry point repeats it.
+    adapters.claude_code.load_sessions
+    checks.check_breakpoint_budget
+    checks.check_minimum
+    checks.run_all
+    cost.ttl_crossover
+    plugin.CachePlugin.on_request
+    recorder.Recorder.__init__
+    trace.Request.__init__
+
+Adversarial review named two of these by hand (`on_request`, `Request`). The
+invariant found the other six, the last only after switching from
+`iter_modules` to `walk_packages` — `iter_modules` does not descend into
+subpackages, so `adapters.claude_code` was invisible.
+
+**Not cosmetic.** Minimums differ by surface: 512 on `anthropic/direct`, 1024
+on `openai/direct`. Measured: `check_minimum(768, 'claude-opus-5')` returns
+**PASS** by default and **FAIL** when the real surface is named.
+
+**Status: IN FLIGHT** — all 8 assigned to Track B of the current round.
 
 ---
 

@@ -158,14 +158,29 @@ class Figure:
     def release(self, ok: bool, because: str = "", *, as_: str = "") -> "Figure":
         """The only way to change release state, and it makes a new Figure.
 
-        `as_` records *how* it was released. Defaults to RECONCILED, because
-        that is what every caller meant before the distinction existed and a
-        silent default of DRAFT would relabel every honest figure.
+        `as_` records *how* it was released. When it is not given, an
+        already-released figure keeps the provenance it has and a withheld one
+        becomes RECONCILED.
+
+        That second half is the original rule and the reason for it stands:
+        RECONCILED is what every caller meant before the distinction existed,
+        and defaulting to DRAFT would relabel every honest figure. But the rule
+        was written for figures that had never been released, and applied to
+        every figure, so `draft.release(True)` silently upgraded a figure the
+        client was told was unchecked into one an invoice had verified.
+
+        `__abs__` had the identical shape and was fixed first, because it was
+        reachable. This one is not reachable today -- all three call sites take
+        a withheld figure straight from `_monthly` -- and it was deferred on
+        that basis. It is fixed now because keeping it meant keeping a test
+        whose label named the path while its body stepped around it, which is
+        worse than either fixing or failing honestly.
         """
+        keep = self.released_as if (self.released and not as_) else as_
         return Figure(self._usd, self.basis, released=bool(ok),
                       withheld_because=("" if ok
                                         else (because or self.withheld_because)),
-                      released_as=(as_ or RECONCILED) if ok else "",
+                      released_as=(keep or RECONCILED) if ok else "",
                       projected=self.projected)
 
     def __float__(self) -> float:
