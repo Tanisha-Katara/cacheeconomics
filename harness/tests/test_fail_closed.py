@@ -601,16 +601,22 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         recheck ran -- without ever comparing -- passed while also suppressing
         perfectly legal requests.
 
-        The obvious repair, one budget per surface seen by every call site, was
-        tried and does not isolate this guard. `_decide` enforces the same
-        predicate earlier against its own view of the body, so lowering the
-        budget everywhere makes `_decide` refuse first and the post-patch
-        recheck is never the cause of anything. Measured: with a uniform Vertex
-        budget of 1, deleting this recheck's enforcement entirely still left
-        the body unmarked and the test green. On correct code the two sites
-        count the same number -- verified, `_decide` and `_pre_call` both see 2
-        -- so there is no body that is legal at one and illegal at the other
-        without changing what one of them is told.
+        DO NOT "simplify" the spy to answer every call site the same budget.
+        That version was written, measured and rejected, and it is the one
+        shape of this test that cannot fail:
+
+          - `_decide` enforces the same predicate earlier, against its own view
+            of the body. Lower the budget everywhere and `_decide` refuses
+            first, so this guard is never the cause of anything.
+          - Measured: with a uniform Vertex budget of 1, deleting this
+            recheck's enforcement outright left the body unmarked and the test
+            green.
+          - Instrumenting `marker_count` at both sites shows why no
+            uniform-answer version can work. On correct code `_decide` and
+            `_pre_call` both count 2. There is no body that is legal at one
+            site and illegal at the other unless one of them is told something
+            different, which is exactly what the per-call-site answer below
+            does and why it is here.
 
         So the budget is answered only for this call site, and the *body* is
         what varies. Same forced budget, two prompts, opposite required
@@ -620,11 +626,21 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
           two stable blocks -> 2 markers placed, budget 1, body comes back EMPTY
 
         That pair is what makes the veto prove it is a function of
-        `marker_count(patched)`. A recheck that vetoes unconditionally fails
-        the first. One that never compares fails the second. One pinned to the
-        handler's `anthropic/direct` default fails the second too, because that
-        surface is left at its real budget of 4 and shows headroom the resolved
-        surface does not have.
+        `marker_count(patched)` rather than of having run. A recheck that
+        vetoes unconditionally fails the first. One that never compares fails
+        the second. One pinned to the handler's `anthropic/direct` default
+        fails the second too, because that surface is left at its real budget
+        of 4 and shows headroom the resolved surface does not have.
+
+        Why this is tested at all, given the guard cannot fire on today's
+        code: it is defence in depth against the override path failing to strip
+        the caller's markers, and "unreachable by construction" is a property
+        of the current implementation, not of the design. The day that changes
+        is the day nobody will notice it changed. Deleting this test and
+        recording the guard as unreachable in a document would trade a tested
+        guard for a claim in a file, which is the failure mode this whole suite
+        exists to prevent. The per-call-site answer is a compromise; a guard
+        with no coverage is a gap. Reviewed and chosen deliberately.
         """
         import asyncio
         import os
@@ -660,6 +676,11 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
                 # Only this guard, and only when it asks about the surface the
                 # request resolved to. Pinned to `anthropic/direct` it falls
                 # through to that surface's real budget of 4 and never vetoes.
+                #
+                # The per-call-site narrowness is deliberate and load-bearing.
+                # Answering every site the same number makes `_decide` refuse
+                # first and this test cannot fail -- measured; see the
+                # docstring before widening it.
                 if site == RECHECK_SITE and target_id == RESOLVED:
                     return recheck_budget
                 return value
