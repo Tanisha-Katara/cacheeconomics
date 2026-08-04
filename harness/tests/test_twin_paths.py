@@ -1104,6 +1104,39 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
         self.assertNotIn("no trace was supplied", text)
         self.assertIn("$", text, "no group released a figure")
 
+    def test_the_cli_by_agent_path_honours_a_failed_invoice(self):
+        """The second call site, which the first round of CLI wiring left half
+        done.
+
+        `bake_off_by_agent` accepts `invoice_usd` and never handed it to a group,
+        so with no invoice in scope every group read `reconciled is None`,
+        `draft_override_applies` took that for "no invoice was supplied", and the
+        command printed per-agent Gate 1 results over a bill it contradicted by a
+        factor of 58,000. With `--allow-unreconciled` it printed $16.2077 of
+        draft dollars per agent beside a 68.9% pass.
+
+        Both flags, because the override was the worse of the two.
+        """
+        for extra in (["--invoice-usd", "999999"],
+                      ["--invoice-usd", "999999", "--allow-unreconciled"]):
+            with self.subTest(" ".join(extra)):
+                rc, text = self._run_bakeoff("--by-agent", *extra)
+                self.assertEqual(rc, 0)
+                self.assertIn("[withheld]", text)
+                self.assertNotIn("beats the automatic baseline", text)
+                self.assertNotIn("vs litellm-auto", text)
+                self.assertNotIn("no invoice was supplied", text,
+                                 "an invoice was supplied and it failed")
+                self.assertIn("does not reconcile", text)
+
+    def test_the_cli_by_agent_path_still_works_without_an_invoice(self):
+        """So the guard above cannot pass by `--by-agent` having stopped
+        producing anything."""
+        rc, text = self._run_bakeoff("--by-agent", "--allow-unreconciled")
+        self.assertEqual(rc, 0)
+        self.assertIn("$", text)
+        self.assertIn("beats the automatic baseline", text)
+
     def test_the_cli_withholds_when_the_evidence_is_not_there(self):
         """The other direction, so the test above cannot pass by the gate having
         been removed. Same command, same fixture, an invoice that does not
@@ -1713,6 +1746,111 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
             self.assertFalse(b.arms["as-shipped"]["spend"].released,
                              f"{g} released over a billed row nobody reports")
             self.assertIsNone(b.delta_pct, g)
+
+    def test_the_two_entry_points_mean_different_things_by_a_narrower_reqs(self):
+        """The contract, resolved rather than patched.
+
+        `bake_off` permits a narrower `reqs`: it is one comparison over whatever
+        you hand it, and its exclusions come from the trace you hand it. A group
+        produced internally is exactly such a call, with a narrowed trace.
+
+        `bake_off_by_agent` does not, because it partitions, and a partition of a
+        workload requires the workload. Handing it alpha's rows with the whole
+        file's trace does not say whether you mean "alpha out of this workload"
+        or "alpha's workload", and those disagree about whose excluded rows
+        count: measured, alpha's six clean requests came back indeterminate with
+        the full trace and released at 20.0% with the trace narrowed first, on
+        rows that were identical.
+
+        The contract is `reqs == trace.analysable`, not "the same agents". That
+        distinction is load-bearing and the next test is why.
+        """
+        reqs = []
+        for agent in ("alpha", "beta"):
+            for i in range(6):
+                reqs.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[Segment(id=f"h{agent}{i}", role="system",
+                                      tokens=300, index=0),
+                              Segment(id="body", role="system", tokens=30_000,
+                                      index=1, cache_marked=True, ttl="5m")]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        alpha = [r for r in ts.analysable if r.agent == "alpha"]
+
+        # Narrower reqs, whole trace: a breach, and it says what to do.
+        out = simulate.bake_off_by_agent(alpha, allow_unreconciled=True,
+                                         trace=ts)
+        self.assertTrue(out)
+        for b in out:
+            self.assertIsNone(b.delta_pct)
+            self.assertIn("not handed over", b.verdict)
+            self.assertIn("Narrow the trace", b.verdict)
+
+        # The same rows with the trace narrowed to match: fine.
+        scoped = replace(ts, requests=alpha)
+        out = simulate.bake_off_by_agent(scoped.analysable,
+                                         allow_unreconciled=True, trace=scoped)
+        self.assertTrue(out)
+        for b in out:
+            self.assertIsNotNone(b.delta_pct)
+            self.assertTrue(b.arms["as-shipped"]["spend"].released)
+
+        # And `bake_off` itself still accepts the narrower slice, because that
+        # is a different question with a different answer.
+        one = simulate.bake_off(alpha, group="alpha", allow_unreconciled=True,
+                                trace=ts)
+        self.assertIsNotNone(one.delta_pct)
+
+    def test_the_cli_shape_is_not_a_breach(self):
+        """`ts.analysable` with the full `ts` is what `cmd_bakeoff` passes, and
+        it must stay legal even when an agent's traffic all failed.
+
+        `analysable` legitimately drops such an agent, so "the same agent
+        universe" would call the CLI's own shape a breach and send the reader to
+        fix their call when the finding is in their export. The row still has to
+        block -- it just has to block as an unreported exclusion, with the
+        reason naming the export.
+        """
+        reqs = []
+        for agent in ("alpha", "beta"):
+            for i in range(6):
+                reqs.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[Segment(id=f"h{agent}{i}", role="system",
+                                      tokens=300, index=0),
+                              Segment(id="body", role="system", tokens=30_000,
+                                      index=1, cache_marked=True, ttl="5m")]))
+        reqs.append(Request(
+            request_id="gamma-failed", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent="gamma", tenant="t", session="sg",
+            target_id="anthropic/direct", ttl_requested="5m", status=500,
+            usage={"input_tokens": 5_000_000, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id="hg", role="system", tokens=5_000_000,
+                              index=0)]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        out = simulate.bake_off_by_agent(ts.analysable, allow_unreconciled=True,
+                                         trace=ts)
+        self.assertTrue(out)
+        for b in out:
+            self.assertNotIn("not handed over", b.verdict,
+                             "the CLI's own shape was reported as a breach")
+            self.assertIn("never reached the arms", b.verdict)
+            self.assertIsNone(b.delta_pct)
 
     def test_the_subset_invariant_is_what_says_so(self):
         """And it is an invariant, not a condition: every request handed to the

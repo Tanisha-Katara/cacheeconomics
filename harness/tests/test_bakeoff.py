@@ -3781,13 +3781,120 @@ class TestBakeOffNeedsAnInvoiceToo(unittest.TestCase):
         self.assertIn("no trace was supplied",
                       b.arms["as-shipped"]["spend"].withheld_because)
 
+    def _two_agents(self, n=6):
+        """Two agents with identical, clean traffic, so the whole workload
+        prices at almost exactly twice either group."""
+        reqs = []
+        for agent in ("alpha", "beta"):
+            for i in range(n):
+                reqs.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[seg(0, "system", 300, f"h{agent}{i}"),
+                              seg(1, "system", 30_000, "body", marked=True,
+                                  ttl="5m")]))
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED)
+
     def test_the_per_agent_run_does_not_reconcile_against_the_whole_invoice(self):
-        """The bill covers the workload, not one agent's slice of it. Passing it
-        down would let each group compare its own share to the full total and
-        release on whichever slice happened to land within 5%."""
-        import inspect
-        src = inspect.getsource(simulate.bake_off_by_agent)
-        self.assertNotIn("invoice_usd=invoice_usd", src)
+        """The bill covers the workload, not one agent's slice of it.
+
+        Behavioural, because the source check this replaced asserted that
+        `invoice_usd=invoice_usd` does not appear in `bake_off_by_agent` -- which
+        pins an implementation rather than the property, and went red on a
+        correct one. The invoice is passed there now, to a single whole-workload
+        run whose reconciliation every group inherits. What must never happen is
+        a *group* releasing because its own slice matched the full bill.
+
+        So the invoice here is one group's spend. Each group's share matches it
+        within 5%; the workload is twice it and does not. Nothing may release.
+        """
+        ts = self._two_agents()
+        alpha = [r for r in ts.analysable if r.agent == "alpha"]
+        scoped = replace(ts, requests=alpha)
+        one_group = simulate.bake_off(
+            scoped.analysable, trace=scoped,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        whole = simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        self.assertAlmostEqual(whole / one_group, 2.0, places=2,
+                               msg="the fixture must make the slice and the "
+                                   "workload disagree, or this proves nothing")
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=one_group)
+        self.assertTrue(out, "no groups came back, so nothing was checked")
+        for b in out:
+            self.assertFalse(
+                b.arms["as-shipped"]["spend"].released,
+                f"{b.group} released because its own slice matched the whole "
+                f"workload's invoice")
+            self.assertIsNone(b.delta_pct, b.group)
+
+    def test_a_reconciling_invoice_frees_the_comparison_but_not_the_dollars(self):
+        """The other direction, and the asymmetry is deliberate.
+
+        A *failed* reconciliation is evidence about the capture and taints every
+        slice cut from it, so it blocks the groups outright. A *passed* one is
+        evidence about the total, and a total that matches does not establish
+        that any particular agent's share does -- per-group errors can cancel in
+        the sum. So the comparison is freed and the dollars are not.
+
+        What must not survive is the caption. A group whose workload reconciled
+        against a real bill used to be told "no invoice was supplied", which is
+        simply false.
+        """
+        ts = self._two_agents()
+        whole = simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=whole)
+        self.assertTrue(out, "no groups came back, so nothing was checked")
+        for b in out:
+            fig = b.arms["as-shipped"]["spend"]
+            self.assertFalse(fig.released, b.group)
+            self.assertNotIn("no invoice was supplied", fig.withheld_because,
+                             f"{b.group} was told no invoice was supplied when "
+                             f"one was supplied and reconciled")
+            self.assertIn("reconciles against the whole workload",
+                          fig.withheld_because)
+            self.assertIsNotNone(b.delta_pct, b.group)
+            self.assertNotIn("indeterminate", b.verdict)
+
+    def test_the_draft_flag_still_reaches_the_per_agent_figures(self):
+        """The escape hatch has to keep working, or the by-agent path can never
+        show a dollar figure at all and the flag is decoration there."""
+        ts = self._two_agents()
+        whole = simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=whole,
+                                         allow_unreconciled=True)
+        self.assertTrue(out)
+        for b in out:
+            self.assertTrue(b.arms["as-shipped"]["spend"].released, b.group)
+
+    def test_the_draft_flag_does_not_reach_them_when_the_invoice_failed(self):
+        """And it must not become a way round a bill the trace contradicts.
+        Measured on the real command before this: `--by-agent --invoice-usd
+        999999 --allow-unreconciled` printed $16.2077 per agent with a 68.9%
+        Gate 1 pass beside it."""
+        ts = self._two_agents()
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=999_999.0,
+                                         allow_unreconciled=True)
+        self.assertTrue(out)
+        for b in out:
+            self.assertFalse(b.arms["as-shipped"]["spend"].released, b.group)
+            self.assertIsNone(b.delta_pct, b.group)
+            self.assertNotIn("beats the automatic baseline", b.verdict)
 
     def test_the_cli_exposes_both_flags(self):
         """It accepted neither, which is why the default printed dollars."""

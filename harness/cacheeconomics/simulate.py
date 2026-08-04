@@ -531,6 +531,11 @@ class BakeOff:
     delta_pct_relocation: float | None = None
     delta_pct_optimistic: float | None = None
     delta_pct_relocation_optimistic: float | None = None
+    # Whether the as-shipped arm matched the invoice: True, False, or None for
+    # "no invoice was supplied". Recorded rather than recomputed, because
+    # `bake_off_by_agent` needs this decision and reimplementing it there is how
+    # the by-agent path came to treat a failed invoice as a missing one.
+    reconciled: bool | None = None
 
     def _range(self, pess, opt):
         if pess is None or opt is None:
@@ -648,6 +653,37 @@ def _agent_trace(trace, agent: str):
         return trace
 
 
+def _match_rows(analysable, reqs) -> tuple[list, int]:
+    """Consume `reqs` out of `analysable` as a multiset.
+
+    Returns the ids that could not be matched, and how many analysable rows
+    were left over. Two rules read this and they need different halves of it:
+    `bake_off` asks only whether anything was unmatched, because a narrower
+    `reqs` is a legitimate slice; `bake_off_by_agent` asks for both, because it
+    partitions a workload and cannot do that from a slice.
+
+    Bucketed by id so this stays linear -- `Request` is an unfrozen dataclass
+    and therefore unhashable, and scanning the whole analysable list per request
+    would be quadratic on a trace with thousands of rows. Identity first and
+    then equality: a caller may hand over the very objects from
+    `trace.analysable`, or equal ones rebuilt by a second load of the same file.
+    Neither is a breach; a different row wearing the same name is.
+    """
+    pool: dict = {}
+    for r in analysable:
+        pool.setdefault(r.request_id, []).append(r)
+    stray = []
+    for r in reqs:
+        bucket = pool.get(r.request_id) or []
+        for k, cand in enumerate(bucket):
+            if cand is r or cand == r:
+                bucket.pop(k)
+                break
+        else:
+            stray.append(r.request_id)
+    return stray, sum(len(v) for v in pool.values())
+
+
 def _unreported_exclusions(trace, reported: set) -> dict:
     """Excluded billed rows belonging to nobody who gets a result.
 
@@ -724,25 +760,7 @@ def _trace_exclusions(trace, reqs) -> tuple[dict, str]:
         # Not a TraceSet, or one that cannot answer. Take its exclusions at face
         # value and claim nothing about the subset.
         return declared, ""
-    # Bucketed by id so this stays linear -- `Request` is an unfrozen dataclass
-    # and therefore unhashable, and scanning the whole analysable list per
-    # request would be quadratic on a trace with thousands of rows.
-    pool: dict = {}
-    for r in analysable:
-        pool.setdefault(r.request_id, []).append(r)
-    stray = []
-    for r in reqs:
-        bucket = pool.get(r.request_id) or []
-        # Identity first, then equality: a caller may hand over the very objects
-        # from `trace.analysable`, or equal ones rebuilt by a second load of the
-        # same file. Neither is a breach; a different row wearing the same name
-        # is.
-        for k, cand in enumerate(bucket):
-            if cand is r or cand == r:
-                bucket.pop(k)
-                break
-        else:
-            stray.append(r.request_id)
+    stray, _unused = _match_rows(analysable, reqs)
     if not stray:
         return declared, ""
     return declared, (
@@ -868,7 +886,8 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
              effective_rate: float | None = None, invoice_usd: float | None = None,
              allow_unreconciled: bool = False,
              excluded_billed: dict | None = None,
-             trace=None) -> BakeOff:
+             trace=None, inherited_blocker: str = "",
+             spend_scope_note: str = "") -> BakeOff:
     """Run all four arms over the same requests and compare.
 
     The comparison that matters is against litellm-auto. Beating as-shipped
@@ -885,6 +904,15 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     argument existed: six separate trace conditions that made `analyze` withhold
     VOL-1's money left `bake_off` printing $2.27 against $1.82 over the identical
     requests.
+
+    `inherited_blocker` is a refusal decided one level up, by something that
+    could see more of the workload than this call does. `bake_off_by_agent` uses
+    it for the two facts a single group cannot establish for itself: whether the
+    invoice -- which covers the whole bill, not one agent's share of it --
+    reconciled, and whether the caller handed over the whole workload to
+    partition. It blocks the dollars and the comparison together, exactly like a
+    breach of the subset invariant, because a group inheriting it is a slice of
+    a workload whose own answer is already indeterminate.
 
     Optional rather than positional because the alternative was measured too.
     There are 47 call sites for `bake_off` and `bake_off_by_agent` -- 2 in the
@@ -1077,6 +1105,11 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # from some other pass over the same export.
     excluded_billed = dict(excluded_billed or {})
     _derived, not_a_subset = _trace_exclusions(trace, reqs)
+    # A refusal decided upstream, where more of the workload was visible.
+    # It travels with the subset breach because it is the same kind of
+    # thing: not a caveat on this figure, but a statement that this run is
+    # answering a question whose premises already failed.
+    not_a_subset = not_a_subset or inherited_blocker
     for _reason, _n in _derived.items():
         excluded_billed[_reason] = max(excluded_billed.get(_reason, 0), int(_n))
     # And the rest of that class. `excluded_billed` was threaded through for the
@@ -1145,9 +1178,17 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     elif not structure_ok:
         spend_why = structure_why
     elif reconciled is None:
-        spend_why = ("no invoice was supplied, so these are modelled list-price "
-                     "amounts that have not been tied to money actually spent. "
-                     "The percentage below does not depend on them")
+        # `spend_scope_note` exists because the default sentence is a statement
+        # of fact and there is one caller for whom it is false. `bake_off_by_agent`
+        # settles the invoice once over the whole workload and does not hand it to
+        # any group, so a group whose workload reconciled against a real bill was
+        # told "no invoice was supplied" -- untrue, and in a tool whose value is
+        # not saying untrue things. It changes the wording and nothing else: the
+        # group still cannot be reconciled, because the bill does not cover it.
+        spend_why = spend_scope_note or (
+            "no invoice was supplied, so these are modelled list-price "
+            "amounts that have not been tied to money actually spent. "
+            "The percentage below does not depend on them")
     elif reconciled is False:
         spend_why = (f"the as-shipped arm does not reconcile against the "
                      f"${invoice_usd:,.2f} invoice within 5%, so the modelled "
@@ -1218,7 +1259,8 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            verdict=breach, verdict_relocation=breach,
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
-                           delta_pct_relocation_optimistic=None)
+                           delta_pct_relocation_optimistic=None,
+                           reconciled=reconciled)
         if excluded_billed:
             excluded_note = (
                 "indeterminate: the trace carries billed rows that never reached "
@@ -1237,7 +1279,8 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            verdict=excluded_note, verdict_relocation=excluded_note,
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
-                           delta_pct_relocation_optimistic=None)
+                           delta_pct_relocation_optimistic=None,
+                           reconciled=reconciled)
         if misscaled and not omitted:
             # Sizes alone. Returned through the same path rather than an earlier
             # one, because a short-circuit made this check mask the omission
@@ -1264,7 +1307,8 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            verdict=only_sizes, verdict_relocation=only_sizes,
                            delta_pct=None, delta_pct_relocation=None,
                            delta_pct_optimistic=None,
-                           delta_pct_relocation_optimistic=None)
+                           delta_pct_relocation_optimistic=None,
+                           reconciled=reconciled)
         if omitted:
             indeterminate = (
                 f"indeterminate: {omitted} of {len(reqs)} requests contributed nothing "
@@ -1278,7 +1322,9 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                            untimed=untimed, unpriceable=unpriceable, unmodelled_ttl=unmodelled,
                            unmodelled_target=unknown_target, verdict=indeterminate, verdict_relocation=indeterminate,
                            delta_pct=None, delta_pct_relocation=None,
-                           delta_pct_optimistic=None, delta_pct_relocation_optimistic=None)
+                           delta_pct_optimistic=None,
+                       delta_pct_relocation_optimistic=None,
+                       reconciled=reconciled)
         # Neither a subset nor an unknown scale. Every request reached every
         # arm and the sizes agree with the bill -- what is missing is the
         # evidence that the numbers those arms were built from mean anything.
@@ -1327,7 +1373,9 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                        unmodelled_target=unknown_target, verdict=unproven,
                        verdict_relocation=unproven,
                        delta_pct=None, delta_pct_relocation=None,
-                       delta_pct_optimistic=None, delta_pct_relocation_optimistic=None)
+                       delta_pct_optimistic=None,
+                       delta_pct_relocation_optimistic=None,
+                       reconciled=reconciled)
 
     return BakeOff(group=group, n_requests=len(reqs), window_days=window,
                    arms=pess, optimistic=opt, moves=moves, unstructured=skipped,
@@ -1336,7 +1384,8 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
                    verdict_relocation=_verdict("relocation-lite", d_reloc, eval_gated=True),
                    delta_pct=d_place, delta_pct_relocation=d_reloc,
                    delta_pct_optimistic=delta(opt, "allocator-lite"),
-                   delta_pct_relocation_optimistic=delta(opt, "relocation-lite"))
+                   delta_pct_relocation_optimistic=delta(opt, "relocation-lite"),
+                   reconciled=reconciled)
 
 
 def _verdict(arm: str, delta: float | None, eval_gated: bool = False) -> str:
@@ -1363,14 +1412,96 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
                       allow_unreconciled: bool = False,
                       excluded_billed: dict | None = None,
                       trace=None) -> list[BakeOff]:
-    """Per agent, because a single blended number hides the interesting cases."""
+    """Per agent, because a single blended number hides the interesting cases.
+
+    Every decision here that is about the *workload* rather than about one agent
+    is now made by running `bake_off` over the whole thing once and reading the
+    answer off it. This function has produced a defect in three consecutive
+    rounds while the single-arm path stayed clean, and the pattern in all three
+    was the same: it reimplemented a decision `bake_off` already makes, and the
+    two drifted. The invoice was the worst of them, because it was reimplemented
+    by *omission* -- never forwarded, never checked, so a supplied invoice that
+    failed by a factor of 58,000 was indistinguishable from no invoice at all.
+
+    The contract for the caller is narrower than `bake_off`'s on purpose:
+
+        `reqs` must be exactly `trace.analysable`.
+
+    `bake_off` permits a narrower `reqs`, because it is one comparison over
+    whatever you hand it and its exclusions come from the trace you hand it. This
+    function partitions, and a partition of a workload requires the workload: a
+    caller passing alpha's rows with the whole file's trace has not said whether
+    they mean "alpha out of this workload" or "alpha's workload", and those give
+    different answers about whose excluded rows count. Measured before choosing
+    it -- alpha's six clean requests returned indeterminate with the full trace
+    and released at 20.0% with the trace narrowed first, on identical rows.
+
+    So the caller narrows the trace, and this checks that they did. Note that
+    `ts.analysable` with the full `ts` is *not* a breach and is the shape the CLI
+    uses: `analysable` legitimately drops agents whose traffic all failed, and
+    those agents' excluded rows must block rather than be reported as somebody
+    passing the wrong trace -- which would send the reader to fix their call when
+    the real finding is in their export.
+    """
     groups: dict[str, list[Request]] = {}
     for r in reqs:
         groups.setdefault(r.agent, []).append(r)
-    # The invoice covers the whole workload, not one agent's share of it, so a
-    # per-agent run cannot reconcile against it. Passing it through would let
-    # each group compare its own slice to the full bill and release on whichever
-    # slice happened to land within 5%.
+    # The whole-workload run. This is the scope the invoice is written against,
+    # so it is the only scope that can settle it, and it is also the run whose
+    # `reconciled` every group has to inherit rather than re-derive.
+    #
+    # A per-group invoice comparison would be wrong in the flattering direction:
+    # each group would measure its own slice against the full bill and release on
+    # whichever slice happened to land within 5%. Not forwarding it at all was
+    # wrong in the same direction by a different route -- with no invoice in
+    # scope, `reconciled` was None in every group, `draft_override_applies` read
+    # that as "no invoice was supplied", and `--by-agent --invoice-usd 999999
+    # --allow-unreconciled` printed $16.2077 of draft dollars per agent with a
+    # 68.9% Gate 1 pass beside them. Without the override it still printed the
+    # Gate 1 pass and captioned the withheld arms "no invoice was supplied",
+    # which was not true: one was supplied and it disagreed by a factor of
+    # 58,000.
+    whole = bake_off(reqs, group="all", on_date=on_date,
+                     effective_rate=effective_rate, invoice_usd=invoice_usd,
+                     allow_unreconciled=allow_unreconciled,
+                     excluded_billed=excluded_billed, trace=trace)
+    inherited = ""
+    scope_note = ""
+    if whole.reconciled is True:
+        # Deliberately not released. A failed reconciliation is evidence about
+        # the capture and taints every slice cut from it; a passed one is
+        # evidence about the total and establishes nothing about any particular
+        # share, because per-group errors can cancel in the sum. The asymmetry
+        # is the point -- inheriting the failure and not the pass is what the
+        # evidence supports, and releasing group dollars off an aggregate match
+        # would be the "whichever slice landed within 5%" defect arriving by the
+        # other door.
+        scope_note = (
+            f"the ${invoice_usd:,.2f} invoice reconciles against the whole "
+            f"workload, but it does not cover one agent's share of it, and a "
+            f"total that matches does not establish that each group's part of it "
+            f"does. Pass --allow-unreconciled for draft per-agent figures. The "
+            f"percentage below does not depend on them")
+    if whole.reconciled is False:
+        inherited = (
+            f"computed spend for the whole workload does not reconcile against "
+            f"the ${invoice_usd:,.2f} invoice within 5%, so the export and the "
+            f"bill may not describe the same workload. That is a fact about the "
+            f"capture these groups were cut from, and no single agent's share of "
+            f"it can be read as money or as a gate answer")
+    # The universe check. Done against the trace rather than against the groups,
+    # because the question is whether the caller handed over the workload they
+    # are asking to have partitioned.
+    _analysable = getattr(trace, "analysable", None)
+    if not inherited and _analysable is not None:
+        _stray, _leftover = _match_rows(_analysable, reqs)
+        if _leftover:
+            inherited = (
+                f"{_leftover} analysable request(s) in the trace were not handed "
+                f"over, so this is a partition of a slice presented as a "
+                f"partition of the workload. Narrow the trace to the rows you "
+                f"mean -- `dataclasses.replace(ts, requests=...)` -- so the "
+                f"exclusions are scoped to the same universe as the groups")
     #
     # Exclusions are scoped to the group when the trace can attribute them, and
     # global only when it cannot. The previous version handed every group the
@@ -1418,7 +1549,8 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
     out = [bake_off(rs, group=g, on_date=on_date, effective_rate=effective_rate,
                     allow_unreconciled=allow_unreconciled,
                     excluded_billed=global_blockers or None,
-                    trace=_agent_trace(trace, g))
+                    trace=_agent_trace(trace, g),
+                    inherited_blocker=inherited, spend_scope_note=scope_note)
            for g, rs in kept]
     # Ranking, which is the other thing `raw()` is for: ordering groups by size
     # has to work before anyone decides whether the sizes may be printed.
