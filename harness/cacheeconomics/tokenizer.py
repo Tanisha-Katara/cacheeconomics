@@ -150,6 +150,72 @@ def _cache_key(cut: dict, counter_id: str = "") -> str:
          + json.dumps(cut, sort_keys=True, default=str)).encode()).hexdigest()
 
 
+def _canonical(obj) -> bytes:
+    """The one serialisation everything here digests.
+
+    `sort_keys` because a JSON round trip through a different exporter must not
+    invalidate every count, and `default=str` because an exporter that put a
+    datetime in a body must not crash a freshness check. Both were already the
+    convention `_cache_key` used; naming it stops a second one growing beside
+    the first.
+    """
+    return json.dumps(obj, sort_keys=True, default=str).encode()
+
+
+def body_sha256(body) -> str:
+    """A digest of a request body, for saying which body a count came from.
+
+    Lives here rather than in `tier-b/count_tokens.py` because both sides of the
+    provenance gate need it and they must agree byte for byte: the counter
+    writes it into each counted row, and `adapters.bodies` recomputes it to
+    decide whether those counts may be trusted as exact. Two implementations of
+    "sha256 of the body" that differ by one flag would make every digest
+    mismatch, so every counted row would silently fall back to byte-share
+    estimation -- the counting feature gone, and gone in the direction that
+    looks fine.
+
+    A digest, never the body. This value travels in a file on a client's disk,
+    and the count cache one function up made exactly this mistake once already.
+    """
+    return hashlib.sha256(_canonical(body)).hexdigest()
+
+
+def cuts_sha256(body) -> str:
+    """A digest of the ordered prefix cuts a body segments into.
+
+    The counts are differences between consecutive cuts, in cut order, so the
+    cuts are what a `segment_tokens` array actually corresponds to -- not the
+    body bytes. `load_bodies` accepts an array when its length, value types and
+    positive sum match the freshly segmented body, and a body digest matching
+    says only that the same bytes were counted at some point.
+
+    That leaves a gap the body digest cannot see: re-segmenting a counted export
+    while preserving the segment *count* keeps both the length check and the
+    body digest satisfied while the counts no longer line up with the segments
+    they are applied to. The row loads with `was_counted=True` carrying stale
+    proportions, `tokens_counted` clears the publish gate, and structural
+    dollars come out of proportions that describe a different segmentation.
+
+    So this digests `prefix_cuts(body)` itself: the boundaries, their order, and
+    their content. Change how a body is cut and every count taken under the old
+    cutting stops being vouched for, whatever the segment count.
+    """
+    return hashlib.sha256(_canonical(prefix_cuts(body))).hexdigest()
+
+
+def row_sha256(row) -> str:
+    """A digest of a whole export row, before enrichment.
+
+    The body digest says the counted content is unchanged. It is blind to
+    everything else the loader reads off the row -- usage, timestamps, status,
+    session, and a top-level `model` that resolves which tokenizer should have
+    answered. Digesting the whole row rather than an enumerated subset is
+    deliberate: naming the analysis-relevant fields is a copy of the loader's
+    knowledge, and those copies drift.
+    """
+    return hashlib.sha256(_canonical(row)).hexdigest()
+
+
 def count_segments(body: dict, count, cache: dict | None = None,
                    counter_id: str = "") -> list:
     """Exact token count per segment, in segment order.
@@ -204,3 +270,25 @@ def apply_counts(segments: list, counts: list) -> list:
         # every other segment's share of the billed input.
         s["bytes"] = max(0, int(n))
     return segments
+
+
+# The vouching contract, in one place. The writer stamps it, the loader checks
+# it, and the key and version were transcribed into both before this -- three
+# copies of a constant whose whole job is that two sides agree on it.
+COUNTS_PROVENANCE_KEY = "segment_tokens_provenance"
+COUNTS_PROVENANCE_VERSION = 3
+
+
+def counts_provenance(body) -> dict:
+    """The record that vouches for counts taken from `body`.
+
+    The minimum a reader needs to decide whether a `segment_tokens` array may be
+    trusted as exact: which counter produced it, the body it was taken from, and
+    the cuts it is differences of. `tier-b/count_tokens.py` adds what it knows
+    on top -- the tokenizer that answered, the endpoint, the surface -- which
+    says whether a *re-run* would agree; this is the narrower question of
+    whether these counts describe this body.
+    """
+    return {"version": COUNTS_PROVENANCE_VERSION,
+            "body_sha256": body_sha256(body),
+            "cuts_sha256": cuts_sha256(body)}

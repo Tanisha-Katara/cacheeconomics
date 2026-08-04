@@ -971,6 +971,12 @@ class TestExactTokenCountsWhenSupplied(unittest.TestCase):
                                       "cache_creation_input_tokens": 0}}}
         if tokens is not None:
             row["segment_tokens"] = tokens
+            # The record the loader now requires before it will treat counts as
+            # exact. A real counted export carries it; this fixture stands in
+            # for one, so it carries it too.
+            from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
+                                                  counts_provenance)
+            row[COUNTS_PROVENANCE_KEY] = counts_provenance(row["request"])
         return row
 
     def _load(self, row):

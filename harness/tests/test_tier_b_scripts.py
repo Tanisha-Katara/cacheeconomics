@@ -16,6 +16,7 @@ CI with no key and no egress.
 """
 
 import contextlib
+import hashlib
 import http.client
 import http.server
 import io
@@ -981,6 +982,271 @@ class TestACaptureCannotQuietlyMixTwoRuns(_ProxyCase):
                          "one process, one run id")
 
 
+class TestOneDigestServesBothSidesOfTheProvenanceGate(unittest.TestCase):
+    """The writer digests a body; the loader re-digests it to decide whether the
+    counts may be trusted. If the two canonicalisations differ by one flag,
+    every digest mismatches, every counted row silently falls back to byte-share
+    estimation, and the counting feature regresses completely -- in the
+    direction that looks fine. Nothing else in the suite would notice: the
+    numbers would still be produced, still be reconciled, still be published,
+    and they would be the estimates counting exists to replace.
+
+    So there is one function, in the package, and both sides call it. This is
+    written before either side depends on it, and it is the test that catches a
+    drift: it computes a digest on both sides of the boundary and compares.
+    """
+
+    BODIES = [
+        {"system": [{"type": "text", "text": "policy"}],
+         "messages": [{"role": "user", "content": "hi"}]},
+        # Key order reversed: canonicalisation must make these identical.
+        {"messages": [{"role": "user", "content": "hi"}],
+         "system": [{"type": "text", "text": "policy"}]},
+        {"model": "claude-opus-5", "tools": [{"name": "t", "input_schema": {}}],
+         "messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}]},
+        {"messages": []},
+    ]
+
+    def test_the_package_owns_the_digest(self):
+        """Guards the guard: if the writer grows a private copy, the comparison
+        below is comparing a function with itself."""
+        from cacheeconomics import tokenizer
+        self.assertTrue(hasattr(tokenizer, "body_sha256"))
+        self.assertTrue(hasattr(tokenizer, "row_sha256"))
+        src = open(os.path.join(TIER_B, "count_tokens.py")).read()
+        self.assertNotIn("def body_sha256", src,
+                         "count_tokens.py defines its own body digest; the "
+                         "loader will disagree with it the first time either "
+                         "canonicalisation is touched")
+        self.assertNotIn("def row_sha256", src)
+
+    def test_the_writer_stamps_exactly_what_the_loader_checks(self):
+        """The comparison that matters, now that the writer holds no digest of
+        its own: every field the loader requires must appear in the record the
+        writer actually emits, with the same value."""
+        from cacheeconomics.tokenizer import counts_provenance
+        writer = load("count_tokens")
+        for body in self.BODIES:
+            stamped = writer.provenance(
+                {"body": body}, body,
+                writer.RowModels("claude-opus-5", "claude-opus-5"),
+                "https://e", None, None)
+            with self.subTest(body=body):
+                for k, v in counts_provenance(body).items():
+                    self.assertEqual(stamped.get(k), v,
+                                     f"the writer's {k} is not what the loader "
+                                     f"will compute for the same body")
+
+    def test_key_order_does_not_change_the_digest(self):
+        """The property that makes the digest usable at all: a JSON round trip
+        through a different exporter must not invalidate every count."""
+        from cacheeconomics.tokenizer import body_sha256
+        self.assertEqual(body_sha256(self.BODIES[0]),
+                         body_sha256(self.BODIES[1]))
+
+    def test_content_changes_do_change_the_digest(self):
+        from cacheeconomics.tokenizer import body_sha256
+        a = {"messages": [{"role": "user", "content": "hi"}]}
+        b = {"messages": [{"role": "user", "content": "hi "}]}
+        self.assertNotEqual(body_sha256(a), body_sha256(b))
+
+    def test_it_follows_the_convention_the_module_already_had(self):
+        """`_cache_key` established `json.dumps(..., sort_keys=True,
+        default=str)` over sha256 in this module. A second convention beside it
+        is a second thing to keep in step."""
+        from cacheeconomics import tokenizer
+        expected = hashlib.sha256(
+            json.dumps(self.BODIES[0], sort_keys=True,
+                       default=str).encode()).hexdigest()
+        self.assertEqual(tokenizer.body_sha256(self.BODIES[0]), expected)
+
+    def test_a_body_that_is_not_json_serialisable_still_digests(self):
+        """`default=str` is part of the convention: an exporter that put a
+        datetime in a body must not crash the loader's freshness check."""
+        from cacheeconomics.tokenizer import body_sha256
+        import datetime as dt
+        body = {"messages": [{"role": "user", "content": dt.date(2026, 8, 1)}]}
+        self.assertEqual(len(body_sha256(body)), 64)
+
+    def test_the_digest_carries_no_prompt_text(self):
+        from cacheeconomics.tokenizer import body_sha256, row_sha256
+        body = {"system": [{"type": "text", "text": "SECRET-POLICY"}],
+                "messages": [{"role": "user", "content": "CONFIDENTIAL"}]}
+        for digest in (body_sha256(body), row_sha256({"body": body})):
+            self.assertNotIn("SECRET", digest)
+            self.assertNotIn("CONFIDENTIAL", digest)
+
+
+class TestTheLoaderOnlyTrustsCountsItCanVouchFor(unittest.TestCase):
+    """`load_bodies` accepted any correctly-shaped positive `segment_tokens`
+    array as EXACT: right length, token-ish values, positive sum. Shape was the
+    whole test.
+
+    So a counted export from a different endpoint, a different tokenizer, an
+    older counter, or a capture that has since been re-recorded loaded with
+    `was_counted=True`, `tokens_counted` reached 1.0, and that is what releases
+    structural dollars. tier-b could refuse to *reuse* such a file; nothing
+    stopped one being handed straight to `analyze`.
+
+    The counts must now come with a record showing they were taken from this
+    body, cut this way, by a counter this loader knows. Unvouched rows are
+    estimated by byte share and named in a note -- never dropped, because the
+    row's billed total is still real and dropping it would understate spend.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.ct = load("count_tokens")
+
+    BODY = {"model": "claude-opus-5",
+            "system": [{"type": "text", "text": "policy " * 40}],
+            "messages": [{"role": "user", "content": "hello there"}]}
+
+    def _row(self, counts, provenance="valid", body=None):
+        from cacheeconomics.tokenizer import body_sha256, cuts_sha256
+        body = body or json.loads(json.dumps(self.BODY))
+        row = {"sent_at": "2026-08-01T09:00:00Z", "body": body,
+               "usage": {"input_tokens": 1000, "cache_read_input_tokens": 0,
+                         "cache_creation_input_tokens": 0},
+               "segment_tokens": counts}
+        if provenance == "valid":
+            row[self.ct.PROVENANCE_KEY] = {
+                "version": self.ct.COUNTER_VERSION,
+                "tool": "tier-b/count_tokens.py",
+                "row_sha256": "unchecked-by-the-loader",
+                "body_sha256": body_sha256(body),
+                "cuts_sha256": cuts_sha256(body),
+                "tokenizer_model": "claude-opus-5",
+                "analysis_model": "claude-opus-5",
+                "endpoint": "https://anything", "target_id": None,
+                "tokenizer_id": None}
+        elif provenance is not None:
+            row[self.ct.PROVENANCE_KEY] = provenance
+        return row
+
+    def _load(self, *rows):
+        from cacheeconomics.adapters.bodies import load_bodies
+        p = os.path.join(self.dir, f"t{len(os.listdir(self.dir))}.jsonl")
+        with open(p, "w") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+        return load_bodies(p, key=b"k" * 32)
+
+    def _counts_for(self, body=None):
+        """A `segment_tokens` array of the right length for this body."""
+        from cacheeconomics.segment import segments_from_request
+        segs = segments_from_request(body or self.BODY, b"k" * 32, None)
+        return [10] * len(segs)
+
+    def test_the_fixture_is_accepted_when_it_is_vouched_for(self):
+        """Guards the guard. If the fixture never loaded as counted, every
+        refusal below would pass for the wrong reason."""
+        ts = self._load(self._row(self._counts_for()))
+        self.assertEqual(ts.tokens_counted, 1.0,
+                         "the fixture does not load as counted at all")
+
+    def test_counts_with_no_record_are_estimated(self):
+        ts = self._load(self._row(self._counts_for(), provenance=None))
+        self.assertEqual(ts.tokens_counted, 0.0,
+                         "counts with no provenance were accepted as exact")
+
+    def test_counts_from_an_unknown_counter_version_are_estimated(self):
+        from cacheeconomics.tokenizer import body_sha256, cuts_sha256
+        row = self._row(self._counts_for())
+        row[self.ct.PROVENANCE_KEY]["version"] = self.ct.COUNTER_VERSION + 1
+        self.assertEqual(self._load(row).tokens_counted, 0.0)
+
+    def test_counts_taken_from_a_different_body_are_estimated(self):
+        row = self._row(self._counts_for())
+        row["body"]["messages"][0]["content"] = "something else entirely"
+        self.assertEqual(self._load(row).tokens_counted, 0.0,
+                         "counts were applied to a body they never described")
+
+    def test_a_resegmentation_that_keeps_the_segment_count_is_estimated(self):
+        """Track B's case, and the reason the digest covers the prefix cuts and
+        not only the body bytes.
+
+        The length check and a body digest are both satisfied when a body is
+        re-cut into the same *number* of segments — so the counts would be
+        applied, in order, to segments they never corresponded to, and
+        `tokens_counted` would clear the publish gate on stale proportions.
+        """
+        from cacheeconomics.tokenizer import body_sha256, cuts_sha256, prefix_cuts
+        row = self._row(self._counts_for())
+        original = json.loads(json.dumps(row["body"]))
+        # Same segment count, different content in one of them: the cuts differ,
+        # the segment count does not.
+        row["body"]["system"][0]["text"] = "a different policy " * 40
+        self.assertEqual(len(prefix_cuts(original)),
+                         len(prefix_cuts(row["body"])),
+                         "the fixture changed the segment count, so this would "
+                         "have been caught by the length check and proves "
+                         "nothing about the cuts digest")
+        # Body digest deliberately left matching the *new* body, so only the
+        # cuts digest can reject this.
+        row[self.ct.PROVENANCE_KEY]["body_sha256"] = body_sha256(row["body"])
+        self.assertNotEqual(row[self.ct.PROVENANCE_KEY]["cuts_sha256"],
+                            cuts_sha256(row["body"]))
+        self.assertEqual(self._load(row).tokens_counted, 0.0,
+                         "counts survived a re-segmentation and would have been "
+                         "applied to segments they never described")
+
+    def test_an_unvouched_row_is_estimated_and_not_dropped(self):
+        """Never rejected. The billed total is real and the structure is
+        readable; only the claim that the sizes are exact is unsupported."""
+        ts = self._load(self._row(self._counts_for(), provenance=None))
+        self.assertEqual(len(ts.requests), 1, "the row was dropped")
+        self.assertGreater(sum(s.tokens for s in ts.requests[0].segments), 0)
+
+    def test_the_report_says_it_estimated_them(self):
+        ts = self._load(self._row(self._counts_for(), provenance=None))
+        said = " ".join(ts.notes)
+        self.assertIn("could not vouch for", said)
+        self.assertIn("estimated", said)
+
+    def test_a_mixed_export_counts_only_the_vouched_rows(self):
+        ts = self._load(self._row(self._counts_for()),
+                        self._row(self._counts_for(), provenance=None))
+        self.assertGreater(ts.tokens_counted, 0.0)
+        self.assertLess(ts.tokens_counted, 1.0)
+
+    def test_what_the_writer_emits_is_accepted_end_to_end(self):
+        """The two halves against each other, through the real script rather
+        than a hand-built record: whatever `count_tokens.py` writes must be what
+        the loader vouches for. A drift in either direction shows up here as
+        counting silently ceasing to work."""
+        stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CountStub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.shutdown)
+        src = os.path.join(self.dir, "cap.jsonl")
+        with open(src, "w") as f:
+            f.write(json.dumps({
+                "sent_at": "2026-08-01T09:00:00Z", "body": self.BODY,
+                "usage": {"input_tokens": 1000, "cache_read_input_tokens": 0,
+                          "cache_creation_input_tokens": 0}}) + "\n")
+        out = os.path.join(self.dir, "counted.jsonl")
+        r = subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
+             "-o", out, "--endpoint",
+             f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens"],
+            capture_output=True, text=True, timeout=90,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        from cacheeconomics.adapters.bodies import load_bodies
+        ts = load_bodies(out, key=b"k" * 32)
+        self.assertEqual(ts.tokens_counted, 1.0,
+                         "the loader would not vouch for what the counter just "
+                         "wrote; the two sides have drifted")
+
+    def test_the_accepted_version_tracks_the_counter(self):
+        """The two constants are bumped in lockstep. If they part, the loader
+        silently estimates everything the current counter produces."""
+        from cacheeconomics.adapters import bodies
+        self.assertEqual(bodies.ACCEPTED_COUNTER_VERSION,
+                         self.ct.COUNTER_VERSION)
+        self.assertEqual(bodies.PROVENANCE_KEY, self.ct.PROVENANCE_KEY)
+
+
 class TestTheCountCacheIsScopedToItsCounter(unittest.TestCase):
     """The cache key was a digest of the prompt prefix and nothing else, while
     `count_tokens.py` exposes both `--model` and `--endpoint`.
@@ -1924,7 +2190,8 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
         self.assertEqual(p["analysis_model"], "claude-opus-5")
         self.assertEqual(p["endpoint"], self.endpoint)
         self.assertEqual(p["version"], m.COUNTER_VERSION)
-        self.assertEqual(p["body_sha256"], m.body_sha256(row["body"]))
+        from cacheeconomics.tokenizer import body_sha256
+        self.assertEqual(p["body_sha256"], body_sha256(row["body"]))
         self.assertIsNone(p["target_id"])
         self.assertIsNone(p["tokenizer_id"])
 
@@ -1949,8 +2216,9 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
         row = json.loads(open(out).read().strip())
         self.assertEqual(
             set(row[m.PROVENANCE_KEY]),
-            {"version", "tool", "row_sha256", "body_sha256", "tokenizer_model",
-             "analysis_model", "endpoint", "target_id", "tokenizer_id"})
+            {"version", "tool", "row_sha256", "body_sha256", "cuts_sha256",
+             "tokenizer_model", "analysis_model", "endpoint", "target_id",
+             "tokenizer_id"})
 
     def test_the_row_digest_covers_what_the_body_digest_misses(self):
         """The body digest is blind to the top-level model, and to usage,
@@ -1962,17 +2230,17 @@ class TestCountedRowsSayWhatProducedThem(unittest.TestCase):
                 "usage": {"input_tokens": 500}}
         changed = json.loads(json.dumps(base))
         changed["model"] = "claude-haiku-4-5"
-        self.assertEqual(m.body_sha256(base["body"]),
-                         m.body_sha256(changed["body"]),
+        from cacheeconomics.tokenizer import body_sha256, row_sha256
+        self.assertEqual(body_sha256(base["body"]), body_sha256(changed["body"]),
                          "the fixture no longer isolates the row from the body")
-        self.assertNotEqual(m.row_sha256(base), m.row_sha256(changed))
+        self.assertNotEqual(row_sha256(base), row_sha256(changed))
         for field, value in (("usage", {"input_tokens": 1}),
                              ("sent_at", "2026-08-02T09:00:00Z"),
                              ("status", 500), ("session", "other")):
             other = json.loads(json.dumps(base))
             other[field] = value
             with self.subTest(field=field):
-                self.assertNotEqual(m.row_sha256(base), m.row_sha256(other))
+                self.assertNotEqual(row_sha256(base), row_sha256(other))
 
     def test_it_carries_no_prompt_text(self):
         """The same rule the count cache was changed for: this lands on a
@@ -2190,7 +2458,8 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
         byte-identical while the tokenizer that should answer changes."""
         self._write_counted()
         src_row = json.loads(open(self.src).read().strip())
-        before = self.ct.body_sha256(src_row["body"])
+        from cacheeconomics.tokenizer import body_sha256
+        before = body_sha256(src_row["body"])
         src_row["model"] = "claude-haiku-4-5"
         del src_row["body"]["model"]
         with open(self.src, "w") as f:
@@ -2199,7 +2468,7 @@ class TestASweepWillNotReuseACountedFileItCannotVouchFor(unittest.TestCase):
         src_row["model"] = "claude-opus-5"
         with open(self.src, "w") as f:
             f.write(json.dumps(src_row) + "\n")
-        self.assertEqual(before, self.ct.body_sha256(src_row["body"]) if
+        self.assertEqual(before, body_sha256(src_row["body"]) if
                          src_row["body"].get("model") else before)
         got, attempts = self._counted_never_shelling_out()
         self.assertEqual(got, self.src,

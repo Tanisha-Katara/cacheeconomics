@@ -40,6 +40,22 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
+def _vouched(row, body_key="request"):
+    """Stamp a counted fixture with the record the loader now requires.
+
+    `load_bodies` only treats `segment_tokens` as exact when a
+    `segment_tokens_provenance` record shows the counts were taken from this
+    body and these prefix cuts, by a counter version it knows -- shape alone
+    used to be the whole test, so a stale or hostile enrichment loaded as exact.
+    These fixtures are hand-built stand-ins for a real counted export, so they
+    carry the same record one would.
+    """
+    from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,
+                                          counts_provenance)
+    row[COUNTS_PROVENANCE_KEY] = counts_provenance(row[body_key])
+    return row
+
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from cacheeconomics import (analyzer, checks, cost, monitor, trace,  # noqa: E402
@@ -2568,10 +2584,12 @@ class TestBothLoadersMeasureCoverageInMoney(unittest.TestCase):
         rows = [{"request": self._body(40),
                  "response": {"usage": {"input_tokens": 10}},
                  "segment_tokens": [5, 5]} for _ in range(99)]
+        rows = [_vouched(r) for r in rows]
         big = {"request": self._body(400_000),
                "response": {"usage": {"input_tokens": 1_000_000}}}
         if big_counted:
             big["segment_tokens"] = [500_000, 500_000]
+            _vouched(big)
         rows.append(big)
         from cacheeconomics.adapters.bodies import load_bodies
         return load_bodies(self._write(rows), self.KEY,
@@ -2639,6 +2657,7 @@ class TestTheCountedClaimIsStatedInMoney(unittest.TestCase):
                              "messages": [{"role": "user", "content": "hi"}]},
                  "response": {"usage": {"input_tokens": 10_000}},
                  "segment_tokens": [500, 500]} for _ in range(99)]
+        rows = [_vouched(r) for r in rows]
         if nobody_tokens:
             rows.append({"response": {"usage": {"input_tokens": nobody_tokens}}})
         fd, path = tempfile.mkstemp(suffix=".jsonl")
@@ -2778,6 +2797,7 @@ class TestAZeroSumCountIsNotAnExactCount(unittest.TestCase):
         rows = [{"request": self.BODY,
                  "response": {"usage": {"input_tokens": 50_000}},
                  "segment_tokens": [tok, tok]} for _ in range(20)]
+        rows = [_vouched(r) for r in rows]
         return load_bodies(self._write(rows), self.KEY,
                            target_id="anthropic/direct").tokens_counted
 

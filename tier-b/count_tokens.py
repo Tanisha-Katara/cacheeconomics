@@ -60,7 +60,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "harness"))
 
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
-from cacheeconomics.tokenizer import count_segments              # noqa: E402
+from cacheeconomics.tokenizer import (COUNTS_PROVENANCE_KEY,      # noqa: E402
+                                      COUNTS_PROVENANCE_VERSION,
+                                      count_segments, counts_provenance,
+                                      row_sha256)
 from cacheeconomics.registry import normalize_model, providers   # noqa: E402
 from cacheeconomics.trace import (_first, _text,                 # noqa: E402
                                   request_from_row)
@@ -71,14 +74,11 @@ from cacheeconomics.trace import (_first, _text,                 # noqa: E402
 # somewhere else, and a hard-coded host makes the answer "edit the source".
 DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
 
-# Bumped when anything about how a count is produced changes -- the cut
-# construction, the differencing, which model is asked. Recorded in every
-# counted row *and* folded into every cache key, so neither a counted export nor
-# a resume cache written by an older version can be read back by this one.
-COUNTER_VERSION = 2
-
-# Where the record of what produced `segment_tokens` lives on each counted row.
-PROVENANCE_KEY = "segment_tokens_provenance"
+# Both owned by `cacheeconomics.tokenizer`, which defines the vouching contract
+# the loader checks. Constants here as well as there was three copies of a pair
+# whose only job is that the two sides agree.
+COUNTER_VERSION = COUNTS_PROVENANCE_VERSION
+PROVENANCE_KEY = COUNTS_PROVENANCE_KEY
 
 
 class RowModels(typing.NamedTuple):
@@ -240,35 +240,6 @@ def row_models(row: dict, body: dict,
     return RowModels(tokenizer, analysis, prefix)
 
 
-def body_sha256(body) -> str:
-    """A digest of the body these counts were taken from.
-
-    Not the body. This lands in a file on a client's disk and the whole point of
-    the enrichment is that structure and counts are enough; the count cache made
-    exactly this mistake once already and was changed to digests.
-    """
-    return hashlib.sha256(
-        json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()
-
-
-def row_sha256(row) -> str:
-    """A digest of the whole source row, before this script adds anything.
-
-    The body digest alone said only that the counted *content* was unchanged. It
-    is blind to everything else the analyzer reads off the row -- usage,
-    timestamps, status, session, and the top-level `model` that resolves the
-    tokenizer for exactly the export shape round 3 was spent fixing. Changing
-    `row["model"]` left the body digest identical, so a counted file made under
-    a different tokenizer passed the freshness check.
-
-    Digesting the whole row rather than an enumerated subset on purpose: naming
-    the analysis-relevant fields here is a copy of the loader's knowledge, and
-    every copy of the loader's knowledge in this file has drifted.
-    """
-    return hashlib.sha256(
-        json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
-
-
 def counter_id(models: RowModels, endpoint: str,
                tokenizer_id: str | None) -> str:
     """The cache scope: everything that decides what a count comes back as.
@@ -295,16 +266,24 @@ def provenance(row, body, models: RowModels, endpoint: str,
     indistinguishable from a fresh one -- and `sweep_report.counted` reused it
     on the strength of the filename existing.
 
-    Both models, because they are two questions: `tokenizer_model` is what
-    answered and `analysis_model` is what the report names, and a reader
-    checking freshness may need either. Both digests, because the body says the
-    counted content is unchanged and the row says nothing else about the request
-    has changed underneath it. `tokenizer_id` is the operator's assertion about
-    which deployment answered, and it is the only thing here that cannot be
-    derived -- see `counter_id`.
+    Two layers. `counts_provenance` supplies what the *loader* checks -- the
+    counter version, a digest of the body and a digest of the prefix cuts the
+    counts are differences of -- which answers "do these counts describe this
+    body". Everything added here answers the wider question "would a re-run
+    agree": both models, because the tokenizer that answered and the model the
+    report names are two different things; the row digest, because the body
+    digest is blind to usage, timestamps, status and a top-level `model`; the
+    endpoint and surface, because they change what comes back; and
+    `tokenizer_id`, the operator's assertion about which deployment answered,
+    which is the only thing here that cannot be derived -- see `counter_id`.
     """
-    return {"version": COUNTER_VERSION, "tool": "tier-b/count_tokens.py",
-            "row_sha256": row_sha256(row), "body_sha256": body_sha256(body),
+    # The package's record, plus what only this script knows. The version and the
+    # two digests the loader checks are not restated here: `counts_provenance` is
+    # the one place they are produced, so a field added to the contract reaches
+    # every counted row without this function being edited.
+    return {**counts_provenance(body),
+            "tool": "tier-b/count_tokens.py",
+            "row_sha256": row_sha256(row),
             "tokenizer_model": models.tokenizer,
             "analysis_model": models.analysis,
             "endpoint": endpoint, "target_id": target_id,

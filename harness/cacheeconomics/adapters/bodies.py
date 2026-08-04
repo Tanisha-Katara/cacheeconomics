@@ -32,9 +32,40 @@ from ..trace import QUALIFIES_SPEND, counted_share
 from ..segment import (_billed_input, _requested_ttl, _scale_to_measured,
                        segments_from_request, usage_from_response)
 
-from ..tokenizer import apply_counts
+from ..tokenizer import (COUNTS_PROVENANCE_KEY, COUNTS_PROVENANCE_VERSION,
+                        apply_counts, counts_provenance)
 from ..trace import (Segment, Tier, TraceSet, _is_token_count, _parse_ts,
                      request_from_row, resolve_tenant)
+
+# Both from `tokenizer`, which owns the vouching contract. They were constants
+# here and constants again in `tier-b/count_tokens.py`, which is three copies of
+# a pair whose entire job is that two sides agree on them.
+PROVENANCE_KEY = COUNTS_PROVENANCE_KEY
+ACCEPTED_COUNTER_VERSION = COUNTS_PROVENANCE_VERSION
+
+
+def _counts_are_vouched(row: dict, body: dict) -> bool:
+    """Whether this row's `segment_tokens` may be trusted as exact.
+
+    Provenance naming a counter version this loader knows, over digests of what
+    the counts were actually taken from. Not the tokenizer model, the endpoint
+    or the surface: those say whether a *re-run* would produce the same counts,
+    which is `sweep_report.reusable_counts`'s question. This one is narrower --
+    were these counts taken from this body, cut this way, by something this
+    loader understands -- and it is the one that decides whether dollars are
+    released.
+    """
+    p = row.get(PROVENANCE_KEY)
+    if not isinstance(p, dict):
+        return False
+    # Compared against a freshly built record rather than field by field, so a
+    # field added to the contract is checked here the day it is added instead of
+    # the day somebody remembers to check it. The writer stamps a superset --
+    # the tokenizer that answered, the endpoint, the surface -- and those say
+    # whether a re-run would agree, which is a different question from whether
+    # these counts describe this body.
+    want = counts_provenance(body)
+    return all(p.get(k) == v for k, v in want.items())
 
 # Where the request body and the response live in each export shape. Checked in
 # order; the first that yields a dict with `messages` wins. Adding a format is a
@@ -154,7 +185,7 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
 
     requests, notes = [], []
     skipped_no_body = unparseable = dropped_no_body = 0
-    counted = uncounted = 0
+    counted = uncounted = unvouched = 0
     # Which requests got exact counts, in lockstep with `requests`, so coverage
     # can be weighted by what each one cost. `counted / segmented` counted rows,
     # and rows are the wrong denominator for a gate that releases dollars.
@@ -239,14 +270,37 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
             # stops this tool producing such a file; it does not stop one
             # arriving.
             billed = _billed_input(usage) if usage else 0
+            # And a record of what produced them, checked against the body in
+            # hand. Shape was the whole test before this: any correctly-shaped
+            # positive array loaded as *exact*, so a counted export left over
+            # from a different endpoint, a different tokenizer, an older counter
+            # or a capture that has since been re-recorded was indistinguishable
+            # from a fresh one -- and `tokens_counted` reaching 1.0 is what
+            # releases structural money.
+            #
+            # The digest comes from `tokenizer.body_sha256`, the same function
+            # `count_tokens.py` writes with. Two implementations that differed
+            # by one flag would fail every row into the estimate branch below,
+            # which is the direction that looks fine, so the two sides are
+            # pinned to one function by test rather than by intention.
+            vouched = _counts_are_vouched(row, body)
             if (isinstance(pre, list) and len(pre) == len(segs)
                     and all(_is_token_count(n) for n in pre)
-                    and (sum(pre) > 0 or not billed)):
+                    and (sum(pre) > 0 or not billed)
+                    and vouched):
                 apply_counts(segs, pre)
                 counted += 1
                 was_counted = True
             elif pre is not None:
                 uncounted += 1
+                if not vouched:
+                    # Estimated rather than refused, deliberately. The row's
+                    # billed total is still real and its structure is still
+                    # readable; only the claim that its segment sizes are exact
+                    # is unsupported. Dropping it would shrink the coverage
+                    # denominator and understate spend, which is a second wrong
+                    # answer laid over the first.
+                    unvouched += 1
             _scale_to_measured(segs, _billed_input(usage) if usage else None)
         counted_flags.append(was_counted)
         requests.append(request_from_row(
@@ -329,6 +383,20 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
             f"count -- so they were estimated instead. That usually means the export "
             f"was re-segmented after counting; re-run tier-b/count_tokens.py against "
             f"this file.")
+    # Separate from the shape failure above, because the operator's next step is
+    # different: a shape mismatch says re-run the counter, an unvouched row says
+    # the counts may be someone else's. Stated rather than silent -- these rows
+    # are the ones whose sizes look exact and are not, and a report that quietly
+    # estimated them would be indistinguishable from one that counted them.
+    if unvouched:
+        notes.append(
+            f"{unvouched:,} request(s) carried counts this loader could not vouch "
+            f"for -- no `{PROVENANCE_KEY}` record, a counter version it does not "
+            f"know, or a digest that does not match the body and prefix cuts in "
+            f"hand -- so they were estimated instead of being treated as exact. "
+            f"Counts are only trusted when they can be shown to have come from "
+            f"this body, cut this way. Re-run tier-b/count_tokens.py against this "
+            f"file to count it under the current counter.")
     if not counted:
         notes.append(
             "Token counts are proportional estimates scaled to the billed input total, "

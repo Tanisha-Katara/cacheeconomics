@@ -41,10 +41,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # curve was drawn from byte-share estimates instead. Two copies of one
 # derivation is what produced that, so there is now one.
 sys.path.insert(0, HERE)
-from count_tokens import (COUNTER_VERSION, DEFAULT_ENDPOINT,     # noqa: E402
-                          PROVENANCE_KEY, body_sha256, counted_path,
-                          row_models, row_sha256)
+from count_tokens import (DEFAULT_ENDPOINT, PROVENANCE_KEY,      # noqa: E402
+                          counted_path, row_models)
 from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
+from cacheeconomics.tokenizer import counts_provenance, row_sha256  # noqa: E402
 
 
 def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
@@ -110,8 +110,12 @@ def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
                 f"{tokenizer_id!r}), so nothing shows the tokenizer that "
                 f"produced these counts is the one answering now")
         models = row_models(s, body, target_id)
-        want = {"version": COUNTER_VERSION,
-                "row_sha256": row_sha256(s), "body_sha256": body_sha256(body),
+        # The package's vouching record -- version and the two digests the
+        # loader checks -- plus the settings that decide whether a *re-run*
+        # would agree. Built from `counts_provenance` rather than restated, so a
+        # field added to the contract is compared here the day it is added.
+        want = {**counts_provenance(body),
+                "row_sha256": row_sha256(s),
                 "tokenizer_model": models.tokenizer,
                 "analysis_model": models.analysis,
                 "endpoint": endpoint, "target_id": target_id,
