@@ -191,10 +191,16 @@ class TestTheSubcommandsRun(unittest.TestCase):
         self.assertIn("priced_models=", out)
 
     def test_checks_exit_code_carries_the_verdict(self):
+        # The surface is named, because every threshold these checks read is a
+        # per-surface fact. `--target-id` used to default to anthropic/direct,
+        # so this test passed while asking about a provider nobody had chosen --
+        # see TestTheChecksCommandWillNotAnswerForAnUnnamedSurface below.
         bad, _o, _e = run("checks", "--prefix-tokens", "300",
-                          "--model", "claude-opus-5", "--breakpoints", "5")
+                          "--model", "claude-opus-5", "--breakpoints", "5",
+                          "--target-id", "anthropic/direct")
         good, _o, _e = run("checks", "--prefix-tokens", "9000",
-                           "--model", "claude-opus-5", "--breakpoints", "2")
+                           "--model", "claude-opus-5", "--breakpoints", "2",
+                           "--target-id", "anthropic/direct")
         self.assertEqual(bad, 2, "a failing configuration must be detectable")
         self.assertEqual(good, 0)
 
@@ -318,3 +324,152 @@ class TestCiAssertsThingsTheReportStillSays(unittest.TestCase):
                                  "figures ARE released, so CI is asserting the "
                                  "absence of something the tool cannot emit")
                 self.assertNotRegex(self._report(), pattern)
+
+
+class TestTheChecksCommandWillNotAnswerForAnUnnamedSurface(unittest.TestCase):
+    """The function-level default was closed and the CLI walked around it.
+
+    `checks.check_minimum` and friends stopped defaulting `target_id`, but
+    `--target-id` still carried `default="anthropic/direct"` in the argparse
+    setup, so the public command handed the fabricated surface straight back in.
+    A parameter default is only one of the routes a surface gets named without
+    anyone choosing it; an argparse default is another, and `inspect.signature`
+    cannot see it.
+
+    Reproduced through the shipped CLI:
+
+        checks --prefix-tokens 768 --model claude-opus-5 --tokens-are-exact
+
+    exited 0 with three PASSes against Anthropic's 512-token minimum. The same
+    prefix on openai/direct FAILs against its 1,024.
+    """
+
+    ARGS = ("checks", "--prefix-tokens", "768", "--model", "claude-opus-5",
+            "--tokens-are-exact")
+
+    def test_it_abstains_and_exits_three_rather_than_passing(self):
+        code, out, _err = run(*self.ARGS)
+        self.assertEqual(code, 3, "abstain must not read as success")
+        self.assertNotIn("PASS", out)
+        self.assertEqual(3, out.count("ABSTAIN"),
+                         "every check answers per surface, so every one abstains")
+
+    def test_it_says_what_would_settle_it(self):
+        _code, out, _err = run(*self.ARGS)
+        self.assertIn("no provider surface named", out)
+        self.assertIn("target_id", out)
+
+    def test_the_same_prefix_still_gets_opposite_verdicts_once_named(self):
+        """Why the abstention is the honest answer rather than a nuisance."""
+        ok, _o, _e = run(*self.ARGS, "--target-id", "anthropic/direct")
+        bad, _o, _e = run(*self.ARGS, "--target-id", "openai/direct")
+        self.assertEqual(ok, 0)
+        self.assertEqual(bad, 2)
+
+    def test_naming_the_surface_still_works(self):
+        code, out, _err = run(*self.ARGS, "--target-id", "anthropic/direct")
+        self.assertEqual(code, 0)
+        self.assertIn("PASS", out)
+
+
+class TestClaudeCodeMakesTheSurfaceAChoice(unittest.TestCase):
+    """`cmd_claude_code` did `args.target_id or "anthropic/direct"`.
+
+    That is the *default* path of the command, and a transcript carries no
+    provider field anywhere, so the ordinary invocation priced Claude Code
+    sessions at Anthropic first-party rates whatever they actually ran against.
+    Measured on a 40-request fixture with `--allow-unreconciled`: $6.66 input
+    spend, $38.46 uncached, $31.80 saved and $123/mo, all released as DRAFT
+    under a rate table nobody chose.
+
+    Silently switching the default to UNATTRIBUTED was measured before it was
+    rejected: it empties the report rather than merely withholding dollars. The
+    same fixture then reports 0 requests, `input_from_cache` None,
+    `prefix_efficiency` None and no findings, in place of 40 requests at 94% and
+    94% -- and those two ratios come from the provider's own usage counters and
+    need no surface at all. So the choice is made explicit instead.
+    """
+
+    def _fixture(self, tmp):
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        with open(os.path.join(proj, "s.jsonl"), "w") as f:
+            for i in range(12):
+                f.write(json.dumps({
+                    "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
+                    "requestId": f"r{i}",
+                    "timestamp": f"2026-07-29T09:{i:02d}:00.000Z",
+                    "message": {"model": "claude-opus-5", "usage": {
+                        "input_tokens": 100, "output_tokens": 10,
+                        "cache_read_input_tokens": 20_000,
+                        "cache_creation_input_tokens": 1_000,
+                        # The per-lifetime split, without which every row is
+                        # excluded as an unprovable write and no dollar figure
+                        # is printed for a reason that has nothing to do with
+                        # the surface -- which would make the assertions below
+                        # pass while testing the wrong refusal.
+                        "cache_creation": {
+                            "ephemeral_5m_input_tokens": 1_000,
+                            "ephemeral_1h_input_tokens": 0}}}}) + "\n")
+        return tmp
+
+    def test_it_refuses_rather_than_assuming_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, err = run("claude-code", "--root", self._fixture(tmp),
+                                 "--allow-unreconciled")
+        self.assertEqual(code, 1)
+        self.assertNotIn("$", out, "no dollar figure may be printed at all")
+        self.assertNotIn("Traceback", err)
+
+    def test_the_refusal_names_both_ways_forward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _code, _out, err = run("claude-code", "--root", self._fixture(tmp))
+        self.assertIn("--assume-anthropic-direct", err)
+        self.assertIn("--target-id", err)
+        self.assertIn("carries no provider field", err)
+
+    def test_the_assumption_can_be_made_explicitly(self):
+        """And produces the report, rather than an empty shell.
+
+        Asserted on the two things that go blank when no surface is priceable,
+        because those are what made the silent-UNATTRIBUTED option an
+        over-block: `analyze` recomputes its ratios over the priced requests, so
+        with none priceable `input_from_cache` and `prefix_efficiency` render as
+        "—" and the findings list empties -- for two measurements taken straight
+        from the provider's usage counters, which no rate table affects.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out, _err = run("claude-code", "--root", self._fixture(tmp),
+                                  "--assume-anthropic-direct",
+                                  "--allow-unreconciled")
+        self.assertEqual(code, 0)
+        self.assertIn("DRAFT", out, "the figures were not released at all")
+        self.assertRegex(out, r"input from cache\s+\d+%",
+                         "the measured ratio came back blank")
+        self.assertRegex(out, r"prefix efficiency\s+\d+%")
+        self.assertIn("1 finding", out, "the findings list came back empty")
+
+    def test_and_is_still_disclosed_when_it_is_made(self):
+        """Opting in states the assumption; it does not retire it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _code, out, _err = run("claude-code", "--root", self._fixture(tmp),
+                                   "--assume-anthropic-direct",
+                                   "--allow-unreconciled")
+        flat = " ".join(out.split())
+        self.assertIn("surface assumed", flat)
+        self.assertIn("--target-id", flat)
+
+    def test_naming_a_different_surface_still_works(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _out, _err = run("claude-code", "--root", self._fixture(tmp),
+                                   "--target-id", "amazon-bedrock/converse",
+                                   "--allow-unreconciled")
+        self.assertEqual(code, 0)
+
+    def test_the_two_flags_cannot_contradict_each_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _out, err = run("claude-code", "--root", self._fixture(tmp),
+                                  "--target-id", "amazon-bedrock/converse",
+                                  "--assume-anthropic-direct")
+        self.assertEqual(code, 1)
+        self.assertIn("not both", err)

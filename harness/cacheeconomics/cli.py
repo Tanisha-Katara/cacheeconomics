@@ -280,16 +280,78 @@ def cmd_checks(args) -> int:
     return 0
 
 
+def _claude_code_target(args) -> str:
+    """The surface for a Claude Code run: stated, assumed on purpose, or refused.
+
+    A transcript records the conversation rather than the wire request and
+    carries no provider field anywhere -- checked across 190 of them -- so this
+    surface can never be read from the data. It used to be *fabricated* instead:
+    `args.target_id or "anthropic/direct"`, which is the default path of the
+    command, so the ordinary invocation priced transcripts at Anthropic
+    first-party rates whatever they actually ran against. Measured on a
+    40-request fixture with `--allow-unreconciled`: $6.66 input spend, $38.46
+    uncached, $31.80 saved, $123/mo, all released as DRAFT under a rate table
+    nobody had chosen. On a Bedrock- or Vertex-routed deployment every one of
+    those is against the wrong table, and the only thing standing in the way was
+    a prose caveat further down the report.
+
+    Defaulting to UNATTRIBUTED instead was measured before it was rejected, and
+    it does not merely withhold the dollars -- it empties the report. `analyze`
+    recomputes its ratios over the *priced* requests, so with none priceable the
+    same fixture reports 0 requests, `input_from_cache` None, `prefix_efficiency`
+    None and no findings at all, in place of 40 requests at 94% and 94%. Those
+    two ratios are computed from the provider's own usage counters and do not
+    depend on the rate table in any way, so silently trading them away to avoid
+    naming a surface would be an over-block: a command that answers nothing gets
+    switched off, and then it catches nothing.
+
+    So the choice is made explicit rather than either fabricated or removed.
+    Anthropic direct is still very likely correct -- Claude Code talks to
+    Anthropic unless CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set --
+    and `--assume-anthropic-direct` is how you say so. It stays an assumption:
+    the adapter's blocking note still fires and still holds release.
+
+    Refusing is louder and cheaper than the alternatives: one flag, at start-up,
+    instead of a wrong rate table discovered from a bill. Same shape as
+    `litellm_handler(mutate=True)`, which refuses at construction for the same
+    reason.
+    """
+    if args.target_id and args.assume_anthropic_direct:
+        raise Fail(
+            "pass either --target-id or --assume-anthropic-direct, not both: "
+            f"--target-id says the surface is {args.target_id!r} and "
+            f"--assume-anthropic-direct says to assume anthropic/direct.")
+    if args.target_id:
+        return args.target_id
+    if args.assume_anthropic_direct:
+        return "anthropic/direct"
+    raise Fail(
+        "this command needs to be told which provider surface these sessions "
+        "ran against, because a Claude Code transcript records the conversation "
+        "rather than the wire request and carries no provider field to read it "
+        "from. The surface decides which rate table applies, and Bedrock and "
+        "Vertex rates are not Anthropic's.\n"
+        "  --assume-anthropic-direct   Claude Code talks to Anthropic directly "
+        "unless CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set on the "
+        "machine that produced these transcripts. This is usually the right "
+        "answer; the report still states it as an assumption and still withholds "
+        "figures until they reconcile.\n"
+        "  --target-id <surface>       name it exactly, e.g. "
+        "amazon-bedrock/converse or google-cloud/vertex.")
+
+
 def cmd_claude_code(args) -> int:
     """Analyse local Claude Code transcripts.
 
     Reads only usage counters and prompt *shape* from the session files. It
     still touches transcripts, so the output can carry counts and timings
     derived from real work -- worth knowing before piping it anywhere.
+
+    The surface has to be chosen, one way or the other. See `_claude_code_target`.
     """
     from .adapters.claude_code import load_sessions
     ts = load_sessions(root=args.root, project=args.project, limit=args.limit,
-                       target_id=args.target_id or "anthropic/direct")
+                       target_id=_claude_code_target(args))
     a = analyze(ts, invoice_usd=args.invoice_usd,
                 effective_rate=args.effective_rate, on_date=args.on_date,
                 allow_unreconciled=args.allow_unreconciled)
@@ -443,7 +505,22 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--breakpoints", type=int, default=1)
     c.add_argument("--ttls", help="comma-separated lifetimes in wire order, "
                                   "e.g. 1h,5m")
-    c.add_argument("--target-id", default="anthropic/direct")
+    # No default surface. Minimums, breakpoint budgets and supported lifetimes
+    # are all per-surface -- 512 tokens on anthropic/direct is 1,024 on
+    # openai/direct -- so a default here answers for a provider the operator
+    # never chose. Measured: `checks --prefix-tokens 768 --model claude-opus-5
+    # --tokens-are-exact` with no surface exited 0 with three PASSes against
+    # Anthropic's 512 minimum, while the same prefix on openai/direct FAILs.
+    #
+    # The checks are tri-state, so nothing has to be refused here: all three
+    # abstain, and `cmd_checks` already maps abstention to exit 3 rather than 0
+    # precisely so that "I could not evaluate this" never reads as a pass.
+    c.add_argument("--target-id", default=DEFAULT_TARGET,
+                   help="the provider surface this configuration ships to "
+                        "(e.g. anthropic/direct, openai/direct, "
+                        "amazon-bedrock/converse). Without it every check "
+                        "abstains and the command exits 3, because these "
+                        "thresholds differ by surface")
     c.add_argument("--tokens-are-exact", action="store_true",
                    help="the prefix size is measured, not estimated")
     c.add_argument("--rolling-marker", action="store_true",
@@ -460,13 +537,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="transcript root (default: ~/.claude/projects)")
     cc.add_argument("--project", help="one project directory only")
     cc.add_argument("--limit", type=int, help="most recent N sessions only")
-    # A transcript carries no provider field, so the surface here is an
-    # assumption the report states out loud. This is how to correct it.
+    # A transcript carries no provider field, so the surface here can only be
+    # stated or assumed -- never read. One of these two is required; see
+    # `_claude_code_target` for why it is not simply defaulted either way.
     cc.add_argument("--target-id", default=None,
-                    help="the provider surface these sessions ran against "
-                         "(default anthropic/direct). Set it if Claude Code was "
-                         "routed through Bedrock or Vertex, whose rates are not "
-                         "Anthropic's")
+                    help="the provider surface these sessions ran against, "
+                         "e.g. amazon-bedrock/converse or google-cloud/vertex, "
+                         "whose rates are not Anthropic's")
+    cc.add_argument("--assume-anthropic-direct", action="store_true",
+                    help="assume these sessions ran against anthropic/direct, "
+                         "which is true unless CLAUDE_CODE_USE_BEDROCK or "
+                         "CLAUDE_CODE_USE_VERTEX was set. Required if "
+                         "--target-id is not given: the surface decides which "
+                         "rate table applies and cannot be read from a "
+                         "transcript. The report still states it as an "
+                         "assumption")
     _pricing_args(cc)
     _release_args(cc)
     _detail_arg(cc)

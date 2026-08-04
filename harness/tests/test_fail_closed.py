@@ -1934,3 +1934,89 @@ class TestAMarkerPlanIsNotWrittenOntoASurfaceThatIgnoresMarkers(unittest.TestCas
                                    model="claude-opus-5", gaps=self.GAPS,
                                    for_mutation=True)
         self.assertTrue(checked, "no non-breakpoint surfaces found; vacuous")
+
+
+class TestRelocationWillNotRecommendAMechanismForAnUnnamedSurface(unittest.TestCase):
+    """`relocate.propose` fabricated a surface in an or-expression.
+
+    `scopes = [(target_id or "anthropic/direct", model)] if model else
+    scopes_of(reqs)` -- so a caller who supplied `model` and omitted `target_id`
+    got a first-party surface invented for them. The surface is exactly what
+    `_authority_mechanism` reads to decide whether system-authority content may
+    leave the system block at all, so the single-scope override answered a
+    different question from the derived path on identical requests.
+
+    Reproduced on twelve UNATTRIBUTED claude-opus-5 requests:
+
+        propose(reqs, vol, model='claude-opus-5')
+            -> [medium] cross-authority, mechanism
+               'role:system message inside messages[]'
+        propose(reqs, vol)
+            -> [blocked], "claude-opus-5 on unknown/unattributed has no
+               recorded authority-preserving relocation mechanism"
+
+    The medium one recommends rewriting a prompt with a mechanism recorded for
+    one named surface, to somebody whose surface nobody stated. `medium` is
+    inside DEFAULT_APPLIED_RISKS, so it is a move the bake-off applies.
+    """
+
+    @staticmethod
+    def _reqs():
+        """A prompt whose volatile system header can only be freed by leaving
+        the system block: it is already last among the system segments, so the
+        within-container candidate recovers nothing and `_classify` falls
+        through to the cross-authority branch."""
+        def segs(i):
+            return [Segment(id="sys", role="system", tokens=8_000, index=0,
+                            label="instructions"),
+                    Segment(id=f"hdr{i}", role="system", tokens=200, index=1,
+                            label="session_header"),
+                    Segment(id="task", role="user", tokens=20_000, index=2,
+                            label="task_brief"),
+                    Segment(id=f"t{i}", role="user", tokens=300, index=3,
+                            label="user_turn")]
+        return [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                        model="claude-opus-5", usage={}, segments=segs(i))
+                for i in range(12)]
+
+    VOL = {0: 1, 1: 12, 2: 1, 3: 12}
+
+    def _move(self, **kw):
+        from cacheeconomics.relocate import propose
+        moves, _order = propose(self._reqs(), self.VOL, **kw)
+        self.assertTrue(moves, "fixture proposed nothing; the check is vacuous")
+        return moves[0]
+
+    def test_the_fixture_really_does_reach_the_cross_authority_branch(self):
+        """Guard the guard. A within-container move needs no mechanism and no
+        surface, so a fixture that produced one would pass every assertion
+        below without ever testing the thing they are named for."""
+        m = self._move(model="claude-opus-5", target_id="anthropic/direct")
+        self.assertEqual("cross-authority", m.scope)
+
+    def test_omitting_the_surface_no_longer_invents_one(self):
+        m = self._move(model="claude-opus-5")
+        self.assertEqual("blocked", m.risk)
+        self.assertEqual("", m.mechanism)
+        self.assertFalse(m.applicable)
+        self.assertIn("unknown/unattributed", m.blocked_by)
+
+    def test_the_override_now_agrees_with_the_derived_path(self):
+        """The defect was a disagreement between two routes to one answer."""
+        override = self._move(model="claude-opus-5")
+        derived = self._move()
+        self.assertEqual(derived.risk, override.risk)
+        self.assertEqual(derived.mechanism, override.mechanism)
+
+    def test_naming_the_surface_still_earns_the_recommendation(self):
+        """The other direction: this must not become an over-block. A stated
+        surface with a recorded mechanism still gets the move."""
+        m = self._move(model="claude-opus-5", target_id="anthropic/direct")
+        self.assertEqual("medium", m.risk)
+        self.assertEqual("role:system message inside messages[]", m.mechanism)
+        self.assertTrue(m.applicable)
+
+    def test_a_surface_with_no_recorded_mechanism_is_still_blocked(self):
+        """And the guard it was walking around still works when named."""
+        m = self._move(model="claude-opus-5", target_id="amazon-bedrock/converse")
+        self.assertEqual("blocked", m.risk)
