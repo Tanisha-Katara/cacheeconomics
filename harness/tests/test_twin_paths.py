@@ -2612,3 +2612,63 @@ class TestBothLoadersMeasureCoverageInMoney(unittest.TestCase):
         items = [("a", True), ("b", False)]
         self.assertEqual(
             trace.counted_share(items, lambda p: p[1], lambda p: 0), 0.5)
+
+
+class TestTheCountedClaimIsStatedInMoney(unittest.TestCase):
+    """`tokens_counted` scopes its ratio to rows that carry structure, in both
+    loaders, and that is deliberate -- it answers "are the sizes we have exact",
+    while `structural_coverage_billed` answers "is there structure at all".
+
+    But the two compose. A capture whose no-body rows carry 9% of the billed
+    tokens reports `tokens_counted == 1.0` *and* clears the 90% structural
+    floor, so both gates pass while a tenth of the spend was never counted --
+    and the note beside it said "exact for all 99 request(s)", which a reader
+    takes as "the figures rest on exact counts".
+
+    The denominator is left alone on purpose: making the two gates agree by
+    conflating them would be a worse answer than having each say what it covers.
+    What changed is that the claim is stated in money.
+    """
+
+    KEY = b"k" * 32
+
+    def _notes(self, nobody_tokens):
+        from cacheeconomics.adapters.bodies import load_bodies
+        rows = [{"request": {"model": "claude-opus-5",
+                             "system": [{"type": "text", "text": "x" * 4000}],
+                             "messages": [{"role": "user", "content": "hi"}]},
+                 "response": {"usage": {"input_tokens": 10_000}},
+                 "segment_tokens": [500, 500]} for _ in range(99)]
+        if nobody_tokens:
+            rows.append({"response": {"usage": {"input_tokens": nobody_tokens}}})
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write("\n".join(json.dumps(r) for r in rows))
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        ts = load_bodies(path, self.KEY, target_id="anthropic/direct")
+        return [n for n in ts.notes if "exact for" in n], ts
+
+    def test_the_claim_names_the_share_of_spend_it_covers(self):
+        notes, _ = self._notes(100_000)
+        self.assertTrue(notes)
+        self.assertIn("90.8% of the billed input tokens", notes[0])
+
+    def test_and_says_what_the_remainder_is(self):
+        notes, _ = self._notes(100_000)
+        self.assertIn("9.2%", notes[0])
+        self.assertIn("no recognisable body", notes[0])
+
+    def test_a_fully_bodied_capture_says_one_hundred_percent(self):
+        """The other direction: a real 100% must not carry a caveat about a
+        remainder that does not exist."""
+        notes, _ = self._notes(0)
+        self.assertIn("100.0% of the billed input tokens", notes[0])
+        self.assertNotIn("no recognisable body", notes[0])
+
+    def test_the_two_gates_still_measure_different_things(self):
+        """Pins the deliberate part. If someone later makes `tokens_counted`
+        unconditional, these stop differing and this test says so."""
+        _, ts = self._notes(100_000)
+        self.assertEqual(ts.tokens_counted, 1.0)
+        self.assertLess(ts.structural_coverage_billed, 0.99)

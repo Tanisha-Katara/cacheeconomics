@@ -284,12 +284,31 @@ def load_bodies(path: str, key: bytes, *, tenant: str | None = None,
         f"post hoc. Segment boundaries are inferred from the logged body, not recorded "
         f"at source.")
     if counted and not uncounted:
+        # Stated in money, not in request count. `counted` is a number of rows,
+        # and rows are the wrong denominator for a sentence a reader takes as
+        # "the figures rest on exact counts". A capture whose no-body rows carry
+        # 9% of the billed tokens reports `tokens_counted == 1.0` and clears the
+        # 90% structural floor, so both gates pass while a tenth of the spend was
+        # never counted -- and this note said "exact for all 99 requests" beside
+        # it. The denominator itself is left alone deliberately: `load_jsonl`
+        # scopes the same ratio to structured rows, the two gates measure
+        # different things, and making them agree by conflating them would be a
+        # worse answer than saying what each covers.
+        counted_billed = sum(_billed_input(r.usage or {}) for r, f
+                             in zip(requests, counted_flags) if f)
+        all_billed = sum(_billed_input(r.usage or {}) for r in requests)
+        share = (counted_billed / all_billed) if all_billed else 0.0
         notes.append(
-            f"Segment token counts are exact for all {counted:,} request(s): each was "
-            f"counted by the provider's own tokenizer in the context it appears in, "
-            f"then scaled to the billed input total. Structural findings inherit that "
-            f"rather than the proportional estimate, whose median error measured 19.2% "
-            f"per segment.")
+            f"Segment token counts are exact for {counted:,} request(s), covering "
+            f"{share:.1%} of the billed input tokens: each was counted by the "
+            f"provider's own tokenizer in the context it appears in, then scaled "
+            f"to the billed input total. Structural findings inherit that rather "
+            f"than the proportional estimate, whose median error measured 19.2% "
+            f"per segment."
+            + ("" if share > 0.999 else
+               f" The remaining {1 - share:.1%} carried no recognisable body, so "
+               f"its segment sizes are not counted and no structural finding "
+               f"rests on them."))
     # Reported whenever any row carried counts that could not be used, not only
     # when some other row's did. A `segment_tokens` array that matches nothing
     # means the enrichment step ran and did not take -- and if every row is like
