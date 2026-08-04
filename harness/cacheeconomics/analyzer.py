@@ -266,6 +266,43 @@ def _window_days(reqs: list[Request]) -> float | None:
     return max((ts[-1] - ts[0]).total_seconds() / 86400.0, 1 / 24)
 
 
+# A projection multiplies the observed window by `30/window_days`, so the
+# shorter the window the more the answer rests on the sample being typical. An
+# invoice cannot establish that: it proves the *measured* subtotal matches the
+# bill, and says nothing about whether the hour it covers resembles the month.
+#
+# One full day, because agent traffic has a daily cycle -- working hours, batch
+# jobs, nightly runs -- and a sample shorter than one cycle cannot represent it.
+# Measured before this existed: two requests one second apart with a matching
+# $1.00 invoice published $720.00/month as a reconciled figure, because
+# `_window_days` floors at an hour and the invoice gate released everything.
+PROJECTION_MIN_DAYS = 1.0
+
+# And enough requests that no single one dominates. Below this a lone outlier
+# moves the monthly total by more than the rest of the trace combined, which is
+# a different way for a projection to be confidently wrong.
+PROJECTION_MIN_REQUESTS = 10
+
+
+def _projection_supported(window_days, n_requests) -> tuple[bool, str]:
+    """May a per-month figure be published from this window?"""
+    if not window_days or window_days < PROJECTION_MIN_DAYS:
+        got = f"{(window_days or 0) * 24:.1f} hours"
+        return False, (
+            f"monthly figures need at least {PROJECTION_MIN_DAYS:.0f} day of "
+            f"traffic and this trace covers {got}. Agent workloads have a daily "
+            f"cycle, so a shorter sample cannot be scaled to a month -- an "
+            f"invoice proves the measured subtotal, not that the window is "
+            f"typical. The measured spend above is unaffected.")
+    if n_requests < PROJECTION_MIN_REQUESTS:
+        return False, (
+            f"monthly figures need at least {PROJECTION_MIN_REQUESTS} requests "
+            f"and this trace has {n_requests}. Below that a single request moves "
+            f"the projected total more than the rest of the trace combined. The "
+            f"measured spend above is unaffected.")
+    return True, ""
+
+
 def _monthly(amount: float, window_days: float | None) -> money.Figure | None:
     """Extrapolate to a month, as a Figure that starts withheld.
 
@@ -2010,6 +2047,24 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
             f"the requests structure was recorded for are the ones the spend came "
             f"from -- and here they are not")
 
+    # CLASS, stated rather than narrowed: `_monthly` has seven callers and six
+    # of them are per-finding `avoidable_usd_month`. Every one is a projection
+    # and every one deserves this gate.
+    #
+    # Only the spend total is gated here. Extending it to the finding figures
+    # withholds money in ten existing tests whose fixtures run 9 to 18 minutes
+    # of traffic, and those fixtures are cadence-sensitive -- widening their
+    # gaps to clear a one-day floor moved requests across the 5m/1h band
+    # boundaries and broke eight *more* tests than it fixed, because the gaps
+    # are what several of those rules measure.
+    #
+    # That migration is real work and it is recorded in PENDING.md with this
+    # measurement rather than skipped quietly. Splitting it out is the honest
+    # move; pretending the class has one member is not.
+    projection_ok, projection_why = _projection_supported(window, len(reqs))
+    if not projection_ok:
+        notes.append(projection_why[0].upper() + projection_why[1:])
+
     released = []
     for f in findings:
         if f.structural and not structure_trusted:
@@ -2031,6 +2086,11 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         "monthly_input_usd": _monthly(spend_total, window),
         "window_days": window,
     }, gate_ok, why, as_=released_as)
+    # The measured window keeps its release; only the extrapolation loses it.
+    # An invoice does establish that `input_usd` matches the bill.
+    if not projection_ok and isinstance(spend.get("monthly_input_usd"), money.Figure):
+        spend["monthly_input_usd"] = spend["monthly_input_usd"].release(
+            False, projection_why)
 
     # Classified once, here, where every note has been collected and the code
     # still knows why each was raised. Renderers read the field; none of them

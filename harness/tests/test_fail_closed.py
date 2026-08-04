@@ -1367,3 +1367,75 @@ class TestToolHistoryIsNeverAnAllocationTarget(unittest.TestCase):
         """Excluding tool history must not become placing nothing."""
         _, last = self._drive(apply=True)
         self.assertTrue(last.placements, "stood down entirely instead of skipping one position")
+
+
+class TestAnInvoiceDoesNotUnderwriteAProjection(unittest.TestCase):
+    """Reconciliation proves the *measured* subtotal matches the bill. It says
+    nothing about whether the window it covers resembles a month.
+
+    The gate treated those as one claim, so two requests one second apart with a
+    matching $1.00 invoice published $720.00/month as a reconciled figure --
+    `_window_days` floors at an hour and `release_map` released everything
+    together. The most authoritative-looking number in the report was the one
+    with the least evidence behind it.
+    """
+
+    def _analyse(self, n, span_seconds):
+        from cacheeconomics.analyzer import analyze
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(seconds=span_seconds * i / max(n - 1, 1)),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        ttl_requested="5m", session="s",
+                        usage={"input_tokens": 100_000},
+                        segments=[Segment(id="s", role="system", tokens=100_000,
+                                          index=0)])
+                for i in range(n)]
+        invoice = n * 100_000 * 5.0 / 1e6          # exact list price, reconciles
+        return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED,
+                                source="projection"), invoice_usd=invoice)
+
+    DAY = 86_400
+
+    def test_a_one_second_window_publishes_no_monthly_figure(self):
+        a = self._analyse(2, 1)
+        self.assertFalse(a.spend["monthly_input_usd"].released)
+
+    def test_but_the_measured_spend_still_publishes(self):
+        """The invoice does establish this one, and withholding it would throw
+        away the thing reconciliation actually proves."""
+        a = self._analyse(2, 1)
+        self.assertTrue(a.spend["input_usd"].released)
+
+    def test_too_few_requests_also_withholds_it(self):
+        """A long window with two requests is not a sample either: one request
+        moves the projected total more than the rest of the trace."""
+        a = self._analyse(2, 3 * self.DAY)
+        self.assertFalse(a.spend["monthly_input_usd"].released)
+
+    def test_a_day_of_real_traffic_publishes(self):
+        """The other direction. A floor that withheld everything would pass a
+        test asserting only that short windows withhold."""
+        a = self._analyse(40, 3 * self.DAY)
+        self.assertTrue(a.spend["monthly_input_usd"].released)
+
+    def test_the_reason_names_the_window_not_the_invoice(self):
+        """Telling a reader who supplied a correct invoice that reconciliation
+        failed sends them to fix something that is not broken."""
+        a = self._analyse(2, 1)
+        why = str(a.spend["monthly_input_usd"])
+        self.assertIn("day of traffic", why)
+        self.assertNotIn("reconcil", why.lower())
+
+    def test_the_demo_fixture_clears_the_floor(self):
+        """Calibration. The floor is meant to catch a nine-minute capture, not
+        a real workload -- if the shipped demo cannot clear it, it is wrong."""
+        from cacheeconomics.analyzer import _projection_supported
+        from cacheeconomics.trace import load_jsonl
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "fixtures", "demo-traces.jsonl")
+        ts = load_jsonl(os.path.normpath(path))
+        from cacheeconomics.analyzer import analyze
+        a = analyze(ts, invoice_usd=17.45)
+        ok, _ = _projection_supported(a.window_days, len(ts.requests))
+        self.assertTrue(ok, f"demo window {a.window_days:.2f}d is below the floor")
+        self.assertTrue(a.spend["monthly_input_usd"].released)
