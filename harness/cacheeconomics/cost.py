@@ -386,13 +386,22 @@ def ratios(usages: list[Usage]) -> dict:
     }
 
 
-def ttl_crossover(target_id: str = "anthropic/direct") -> dict:
+def ttl_crossover(target_id: str) -> dict:
     """Where the one-hour cache is worth its write premium.
 
     Derived from the registry rather than asserted, so it stays correct if a
     provider changes a multiplier. Both boundaries belong to the cache, not the
     price list, so this is model-independent: changing the model rescales the
     money without moving the window.
+
+    `target_id` is required rather than defaulted, and required rather than
+    accepting `UNATTRIBUTED`, because every number below is read out of one
+    surface's row: the lifetimes it offers and its read and write multipliers.
+    A default named `anthropic/direct`, so a caller who never chose a surface
+    was told which lifetime wins on a surface they may not be using -- and
+    deepseek/direct, one row away, offers no 1h lifetime at all. Same reasoning
+    as `registry.base_rate`, which took only model and date until the surface it
+    had erased turned out to decide the answer.
     """
     # Applicability first. An implicit-prefix surface has neither TTLs nor
     # write multipliers, so asking for multipliers before checking would raise

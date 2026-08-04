@@ -127,7 +127,10 @@ class TestRecordingRoundTrip(unittest.TestCase):
 
     def _record(self, n=6, fail_last=False, stream=False):
         path = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False).name
-        rec = Recorder(path, key=KEY, tenant="acme")
+        # The surface is stated, because these rows go on to be priced. A
+        # recorder that is not told writes `unknown/unattributed`, which is
+        # registered unpriceable and withholds every dollar figure downstream.
+        rec = Recorder(path, key=KEY, tenant="acme", target_id="anthropic/direct")
         for i in range(n):
             req = dict(REQUEST)
             req["messages"] = [{"role": "user",

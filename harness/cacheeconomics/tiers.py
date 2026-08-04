@@ -229,13 +229,29 @@ def expected_cost(blocks, ttls, read_rate, write_rates, gaps, survivals) -> floa
 
 
 def allocate(segments, change_rates, *, target_id: str, model: str,
-             gaps=None, budget=None) -> Allocation:
+             gaps=None, budget=None, for_mutation: bool = False) -> Allocation:
     """Best marker placement for one prompt shape under the surface's budget.
 
     `segments` are in wire order. `change_rates` maps segment index to the share
     of requests on which that segment changed -- a rate, not a count of distinct
     values, because a field alternating between two states changes the prefix on
     every single request and only ever shows two values.
+
+    `for_mutation` says whether this plan is about to be written onto a live
+    request. It splits by intent, not by caller: the same function serves the
+    report path and the request path, and only one of them can be wrong in a way
+    the provider will not report.
+
+    It exists for surfaces whose `control_model` is not `explicit_breakpoint`.
+    This whole model -- markers at wire positions cutting a prefix into blocks --
+    is explicit-breakpoint semantics. On a surface that reaches its cache some
+    other way (Bedrock searches backward from a checkpoint; Gemini caches a named
+    resource; DeepSeek matches an implicit prefix) the arithmetic above describes
+    something the provider does not do. A *report* may still model it and say so,
+    which is what the note below is for. Writing those positions onto somebody's
+    request cannot be caveated in the same way -- nobody reads a note at request
+    time, and a marker the surface does not honour is billed and silent -- so
+    mutation fails closed instead.
     """
     surf_budget, write_rates, read_rate = _surface(target_id, model)
     # `budget or surf_budget` made 0 indistinguishable from None, so a caller
@@ -279,10 +295,33 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
             f"provider caches nothing and returns no error. ({e})") from e
 
     control = registry.target(target_id).get("control_model")
-    if control and control != "explicit_breakpoint":
+    if control != "explicit_breakpoint":
+        # Reported as indicative; refused when it is about to be written.
+        #
+        # This branch used to append the note and carry straight on, so the live
+        # plugin put `cache_control` on a Bedrock request -- measured, markers
+        # {1: '5m'} on the wire -- with the words "treat the placement as
+        # indicative" going nowhere near the request. A caveat attached to a
+        # mutation is not a caveat, it is a mutation.
+        #
+        # A missing `control_model` fails closed with the rest. It is not
+        # evidence of explicit-breakpoint semantics; it is the absence of
+        # evidence, and this is the branch that decides whether to rewrite
+        # somebody's traffic.
+        if for_mutation:
+            raise Unsupported(
+                f"{target_id} controls caching by "
+                f"{control or 'a control model the registry does not record'}, "
+                f"not by an explicit breakpoint over a prefix, so a marker plan "
+                f"computed from explicit-breakpoint semantics must not be "
+                f"written onto a live request here. The plan is still modelled "
+                f"for reporting: run without mutation to see it, marked "
+                f"indicative. Confirm the placement against this surface before "
+                f"acting on it.")
         notes.append(
-            f"{target_id} controls caching by {control}, not by an explicit "
-            f"breakpoint over a prefix. This plan is modelled on "
+            f"{target_id} controls caching by "
+            f"{control or 'a control model the registry does not record'}, not "
+            f"by an explicit breakpoint over a prefix. This plan is modelled on "
             f"explicit-breakpoint semantics, so treat the placement as "
             f"indicative on this surface until it is confirmed against it")
 

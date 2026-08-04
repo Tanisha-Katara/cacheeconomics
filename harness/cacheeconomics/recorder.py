@@ -46,6 +46,9 @@ from datetime import datetime, timezone
 
 from .segment import (_billed_input, _get, _requested_ttl, _scale_to_measured,
                       segments_from_request, usage_from_response)
+# The one spelling of "no surface was stated", shared with the loaders so a row
+# this recorder writes and a row the JSONL loader defaults agree by construction.
+from .trace import UNATTRIBUTED
 
 SCHEMA_VERSION = 1
 
@@ -116,7 +119,21 @@ class Recorder:
     """
 
     def __init__(self, path: str, key: bytes, *, tenant: str | None = None,
-                 target_id: str = "anthropic/direct"):
+                 target_id: str = UNATTRIBUTED):
+        """`target_id` is the surface these requests are actually sent to.
+
+        It is stamped on every row and decides, months later and in another
+        process, which rate table the trace is priced against. It defaulted to
+        `anthropic/direct`, so a recorder wired into a proxy fronting Bedrock
+        wrote first-party attribution onto traffic AWS invoices -- and nothing
+        downstream could tell that surface from one somebody had chosen.
+
+        `UNATTRIBUTED` is registered unpriceable, so an unnamed surface produces
+        a report that refuses to publish dollars and says why, rather than one
+        that publishes the wrong ones. That is the same value the JSONL loader
+        already uses for a row that states no provider (`load_jsonl`'s
+        `default_target`), which is what a recorder writing no surface produces.
+        """
         if not key:
             raise ValueError(
                 "a recorder needs an HMAC key. Segment ids are keyed so that a short, "

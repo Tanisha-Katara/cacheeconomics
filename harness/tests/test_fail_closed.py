@@ -84,7 +84,7 @@ class TestNoMarkerOnAnUnknownModel(unittest.TestCase):
         last = None
         for i in range(20):
             _, last = p.on_request(body, model=UNKNOWN_MODEL,
-                                   at=T0 + timedelta(seconds=90 * i))
+                                   at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertFalse(last.applied)
         self.assertEqual(last.placements, {})
 
@@ -101,7 +101,7 @@ class TestNoMarkerOnAnUnknownModel(unittest.TestCase):
             fired += m.observe(Request(request_id=f"r{i}",
                                        sent_at=T0 + timedelta(seconds=60 * i),
                                        model=UNKNOWN_MODEL, usage={},
-                                       segments=segs, session="s"))
+                                       segments=segs, session="s", target_id="anthropic/direct"))
         self.assertNotIn("RT-MIN", {a.code for a in fired})
 
     def test_every_refusal_says_why(self):
@@ -994,7 +994,12 @@ class TestClaudeCodeSaysTheSurfaceIsAssumed(unittest.TestCase):
         from cacheeconomics.adapters.claude_code import load_sessions
         from cacheeconomics.report import render_text
         with tempfile.TemporaryDirectory() as tmp:
-            ts = load_sessions(root=self._fixture(tmp))
+            # Stated, which is what makes it an assumption to disclose. The
+            # parameter used to default to this value, so every library caller
+            # made the assumption whether or not they had considered it; now the
+            # CLI states it and this test states it too.
+            ts = load_sessions(root=self._fixture(tmp),
+                               target_id="anthropic/direct")
         self.assertTrue(ts.requests, "fixture produced no requests")
         self.assertTrue(any("surface assumed" in n for n in ts.blocking_notes))
         flat = " ".join(render_text(analyze(ts, allow_unreconciled=True)).split())
@@ -1668,3 +1673,264 @@ class TestTheDirectPathObeysTheSameMarkingRule(unittest.TestCase):
                            and not isinstance(path[2], str))
         with self.assertRaises(ValueError):
             apply_markers(b, {content_pos: "5m"})
+
+
+class TestNoSurfaceIsAnsweredForByDefault(unittest.TestCase):
+    """Default-deny for the *surface*, at every public entry point.
+
+    Same shape as the unknown-model sweep above, one field over. `target_id`
+    selects the rate table and the capability limits, so a parameter default
+    naming a surface is an answer nobody gave -- and it is given confidently,
+    because from inside the check there is no difference between a caller who
+    chose `anthropic/direct` and a caller who chose nothing.
+
+    The harm is measured rather than theoretical, and the first test below is
+    the reproduction: minimums differ by surface, so one request is PASS on one
+    and FAIL on another.
+
+    Eight public callables defaulted to `anthropic/direct`. Adversarial review
+    found two of them by hand. What follows pins the *behaviour* of each rather
+    than the signature, because a signature can be satisfied while the callee
+    quietly substitutes a surface back in.
+    """
+
+    def test_the_same_prefix_gets_two_verdicts_on_two_surfaces(self):
+        """The reproduction the rest of this class exists for."""
+        from cacheeconomics import registry
+        self.assertEqual(registry.min_cacheable_tokens("anthropic/direct",
+                                                       "claude-opus-5"), 512)
+        self.assertEqual(registry.min_cacheable_tokens("openai/direct",
+                                                       "claude-opus-5"), 1024)
+        opts = dict(tokens_are_estimated=False)
+        self.assertIs(checks.check_minimum(768, "claude-opus-5",
+                                           "anthropic/direct", **opts).status,
+                      checks.Status.PASS)
+        self.assertIs(checks.check_minimum(768, "claude-opus-5",
+                                           "openai/direct", **opts).status,
+                      checks.Status.FAIL)
+
+    def test_so_a_check_with_no_surface_abstains_rather_than_picking_one(self):
+        for r in (checks.check_minimum(768, "claude-opus-5"),
+                  checks.check_breakpoint_budget(5),
+                  checks.check_ttl_ordering(["5m"], UNATTRIBUTED)):
+            with self.subTest(check=r.check):
+                self.assertIs(r.status, checks.Status.ABSTAIN)
+                self.assertIn("no provider surface named", r.summary)
+
+    def test_run_all_abstains_on_every_check_rather_than_one(self):
+        rs = checks.run_all(prefix_tokens=768, model="claude-opus-5",
+                            breakpoints=5, ttls_in_order=["5m"])
+        self.assertEqual([checks.Status.ABSTAIN] * 3, [r.status for r in rs])
+        self.assertIs(checks.worst(rs), checks.Status.ABSTAIN)
+
+    def test_the_crossover_question_cannot_be_asked_without_a_surface(self):
+        """No default at all here: every number it returns is read out of one
+        surface's row, so there is nothing to abstain *with*."""
+        with self.assertRaises(TypeError):
+            cost.ttl_crossover()
+
+    def test_the_live_plugin_stands_down_when_no_surface_was_named(self):
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=4)
+        body = {"system": [{"type": "text", "text": "s" * 90_000}],
+                "messages": [{"role": "user", "content": "t"}]}
+        out = last = None
+        for i in range(12):
+            out, last = p.on_request(body, model="claude-opus-5", apply=True,
+                                     at=T0 + timedelta(seconds=120 * i))
+        self.assertFalse(last.applied)
+        self.assertEqual({}, last.placements)
+        self.assertNotIn("cache_control", json.dumps(out))
+        self.assertEqual(UNATTRIBUTED, last.scope[1],
+                         "the scope must record that no surface was named, not "
+                         "file this traffic under a first-party one")
+
+    def test_the_recorder_writes_no_surface_rather_than_a_first_party_one(self):
+        from cacheeconomics.recorder import Recorder
+        path = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False).name
+        try:
+            rec = Recorder(path, key=b"k" * 32)
+            self.assertEqual(UNATTRIBUTED, rec.target_id)
+            rec.capture({"model": "claude-opus-5",
+                         "messages": [{"role": "user", "content": "hi"}]},
+                        agent="a").done({"usage": {"input_tokens": 10}})
+            with open(path) as f:
+                row = json.loads(f.readline())
+            self.assertEqual(UNATTRIBUTED, row["target_id"])
+        finally:
+            os.unlink(path)
+
+    def test_a_request_nobody_told_carries_no_surface(self):
+        """The field every one of the above eventually writes into."""
+        r = Request(request_id="r", sent_at=T0, model="claude-opus-5", usage={})
+        self.assertEqual(UNATTRIBUTED, r.target_id)
+
+    def test_and_that_withholds_dollars_instead_of_publishing_wrong_ones(self):
+        """The consequence, end to end: unpriceable rather than mispriced."""
+        reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                        model="claude-opus-5",
+                        usage={"input_tokens": 1_000_000,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0})
+                for i in range(4)]
+        a = analyze(TraceSet(requests=reqs, tier=Tier.USAGE_ONLY),
+                    allow_unreconciled=True)
+        self.assertFalse(a.spend["input_usd"].released)
+        self.assertTrue(any(UNATTRIBUTED in n for n in a.notes),
+                        "the report must say which surface it could not price")
+
+    def test_the_claude_code_adapter_says_so_rather_than_assuming(self):
+        from cacheeconomics.adapters.claude_code import load_sessions
+        with tempfile.TemporaryDirectory() as tmp:
+            proj = os.path.join(tmp, "proj")
+            os.makedirs(proj)
+            with open(os.path.join(proj, "s.jsonl"), "w") as f:
+                for i in range(4):
+                    f.write(json.dumps({
+                        "type": "assistant", "sessionId": "s1", "uuid": f"u{i}",
+                        "requestId": f"r{i}",
+                        "timestamp": f"2026-07-29T09:0{i}:00.000Z",
+                        "message": {"model": "claude-opus-5",
+                                    "usage": {"input_tokens": 100,
+                                              "output_tokens": 10,
+                                              "cache_read_input_tokens": 20_000,
+                                              "cache_creation_input_tokens": 1_000}}}) + "\n")
+            ts = load_sessions(root=tmp)
+        self.assertTrue(ts.requests, "fixture produced no requests")
+        self.assertTrue(all(r.target_id == UNATTRIBUTED for r in ts.requests))
+        self.assertTrue(any("No provider surface was stated" in n
+                            for n in ts.blocking_notes),
+                        "an unnamed surface has to block release, not pass quietly")
+
+
+class TestMutationIsOptIn(unittest.TestCase):
+    """`on_request` used to default `apply=True`.
+
+    So a direct integration -- somebody wiring this into their own client rather
+    than into a proxy -- rewrote live requests by default, while
+    `litellm_handler` one layer up defaulted `mutate=False` and documented at
+    length why. Two supported ways of using the package, disagreeing about
+    whether it edits somebody's traffic.
+
+    Measured before the change: twelve warm requests through `on_request(body,
+    model='claude-opus-5')` returned a body carrying `cache_control`, with
+    `applied=True` and `placements={1: '5m'}`, against a surface nobody named.
+    """
+
+    BODY = {"system": [{"type": "text", "text": "s" * 90_000}],
+            "messages": [{"role": "user", "content": "hello"}]}
+
+    def _run(self, **kw):
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=4)
+        out = d = None
+        for i in range(12):
+            out, d = p.on_request(self.BODY, model="claude-opus-5",
+                                  target_id="anthropic/direct",
+                                  at=T0 + timedelta(seconds=120 * i), **kw)
+        return out, d
+
+    def test_the_default_places_nothing_on_the_wire(self):
+        out, d = self._run()
+        self.assertFalse(d.applied)
+        self.assertNotIn("cache_control", json.dumps(out))
+
+    def test_the_default_returns_the_callers_own_body(self):
+        out, _d = self._run()
+        self.assertIs(self.BODY, out)
+
+    def test_it_still_says_what_it_would_have_done(self):
+        """Observe-only is not silent. The plan is kept as a proposal, which is
+        what makes the default usable rather than merely safe."""
+        _out, d = self._run()
+        self.assertTrue(d.proposed)
+        self.assertIn("observing only", d.reason)
+
+    def test_and_asking_for_it_still_works(self):
+        out, d = self._run(apply=True)
+        self.assertTrue(d.applied)
+        self.assertIn("cache_control", json.dumps(out))
+
+
+class TestAMarkerPlanIsNotWrittenOntoASurfaceThatIgnoresMarkers(unittest.TestCase):
+    """`tiers.allocate` noted that a surface controls caching some other way,
+    and then emitted a marker plan regardless.
+
+    Measured: twelve warm requests through the plugin with
+    `target_id='amazon-bedrock/converse'` put `cache_control` on the wire --
+    `placements={1: '5m'}` -- while the note beside it said "treat the placement
+    as indicative on this surface". A caveat attached to a mutation is not a
+    caveat: nobody reads a note at request time.
+
+    The split is by intent. A report may still model the plan and say so,
+    because a reader sees the note. A request path may not, because a marker the
+    surface does not honour is billed and returns no error.
+    """
+
+    SEGS = [Segment(id="a", role="system", tokens=20_000, index=0),
+            Segment(id="b", role="user", tokens=200, index=1)]
+    RATES = {0: 0.0, 1: 1.0}
+    GAPS = [120.0] * 20
+    BEDROCK = "amazon-bedrock/converse"
+
+    def _plugin_run(self, apply):
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=4)
+        body = {"system": [{"type": "text", "text": "s" * 90_000}],
+                "messages": [{"role": "user", "content": "t"}]}
+        out = last = None
+        for i in range(12):
+            out, last = p.on_request(body, model="claude-opus-5",
+                                     target_id=self.BEDROCK, apply=apply,
+                                     at=T0 + timedelta(seconds=120 * i))
+        return out, last
+
+    def test_a_report_still_models_it_and_says_it_is_indicative(self):
+        a = tiers.allocate(self.SEGS, self.RATES, target_id=self.BEDROCK,
+                           model="claude-opus-5", gaps=self.GAPS)
+        self.assertTrue(a.tiers, "the report path must still produce a plan")
+        self.assertTrue(any("controls caching by checkpoint_backward_search" in n
+                            for n in a.notes))
+        self.assertTrue(any("indicative" in n for n in a.notes))
+
+    def test_but_the_same_plan_is_refused_when_it_is_about_to_be_written(self):
+        with self.assertRaises(tiers.Unsupported) as e:
+            tiers.allocate(self.SEGS, self.RATES, target_id=self.BEDROCK,
+                           model="claude-opus-5", gaps=self.GAPS,
+                           for_mutation=True)
+        self.assertIn("checkpoint_backward_search", str(e.exception))
+        self.assertIn("live request", str(e.exception))
+
+    def test_the_live_plugin_stands_down_rather_than_marking_bedrock(self):
+        out, last = self._plugin_run(apply=True)
+        self.assertFalse(last.applied)
+        self.assertNotIn("cache_control", json.dumps(out))
+        self.assertIn("checkpoint_backward_search", last.reason)
+
+    def test_a_dry_run_on_the_same_surface_still_reports_a_plan(self):
+        """The other half. Refusing both would be an over-block: the plan is the
+        useful part, and a reader can act on it deliberately."""
+        _out, last = self._plugin_run(apply=False)
+        self.assertTrue(last.proposed, "the dry run lost the plan as well")
+
+    def test_every_surface_that_does_not_take_breakpoints_refuses_mutation(self):
+        """Members from the registry at runtime, not from a list written here.
+
+        Scoped honestly, because only one of them reaches the branch this
+        closes. Of the four surfaces whose `control_model` is not
+        `explicit_breakpoint`, three are already refused earlier for unrelated
+        reasons -- two are flagged contested, one records no explicit
+        breakpoints at all -- so only amazon-bedrock/converse ever got as far as
+        the note. The other three would fall straight through it the day a
+        contested flag is cleared, which is why this asks all of them.
+        """
+        from cacheeconomics import registry
+        checked = []
+        for t in registry.target_ids(include_contested=True):
+            row = registry.target(t, allow_contested=True)
+            if row.get("control_model") == "explicit_breakpoint":
+                continue
+            checked.append(t)
+            with self.subTest(target=t):
+                with self.assertRaises(tiers.Unsupported):
+                    tiers.allocate(self.SEGS, self.RATES, target_id=t,
+                                   model="claude-opus-5", gaps=self.GAPS,
+                                   for_mutation=True)
+        self.assertTrue(checked, "no non-breakpoint surfaces found; vacuous")

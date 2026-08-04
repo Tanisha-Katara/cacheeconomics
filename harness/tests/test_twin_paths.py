@@ -120,9 +120,9 @@ class TestOneFactOneValue(unittest.TestCase):
         sent = T0
         observed = Request(request_id="o", sent_at=sent,
                            first_token_at=sent + timedelta(seconds=20),
-                           model="claude-opus-5", usage={}, segments=[])
+                           model="claude-opus-5", usage={}, segments=[], target_id="anthropic/direct")
         assumed = Request(request_id="a", sent_at=sent,
-                          model="claude-opus-5", usage={}, segments=[])
+                          model="claude-opus-5", usage={}, segments=[], target_id="anthropic/direct")
         at, was_observed = trace.write_visible_at(observed)
         self.assertEqual(at, sent + timedelta(seconds=20))
         self.assertTrue(was_observed)
@@ -150,7 +150,7 @@ class TestVolatilityIsMeasuredTheSameWay(unittest.TestCase):
             return out
         return [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=240 * i),
                         model="claude-opus-5", usage={"input_tokens": 10},
-                        segments=segs(i), session="s") for i in range(n)]
+                        segments=segs(i), session="s", target_id="anthropic/direct") for i in range(n)]
 
     def test_they_agree_exactly_when_every_position_appears_from_the_start(self):
         """The strict case, and the one that matters: no late arrivals, so both
@@ -163,7 +163,7 @@ class TestVolatilityIsMeasuredTheSameWay(unittest.TestCase):
                     Segment(id=f"turn{i}", role="user", tokens=200, index=3)]
         reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=240 * i),
                         model="claude-opus-5", usage={"input_tokens": 10},
-                        segments=segs(i), session="s") for i in range(40)]
+                        segments=segs(i), session="s", target_id="anthropic/direct") for i in range(40)]
         m = monitor.Monitor()
         for r in reqs:
             m.observe_shape(r)
@@ -205,7 +205,7 @@ class TestVolatilityIsMeasuredTheSameWay(unittest.TestCase):
         reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
                         model="claude-opus-5", usage={},
                         segments=[Segment(id="a", role="system", tokens=9_000, index=0)],
-                        session="s") for i in range(20)]
+                        session="s", target_id="anthropic/direct") for i in range(20)]
         m = monitor.Monitor()
         for r in reqs:
             m.observe_shape(r)
@@ -223,7 +223,11 @@ class TestTheMinimumIsEnforcedEverywhereOrNowhere(unittest.TestCase):
     MODEL = "claude-haiku-4-5"     # 4,096
 
     def test_the_static_check_refuses_a_short_prefix(self):
-        r = checks.check_minimum(self.SHORT, self.MODEL)
+        # The surface is named, as it is on the three siblings below. It used to
+        # be omitted here and the check defaulted to `anthropic/direct`, so this
+        # member of a four-way twin-path invariant was the one asking a
+        # different question from the other three.
+        r = checks.check_minimum(self.SHORT, self.MODEL, "anthropic/direct")
         self.assertIs(r.status, checks.Status.FAIL)
 
     def test_the_allocator_refuses_the_same_prefix(self):
@@ -238,7 +242,12 @@ class TestTheMinimumIsEnforcedEverywhereOrNowhere(unittest.TestCase):
                 "messages": [{"role": "user", "content": "t"}]}
         last = None
         for i in range(20):
+            # `apply=True` and a named surface, so this still tests the minimum.
+            # With the observe-only default and no surface it would refuse for
+            # two other reasons and the assertion below would pass without ever
+            # reaching the guard it is named after.
             _, last = p.on_request(body, model=self.MODEL,
+                                   target_id="anthropic/direct", apply=True,
                                    at=T0 + timedelta(seconds=90 * i))
         self.assertFalse(last.applied)
 
@@ -250,7 +259,7 @@ class TestTheMinimumIsEnforcedEverywhereOrNowhere(unittest.TestCase):
         from cacheeconomics.allocate import allocator_lite
         r = Request(request_id="r", sent_at=T0, model=self.MODEL, usage={},
                     segments=[Segment(id="a", role="system",
-                                      tokens=self.SHORT, index=0)])
+                                      tokens=self.SHORT, index=0)], target_id="anthropic/direct")
         self.assertEqual(allocator_lite(r, volatility={0: 1},
                                         cadence_seconds=120).marker_indices, [])
 
@@ -261,12 +270,13 @@ class TestTheMinimumIsEnforcedEverywhereOrNowhere(unittest.TestCase):
             tiers.allocate([Segment(id="a", role="system", tokens=9_000, index=0)],
                            {0: 0.0}, target_id="anthropic/direct",
                            model="nobody-registered-this", gaps=[120.0] * 20)
-        self.assertIs(checks.check_minimum(9_000, "nobody-registered-this").status,
+        self.assertIs(checks.check_minimum(9_000, "nobody-registered-this",
+                                           "anthropic/direct").status,
                       checks.Status.ABSTAIN)
         from cacheeconomics.allocate import allocator_lite
         r = Request(request_id="r", sent_at=T0, model="nobody-registered-this",
                     usage={}, segments=[Segment(id="a", role="system",
-                                                tokens=9_000, index=0)])
+                                                tokens=9_000, index=0)], target_id="anthropic/direct")
         self.assertEqual(allocator_lite(r, volatility={0: 1},
                                         cadence_seconds=120).marker_indices, [])
 
@@ -285,7 +295,7 @@ class TestRebuildMeansTheSameThingLiveAndInReport(unittest.TestCase):
                        "cache_read_input_tokens": 0 if cold else p,
                        "cache_creation_input_tokens": w,
                        "cache_creation": {"ephemeral_5m_input_tokens": w,
-                                          "ephemeral_1h_input_tokens": 0}}))
+                                          "ephemeral_1h_input_tokens": 0}}, target_id="anthropic/direct"))
             p += 2_000
         return out
 
@@ -390,7 +400,7 @@ class TestTheLifetimeBandIsOneBand(unittest.TestCase):
                     ttl_requested="5m", session="s",
                     segments=[Segment(id="a", role="system", tokens=9_000, index=0,
                                       cache_marked=True, ttl="5m"),
-                              Segment(id=f"t{i}", role="user", tokens=100, index=1)]))
+                              Segment(id=f"t{i}", role="user", tokens=100, index=1)], target_id="anthropic/direct"))
             return [a for a in fired if a.code == "RT-TTL"]
 
         self.assertTrue(ttl_alerts((lo + hi) / 2))
@@ -417,7 +427,7 @@ class TestMixedLifetimesAreUnprovable(unittest.TestCase):
                        segments=[Segment(id="sys", role="system", tokens=40_000,
                                          index=0, cache_marked=True, ttl=prefix_ttl),
                                  Segment(id=f"t{i}", role="user", tokens=200,
-                                         index=1, cache_marked=True, ttl=turn_ttl)])
+                                         index=1, cache_marked=True, ttl=turn_ttl)], target_id="anthropic/direct")
 
     def _ttl_alert(self, prefix_ttl, turn_ttl, row_ttl, gap=900):
         m, fired = monitor.Monitor(), []
@@ -456,7 +466,7 @@ class TestMixedLifetimesAreUnprovable(unittest.TestCase):
                 ttl_requested="5m", session="s",
                 segments=[Segment(id="sys", role="system", tokens=40_000,
                                   index=0, cache_marked=True, ttl="5m"),
-                          Segment(id=f"t{i}", role="user", tokens=200, index=1)]))
+                          Segment(id=f"t{i}", role="user", tokens=200, index=1)], target_id="anthropic/direct"))
         self.assertIsNotNone(next((a for a in fired if a.code == "RT-TTL"), None))
 
     def test_an_advancing_marker_is_reported_by_both(self):
@@ -732,7 +742,7 @@ class TestTheDraftOverrideMeansTheSameThingEverywhere(unittest.TestCase):
                         segments=[Segment(id="sys", role="system", tokens=9000,
                                           index=0, cache_marked=True, ttl="5m"),
                                   Segment(id=f"t{i}", role="user", tokens=200,
-                                          index=1)])
+                                          index=1)], target_id="anthropic/direct")
                 for i in range(30)]
 
     def test_a_failed_invoice_blocks_the_bake_off_despite_the_override(self):
@@ -826,7 +836,7 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
                    "cache_creation_input_tokens": 0 if i else 9000},
             segments=[Segment(id="sys", role="system", tokens=9000, index=0,
                               cache_marked=True, ttl="5m"),
-                      Segment(id=f"t{i}", role="user", tokens=200, index=1)])
+                      Segment(id=f"t{i}", role="user", tokens=200, index=1)], target_id="anthropic/direct")
             for i in range(n)]
 
     def _both_withhold(self, ts, label):
@@ -844,7 +854,7 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
             model="claude-opus-5", agent="a", session="s", ttl_requested="5m",
             status=500,
             usage={"input_tokens": 5_000_000, "cache_read_input_tokens": 0,
-                   "cache_creation_input_tokens": 0}, segments=[]))
+                   "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct"))
         self._both_withhold(
             TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"),
             "failed but billed")
@@ -854,7 +864,7 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
         reqs.append(Request(
             request_id="blind", sent_at=T0 + timedelta(seconds=9999),
             model="claude-opus-5", agent="a", session="s", ttl_requested="5m",
-            usage={}, segments=[]))
+            usage={}, segments=[], target_id="anthropic/direct"))
         self._both_withhold(
             TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"),
             "no usage fields")
@@ -902,7 +912,7 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
             model="claude-opus-5", agent="a", session="s", ttl_requested="5m",
             status=500,
             usage={"input_tokens": 5_000_000, "cache_read_input_tokens": 0,
-                   "cache_creation_input_tokens": 0}, segments=[]))
+                   "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct"))
         ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
         b = simulate.bake_off(ts.analysable, group="g", allow_unreconciled=True,
                               excluded_billed=ts.excluded_billed)
@@ -1028,7 +1038,7 @@ class TestCoverageThatGatesMoneyIsWeightedByMoney(unittest.TestCase):
                 segments=[Segment(id=f"vol{i}", role="system", tokens=500, index=0),
                           Segment(id="tools", role="tools", tokens=29500, index=1,
                                   cache_marked=True, ttl="5m"),
-                          Segment(id=f"t{i}", role="user", tokens=200, index=2)]))
+                          Segment(id=f"t{i}", role="user", tokens=200, index=2)], target_id="anthropic/direct"))
         for i in range(3):
             reqs.append(Request(
                 request_id=f"h{i}", sent_at=T0 + timedelta(seconds=120 * (27 + i)),
@@ -1036,7 +1046,7 @@ class TestCoverageThatGatesMoneyIsWeightedByMoney(unittest.TestCase):
                 usage={"input_tokens": unstructured_tokens,
                        "cache_read_input_tokens": 0,
                        "cache_creation_input_tokens": 0},
-                segments=[]))
+                segments=[], target_id="anthropic/direct"))
         return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x",
                         structural_coverage=27 / 30)
 
@@ -1075,7 +1085,7 @@ class TestCoverageThatGatesMoneyIsWeightedByMoney(unittest.TestCase):
                                   "cache_read_input_tokens": 0,
                                   "cache_creation_input_tokens": 0},
                            segments=[Segment(id=i, role="system", tokens=100, index=n)
-                                     for n, i in enumerate(ids)])
+                                     for n, i in enumerate(ids)], target_id="anthropic/direct")
         truth = [side(f"t{i}", [f"a{i}", f"b{i}"], 200) for i in range(9)]
         inferred = [side(f"t{i}", [f"a{i}", f"b{i}"], 200) for i in range(9)]
         truth.append(side("huge", ["x", "y", "z"], 900_000))
@@ -1142,7 +1152,7 @@ class TestCadenceIsMeasuredInsideACacheScope(unittest.TestCase):
                     segments=[Segment(id=f"sys{t}", role="system", tokens=30000,
                                       index=0, cache_marked=True, ttl="5m"),
                               Segment(id=f"u{t}{k}", role="user", tokens=200,
-                                      index=1)]))
+                                      index=1)], target_id="anthropic/direct"))
         reqs.sort(key=lambda r: r.sent_at)
         return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="t")
 
@@ -1577,10 +1587,10 @@ class TestAbsenceIsNeverProofOfZero(unittest.TestCase):
                      agent="a", session="s", ttl_requested="5m",
                      usage={"input_tokens": 1_000_000,
                             "cache_read_input_tokens": 0,
-                            "cache_creation_input_tokens": 0}, segments=[])
+                            "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct")
         bad = Request(request_id="failed", sent_at=T0 + timedelta(seconds=60),
                       model="claude-opus-5", agent="a", session="s",
-                      ttl_requested="5m", status=500, usage=poisoned, segments=[])
+                      ttl_requested="5m", status=500, usage=poisoned, segments=[], target_id="anthropic/direct")
         ts = TraceSet(requests=[ok, bad], tier=Tier.USAGE_ONLY, source="x")
         self.assertEqual(ts.excluded_billed, {"failed but billed": 1})
         a = analyze(ts, invoice_usd=5.00)
@@ -1591,7 +1601,7 @@ class TestAbsenceIsNeverProofOfZero(unittest.TestCase):
         """Summing only the valid counters must not make a wholly malformed row
         look like a clean zero. `has_usage` catches those as blind rows."""
         r = Request(request_id="x", sent_at=T0, model="claude-opus-5",
-                    usage={"input_tokens": float("nan")}, segments=[])
+                    usage={"input_tokens": float("nan")}, segments=[], target_id="anthropic/direct")
         self.assertFalse(r.has_usage)
 
     def test_a_missing_litellm_split_is_not_proof_of_no_caching(self):
@@ -1635,7 +1645,7 @@ class TestAFixMustRecoverWhatItClaims(unittest.TestCase):
                 request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
                 model="claude-opus-5", agent="a", session="s", ttl_requested="5m",
                 usage={"input_tokens": 200, "cache_read_input_tokens": 0,
-                       "cache_creation_input_tokens": 30400}, segments=segs))
+                       "cache_creation_input_tokens": 30400}, segments=segs, target_id="anthropic/direct"))
         return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
 
     def _vol(self, blockers):
@@ -1762,7 +1772,7 @@ class TestStructuralMoneyNeedsCountedTokens(unittest.TestCase):
                         usage={"input_tokens": 200, "cache_read_input_tokens": 0,
                                "cache_creation_input_tokens": 30400},
                         segments=[replace(s, id=f"{s.id}{i}" if s.index == 0 else s.id)
-                                  for s in segs])
+                                  for s in segs], target_id="anthropic/direct")
                 for i in range(40)]
         return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x", **kw)
 
@@ -1845,7 +1855,7 @@ class TestBothRenderersSayWhatToDo(unittest.TestCase):
                         usage={"input_tokens": 200, "cache_read_input_tokens": 0,
                                "cache_creation_input_tokens": 30400},
                         segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
-                                  for s in segs])
+                                  for s in segs], target_id="anthropic/direct")
                 for i in range(40)]
         return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"),
                        allow_unreconciled=True)
@@ -1914,7 +1924,7 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
                         usage={"input_tokens": 200, "cache_read_input_tokens": 0,
                                "cache_creation_input_tokens": 30400},
                         segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
-                                  for s in segs])
+                                  for s in segs], target_id="anthropic/direct")
                 for i in range(40)]
         return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"),
                        allow_unreconciled=True)
@@ -1970,7 +1980,7 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
                         usage={"input_tokens": 200, "cache_read_input_tokens": 0,
                                "cache_creation_input_tokens": 30400},
                         segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
-                                  for s in segs])
+                                  for s in segs], target_id="anthropic/direct")
                 for i in range(40)]
         return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x"))
 
@@ -1996,7 +2006,7 @@ class TestTheDraftStampSurvives(unittest.TestCase):
                         usage={"input_tokens": 200, "cache_read_input_tokens": 0,
                                "cache_creation_input_tokens": 30400},
                         segments=[replace(s, id=f"{s.id}{i}") if s.index == 0 else s
-                                  for s in segs])
+                                  for s in segs], target_id="anthropic/direct")
                 for i in range(40)]
         return analyze(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED,
                                 source="x"), **kw)
@@ -2060,7 +2070,7 @@ class TestNoteKindIsRecordedNotInferred(unittest.TestCase):
                         ttl_requested=None,
                         usage={"input_tokens": 200,
                                "cache_creation_input_tokens": 30000},
-                        segments=[]) for i in range(20)]
+                        segments=[], target_id="anthropic/direct") for i in range(20)]
         return analyze(TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x"),
                        **kw)
 
@@ -2248,7 +2258,8 @@ class TestTheRuntimeAndTheReportAgreePerFindingCode(unittest.TestCase):
         for i in range(n):
             at = T0 + timedelta(seconds=gap * i)
             out.append(Request(request_id=f"r{i}", sent_at=at,
-                               segments=segs(i), **{**base, "usage": dict(base["usage"])}))
+                               segments=segs(i),
+                               **{**base, "usage": dict(base["usage"])}))
         return out
 
     # -- an inner marker that cannot cache ---------------------------------

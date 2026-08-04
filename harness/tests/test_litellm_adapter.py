@@ -514,10 +514,10 @@ class TestUnknownCostBlocksTheGate(unittest.TestCase):
                     agent="a", session="s", ttl_requested="5m",
                     usage={"input_tokens": 2_000_000,
                            "cache_read_input_tokens": 0,
-                           "cache_creation_input_tokens": 0}, segments=[]),
+                           "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct"),
             Request(request_id="blind", sent_at=t0 + timedelta(seconds=60),
                     model="claude-opus-5", agent="a", session="s",
-                    usage={}, segments=[], status=200)],
+                    usage={}, segments=[], status=200, target_id="anthropic/direct")],
             tier=Tier.USAGE_ONLY, source="x")
 
     def test_a_matching_invoice_over_a_partial_denominator_stays_withheld(self):
@@ -592,10 +592,10 @@ class TestAnAllZeroRowIsAPlaceholder(unittest.TestCase):
                         agent="a", session="s", ttl_requested="5m",
                         usage={"input_tokens": 2_000_000,
                                "cache_read_input_tokens": 0,
-                               "cache_creation_input_tokens": 0}, segments=[]),
+                               "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct"),
                 Request(request_id="tail", sent_at=t0 + timedelta(seconds=60),
                         model="claude-opus-5", agent="a", session="s",
-                        usage=tail_usage, segments=[], status=200)]
+                        usage=tail_usage, segments=[], status=200, target_id="anthropic/direct")]
 
     def test_all_zero_scalars_are_not_accounting(self):
         from cacheeconomics.trace import Tier, TraceSet
@@ -643,7 +643,7 @@ class TestTheDraftOverrideRespectsTheSameBlockers(unittest.TestCase):
                        ttl_requested="5m",
                        usage={"input_tokens": 2_000_000,
                               "cache_read_input_tokens": 0,
-                              "cache_creation_input_tokens": 0}, segments=[])
+                              "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct")
 
     def test_a_dropped_row_blocks_the_draft(self):
         from cacheeconomics.trace import Tier, TraceSet
@@ -658,7 +658,7 @@ class TestTheDraftOverrideRespectsTheSameBlockers(unittest.TestCase):
         t0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
         blind = Request(request_id="blind", sent_at=t0 + timedelta(seconds=60),
                         model="claude-opus-5", agent="a", session="s",
-                        usage={}, segments=[], status=200)
+                        usage={}, segments=[], status=200, target_id="anthropic/direct")
         a = analyze(TraceSet(requests=[self._paid(), blind],
                              tier=Tier.USAGE_ONLY, source="x"),
                     allow_unreconciled=True)

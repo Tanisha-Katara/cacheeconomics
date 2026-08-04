@@ -264,7 +264,7 @@ class TestTTLGuardNotBypassed(unittest.TestCase):
     def _r(self, ttl, created=5000):
         return Request(request_id="x", sent_at=T0, model="claude-opus-5",
                        usage={"input_tokens": 100, "cache_creation_input_tokens": created},
-                       segments=[], agent="a", ttl_requested=ttl)
+                       segments=[], agent="a", ttl_requested=ttl, target_id="anthropic/direct")
 
     def test_missing_ttl_on_a_write_is_excluded_not_guessed(self):
         priced, unprovable = _usages([self._r(None)])
@@ -286,7 +286,7 @@ class TestTTLGuardNotBypassed(unittest.TestCase):
         """The multiplier lands on zero either way, so silence is harmless here."""
         r = Request(request_id="x", sent_at=T0, model="claude-opus-5",
                     usage={"input_tokens": 100, "cache_read_input_tokens": 900},
-                    segments=[], agent="a")
+                    segments=[], agent="a", target_id="anthropic/direct")
         priced, unprovable = _usages([r])
         self.assertEqual(unprovable, [])
         self.assertEqual(priced[0].cache_read, 900)
@@ -309,7 +309,7 @@ class TestTextReportHonoursTheGate(unittest.TestCase):
     def _trace(self):
         r = Request(request_id="x", sent_at=T0, model="claude-opus-5",
                     usage={"input_tokens": 400000, "cache_creation_input_tokens": 100000},
-                    segments=[], agent="a", ttl_requested="5m")
+                    segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct")
         return TraceSet(requests=[r] * 5, tier=Tier.USAGE_ONLY)
 
     def _analysis(self, invoice):
@@ -472,7 +472,7 @@ class TestFindingsNeverOutrunPricing(unittest.TestCase):
         return Request(request_id="x", sent_at=T0, model="claude-opus-5",
                        usage={"input_tokens": 1000,
                               "cache_creation_input_tokens": created},
-                       segments=[], agent="a", ttl_requested=ttl)
+                       segments=[], agent="a", ttl_requested=ttl, target_id="anthropic/direct")
 
     def test_unpriceable_requests_produce_no_dollar_findings(self):
         ts = TraceSet(requests=[self._req(None) for _ in range(40)],
@@ -489,7 +489,7 @@ class TestFindingsNeverOutrunPricing(unittest.TestCase):
                         usage={"input_tokens": 10,
                                "cache_creation_input_tokens": 50000},
                         segments=[seg(i, "system", 6000, f"s{i}", marked=True, ttl=t)
-                                  for i, t in enumerate(order)], agent="a")
+                                  for i, t in enumerate(order)], agent="a", target_id="anthropic/direct")
             priced, unprovable = _usages([r])
             self.assertEqual(priced, [], f"{order} must not price as {order[0]}")
             self.assertEqual(len(unprovable), 1)
@@ -498,7 +498,7 @@ class TestFindingsNeverOutrunPricing(unittest.TestCase):
         r = Request(request_id="x", sent_at=T0, model="claude-opus-5",
                     usage={"input_tokens": 10, "cache_creation_input_tokens": 50000},
                     segments=[seg(i, "system", 6000, f"s{i}", marked=True, ttl="1h")
-                              for i in range(2)], agent="a")
+                              for i in range(2)], agent="a", target_id="anthropic/direct")
         priced, unprovable = _usages([r])
         self.assertEqual(unprovable, [])
         self.assertEqual(priced[0].cache_write_1h, 50000)
@@ -510,7 +510,7 @@ class TestFindingsNeverOutrunPricing(unittest.TestCase):
                            "cache_creation": {"ephemeral_5m_input_tokens": 1000,
                                               "ephemeral_1h_input_tokens": 2000}},
                     segments=[seg(i, "system", 6000, f"s{i}", marked=True, ttl=t)
-                              for i, t in enumerate(["5m", "1h"])], agent="a")
+                              for i, t in enumerate(["5m", "1h"])], agent="a", target_id="anthropic/direct")
         priced, unprovable = _usages([r])
         self.assertEqual(unprovable, [])
         self.assertEqual((priced[0].cache_write_5m, priced[0].cache_write_1h),
@@ -785,7 +785,7 @@ class TestTTLRuleChecksTheLifetimeInUse(unittest.TestCase):
                        "cache_read_input_tokens": reads},
                 segments=[seg(0, "system", 7000, "stable-prefix", "sys", marked=True, ttl=ttl),
                               seg(1, "user", 100, f"turn{i}")],
-                agent="a", session="s", ttl_requested=ttl))
+                agent="a", session="s", ttl_requested=ttl, target_id="anthropic/direct"))
         return out
 
     def test_no_ttl_finding_when_the_workload_already_uses_one_hour(self):
@@ -816,7 +816,7 @@ class TestTTLRuleChecksTheLifetimeInUse(unittest.TestCase):
                 segments=[seg(0, "system", 7000, f"drifts-{i}", "sys",
                               marked=True, ttl="5m"),
                           seg(1, "user", 100, f"turn{i}")],
-                agent="a", session="s", ttl_requested="5m"))
+                agent="a", session="s", ttl_requested="5m", target_id="anthropic/direct"))
         a = analyze(TraceSet(requests=out, tier=Tier.USAGE_ONLY))
         self.assertNotIn("TTL-1", [f.code for f in a.findings])
 
@@ -868,7 +868,7 @@ class TestNoInvoiceIsNotAPassedGate(unittest.TestCase):
     def _ts(self):
         r = Request(request_id="x", sent_at=T0, model="claude-opus-5",
                     usage={"input_tokens": 400000, "cache_creation_input_tokens": 100000},
-                    segments=[], agent="a", ttl_requested="5m")
+                    segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct")
         return TraceSet(requests=[r] * 5, tier=Tier.USAGE_ONLY)
 
     def test_absent_invoice_withholds_every_figure(self):
@@ -990,7 +990,7 @@ class TestTTLSavingsChargeTheColdWrite(unittest.TestCase):
                            "cache_read_input_tokens": 5000},
                     segments=[seg(0, "system", 7000, "stable-prefix", "sys", marked=True, ttl="5m"),
                               seg(1, "user", 100, f"turn{i}")],
-                    agent="a", session=f"sess{s}", ttl_requested="5m"))
+                    agent="a", session=f"sess{s}", ttl_requested="5m", target_id="anthropic/direct"))
                 t += timedelta(seconds=gap)
         return reqs
 
@@ -1113,7 +1113,7 @@ class TestDraftOverrideStillRespectsUnprovableWrites(unittest.TestCase):
     def _ts(self, ttl):
         r = Request(request_id="x", sent_at=T0, model="claude-opus-5",
                     usage={"input_tokens": 1000, "cache_creation_input_tokens": 50000},
-                    segments=[], agent="a", ttl_requested=ttl)
+                    segments=[], agent="a", ttl_requested=ttl, target_id="anthropic/direct")
         return TraceSet(requests=[r] * 4, tier=Tier.USAGE_ONLY)
 
     def test_the_override_does_not_release_when_writes_are_unprovable(self):
@@ -1179,7 +1179,7 @@ class TestPrefixEfficiencyPricesTheRealLifetime(unittest.TestCase):
                         model="claude-opus-5",
                         usage={"input_tokens": 100, "cache_creation_input_tokens": 1_000_000,
                                "cache_read_input_tokens": 0},
-                        segments=[], agent="a", ttl_requested=ttl) for i in range(5)]
+                        segments=[], agent="a", ttl_requested=ttl, target_id="anthropic/direct") for i in range(5)]
         a = analyze(TraceSet(requests=reqs, tier=Tier.USAGE_ONLY), allow_unreconciled=True)
         f = [x for x in a.findings if x.code == "EFF-1"]
         return f[0].avoidable_usd_month.raw() if f else 0.0
@@ -1294,7 +1294,7 @@ class TestTTLSavingsExcludeSubFiveMinuteRewrites(unittest.TestCase):
                                "cache_read_input_tokens": 5000},
                         segments=[seg(0, "system", 7000, "stable-prefix", "sys", marked=True, ttl="5m"),
                               seg(1, "user", 100, f"turn{i}")],
-                        agent="a", session="s", ttl_requested="5m")
+                        agent="a", session="s", ttl_requested="5m", target_id="anthropic/direct")
                 for i in range(12)]
 
     def _finding(self, reqs):
@@ -1317,7 +1317,7 @@ class TestTTLSavingsExcludeSubFiveMinuteRewrites(unittest.TestCase):
                                  segments=[seg(0, "system", 7000, "stable-prefix",
                                                "sys", marked=True, ttl="5m"),
                                            seg(1, "user", 100, f"burst{i}")],
-                                 agent="a", session="s", ttl_requested="5m"))
+                                 agent="a", session="s", ttl_requested="5m", target_id="anthropic/direct"))
         f = self._finding(mixed)
         if f is not None:
             self.assertIn("within five minutes", f.detail)
@@ -1425,7 +1425,7 @@ class TestUnknownPricingDoesNotAbortTheReport(unittest.TestCase):
                 model=unknown if i % 4 == 0 else "claude-opus-5",
                 usage={"input_tokens": 5000, "cache_creation_input_tokens": 100_000,
                        "cache_read_input_tokens": 1000},
-                segments=[], agent="a", ttl_requested="5m"))
+                segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct"))
         return out
 
     def test_the_analysis_completes(self):
@@ -1494,7 +1494,7 @@ class TestReconciliationVerdictMatchesWhatWasPublished(unittest.TestCase):
                         model="claude-not-a-real-model" if i == 0 else "claude-opus-5",
                         usage={"input_tokens": 5000,
                                "cache_creation_input_tokens": 100_000},
-                        segments=[], agent="a", ttl_requested="5m")
+                        segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct")
                 for i in range(6)]
         return TraceSet(requests=reqs, tier=Tier.USAGE_ONLY)
 
@@ -1592,7 +1592,7 @@ class TestSameFixAppliedEverywhere(unittest.TestCase):
                         model="claude-sonnet-5",
                         usage={"input_tokens": 1_000_000,
                                "cache_creation_input_tokens": 0},
-                        segments=[], agent="a", ttl_requested="5m") for i in range(4)]
+                        segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct") for i in range(4)]
 
     def test_the_analyzer_prices_on_the_day_the_request_was_sent(self):
         """spend() was fixed for this and analyze() was not."""
@@ -1659,7 +1659,7 @@ class TestFindingDollarsUseTraceDatePricing(unittest.TestCase):
                         usage={"input_tokens": 1000,
                                "cache_creation_input_tokens": 400_000,
                                "cache_read_input_tokens": 0},
-                        segments=[], agent="a", ttl_requested="5m") for i in range(6)]
+                        segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct") for i in range(6)]
         return TraceSet(requests=reqs, tier=Tier.USAGE_ONLY)
 
     def _eff(self, when):
@@ -1810,10 +1810,10 @@ class TestUntimedRequestsDoNotCrashTheSimulator(unittest.TestCase):
 
     def _mix(self, timed=3, untimed=1):
         out = [Request(request_id=f"t{i}", sent_at=T0 + timedelta(seconds=60 * i),
-                       model="claude-opus-5", usage={}, segments=self._segs(), agent="a")
+                       model="claude-opus-5", usage={}, segments=self._segs(), agent="a", target_id="anthropic/direct")
                for i in range(timed)]
         out += [Request(request_id=f"u{i}", sent_at=None, model="claude-opus-5",
-                        usage={}, segments=self._segs(), agent="a")
+                        usage={}, segments=self._segs(), agent="a", target_id="anthropic/direct")
                 for i in range(untimed)]
         return out
 
@@ -1953,11 +1953,11 @@ class TestRelocationRefusesMixedPromptShapes(unittest.TestCase):
         return [
             Request(request_id="a", sent_at=T0, model="claude-opus-5", usage={}, agent="a",
                     segments=[seg(0, "user", 300, "user0"),
-                              seg(1, "assistant", 9000, "assistant1")]),
+                              seg(1, "assistant", 9000, "assistant1")], target_id="anthropic/direct"),
             Request(request_id="b", sent_at=T0 + timedelta(seconds=60), model="claude-opus-5",
                     usage={}, agent="a",
                     segments=[seg(0, "system", 300, "sysvary"),
-                              seg(1, "system", 9000, "stable")]),
+                              seg(1, "system", 9000, "stable")], target_id="anthropic/direct"),
         ]
 
     def test_a_mixed_group_proposes_nothing_applicable(self):
@@ -2306,7 +2306,7 @@ class TestUntimedRowsAreNotPricedAtTheRunDate(unittest.TestCase):
         return TraceSet(requests=[Request(
             request_id=f"u{i}", sent_at=None, model="claude-sonnet-5",
             usage={"input_tokens": 100000, "cache_creation_input_tokens": 0},
-            segments=[], agent="a") for i in range(3)], tier=Tier.USAGE_ONLY)
+            segments=[], agent="a", target_id="anthropic/direct") for i in range(3)], tier=Tier.USAGE_ONLY)
 
     def test_they_are_excluded_and_the_gate_fails(self):
         a = analyze(self._ts(), allow_unreconciled=True)
@@ -2394,7 +2394,7 @@ class TestUndatedRowsCannotCertifyReconciliation(unittest.TestCase):
         return TraceSet(requests=[Request(
             request_id=f"u{i}", sent_at=None, model="claude-opus-5",
             usage={"input_tokens": 1000, "cache_creation_input_tokens": 0},
-            segments=[], agent="a") for i in range(3)], tier=Tier.USAGE_ONLY)
+            segments=[], agent="a", target_id="anthropic/direct") for i in range(3)], tier=Tier.USAGE_ONLY)
 
     def test_the_gate_fails_with_undated_rows(self):
         a = analyze(self._ts(), invoice_usd=5.0)
@@ -2521,7 +2521,7 @@ class TestPartialBakeOffsAreIndeterminate(unittest.TestCase):
     def test_one_structureless_request_makes_it_indeterminate(self):
         reqs = self._clean()
         reqs.append(Request(request_id="x", sent_at=T0 + timedelta(seconds=900),
-                            model="claude-opus-5", usage={}, segments=[], agent="a"))
+                            model="claude-opus-5", usage={}, segments=[], agent="a", target_id="anthropic/direct"))
         b = simulate.bake_off(reqs)
         self.assertIsNone(b.delta_pct)
         self.assertIn("indeterminate", b.verdict)
@@ -2531,13 +2531,13 @@ class TestPartialBakeOffsAreIndeterminate(unittest.TestCase):
         reqs = self._clean()
         reqs.append(Request(request_id="x", sent_at=None, model="claude-opus-5",
                             usage={}, agent="a",
-                            segments=[seg(0, "system", 8000, "sys", marked=True, ttl="5m")]))
+                            segments=[seg(0, "system", 8000, "sys", marked=True, ttl="5m")], target_id="anthropic/direct"))
         self.assertIn("without timestamps", simulate.bake_off(reqs).verdict)
 
     def test_the_relocation_verdict_is_indeterminate_too(self):
         reqs = self._clean()
         reqs.append(Request(request_id="x", sent_at=T0, model="claude-opus-5",
-                            usage={}, segments=[], agent="a"))
+                            usage={}, segments=[], agent="a", target_id="anthropic/direct"))
         b = simulate.bake_off(reqs)
         self.assertIsNone(b.delta_pct_relocation)
         self.assertIn("indeterminate", b.verdict_relocation)
@@ -2545,7 +2545,7 @@ class TestPartialBakeOffsAreIndeterminate(unittest.TestCase):
     def test_the_range_reads_indeterminate_rather_than_a_dash(self):
         reqs = self._clean()
         reqs.append(Request(request_id="x", sent_at=T0, model="claude-opus-5",
-                            usage={}, segments=[], agent="a"))
+                            usage={}, segments=[], agent="a", target_id="anthropic/direct"))
         self.assertIn("indeterminate", str(simulate.bake_off(reqs)))
 
 
@@ -2561,7 +2561,7 @@ class TestEffOnePricesNetExcessNotGrossPremium(unittest.TestCase):
             model="claude-opus-5",
             usage={"input_tokens": 0, "cache_creation_input_tokens": writes,
                    "cache_read_input_tokens": reads},
-            segments=[], agent="a", ttl_requested="5m") for i in range(n)]
+            segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct") for i in range(n)]
 
     def _eff(self, writes, reads):
         a = analyze(TraceSet(requests=self._reqs(writes, reads), tier=Tier.USAGE_ONLY),
@@ -2674,7 +2674,7 @@ class TestEffOneCreditsPaybackOnLaterRequests(unittest.TestCase):
             Request(request_id="w", sent_at=T0, model="claude-opus-5",
                     usage={"input_tokens": 0, "cache_creation_input_tokens": writes,
                            "cache_read_input_tokens": 0},
-                    segments=[], agent="a", ttl_requested="5m"),
+                    segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct"),
             # A small real input on the tail request. It used to be zero on all
             # three counters, which is a request that billed nothing at all --
             # not a thing that happens, and now excluded as a placeholder rather
@@ -2684,7 +2684,7 @@ class TestEffOneCreditsPaybackOnLaterRequests(unittest.TestCase):
                     model="claude-opus-5",
                     usage={"input_tokens": 100, "cache_creation_input_tokens": 0,
                            "cache_read_input_tokens": reads},
-                    segments=[], agent="a", ttl_requested="5m")]
+                    segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct")]
 
     def _eff(self, writes, reads):
         a = analyze(TraceSet(requests=self._reqs(writes, reads), tier=Tier.USAGE_ONLY),
@@ -2720,7 +2720,7 @@ class TestFindingsUseTheInvoiceRate(unittest.TestCase):
             model="claude-opus-5",
             usage={"input_tokens": 0, "cache_creation_input_tokens": 100_000,
                    "cache_read_input_tokens": 0},
-            segments=[], agent="a", ttl_requested="5m") for i in range(2)]
+            segments=[], agent="a", ttl_requested="5m", target_id="anthropic/direct") for i in range(2)]
 
     def _eff(self, rate):
         a = analyze(TraceSet(requests=self._reqs(), tier=Tier.USAGE_ONLY),
@@ -2792,7 +2792,7 @@ class TestSessionSplitIsScopedToItsTenant(unittest.TestCase):
         return [Request(
             request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i), model=model,
             usage={"input_tokens": 10}, segments=[], agent="a",
-            tenant="A" if same_tenant else tenant, session="shared-id")
+            tenant="A" if same_tenant else tenant, session="shared-id", target_id="anthropic/direct")
             for i, (tenant, model) in enumerate(rows)]
 
     def test_two_tenants_sharing_a_session_id_is_not_a_split(self):
@@ -2961,7 +2961,7 @@ class TestARefreshDoesNotHideAWarmEntry(unittest.TestCase):
                 seg(1, "user", 100, "turn")]
         return [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=s),
                         model="claude-opus-5", usage={"input_tokens": 10},
-                        segments=segs, agent="a", session="s", ttl_requested="5m")
+                        segments=segs, agent="a", session="s", ttl_requested="5m", target_id="anthropic/direct")
                 for i, s in enumerate(times)]
 
     def _reads(self, times, assume):
@@ -3049,7 +3049,7 @@ class TestPessimismDoesNotPunishEarlyMarkers(unittest.TestCase):
                            sent_at=datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
                            + timedelta(seconds=60 * i),
                            model="claude-opus-5", usage={"input_tokens": 10},
-                           segments=segs, session="s")
+                           segments=segs, session="s", target_id="anthropic/direct")
         return [one(i) for i in range(n)]
 
     def _reads(self, reqs, assume):
@@ -3079,7 +3079,7 @@ class TestPessimismDoesNotPunishEarlyMarkers(unittest.TestCase):
                            sent_at=datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
                            + timedelta(seconds=60 * i),
                            model="claude-opus-5", usage={"input_tokens": 10},
-                           segments=segs, session="s")
+                           segments=segs, session="s", target_id="anthropic/direct")
         far = [one(i, 40) for i in range(10)]
         self.assertLess(self._reads(far, simulate.PESSIMISTIC),
                         self._reads(far, simulate.NEUTRAL))

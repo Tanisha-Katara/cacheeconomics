@@ -176,7 +176,17 @@ class Request:
     agent: str = "unknown"
     session: str | None = None
     tenant: str | None = None
-    target_id: str = "anthropic/direct"
+    # The surface this request was actually sent to. `UNATTRIBUTED` is the
+    # absence of one, not a surface, and it is the default because a Request
+    # that nobody told is a Request nobody told.
+    #
+    # It defaulted to `anthropic/direct`, which made "the caller stated the
+    # first-party surface" and "the caller stated nothing" the same value on the
+    # one field that decides which rate table applies and which capability
+    # limits are checked. Both loaders already default to `UNATTRIBUTED`
+    # (`load_jsonl(default_target=...)`), so the object they build disagreed
+    # with the object built directly beside it.
+    target_id: str = UNATTRIBUTED
     first_token_at: datetime | None = None
     status: int = 200
     ttl_requested: str | None = None

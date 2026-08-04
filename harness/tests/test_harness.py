@@ -221,34 +221,39 @@ class TestModelIdNormalization(unittest.TestCase):
 class TestChecks(unittest.TestCase):
 
     def test_below_minimum_fails(self):
-        r = checks.check_minimum(3000, "claude-haiku-4-5", tokens_are_estimated=False)
+        r = checks.check_minimum(3000, "claude-haiku-4-5", "anthropic/direct",
+                                 tokens_are_estimated=False)
         self.assertIs(r.status, Status.FAIL)
         self.assertIn("no error is returned", r.detail)
 
     def test_same_prefix_passes_on_a_lower_minimum_model(self):
         """3,000 tokens fails on Haiku 4.5 and passes on Opus 5. Same prompt."""
-        self.assertIs(checks.check_minimum(3000, "claude-haiku-4-5",
+        self.assertIs(checks.check_minimum(3000, "claude-haiku-4-5", "anthropic/direct",
                                            tokens_are_estimated=False).status, Status.FAIL)
-        self.assertIs(checks.check_minimum(3000, "claude-opus-5",
+        self.assertIs(checks.check_minimum(3000, "claude-opus-5", "anthropic/direct",
                                            tokens_are_estimated=False).status, Status.PASS)
 
     def test_estimate_near_threshold_abstains(self):
-        r = checks.check_minimum(4000, "claude-haiku-4-5", tokens_are_estimated=True)
+        r = checks.check_minimum(4000, "claude-haiku-4-5", "anthropic/direct",
+                                 tokens_are_estimated=True)
         self.assertIs(r.status, Status.ABSTAIN)
         self.assertIn("token counter", r.resolve)
 
     def test_exact_count_near_threshold_decides(self):
-        r = checks.check_minimum(4000, "claude-haiku-4-5", tokens_are_estimated=False)
+        r = checks.check_minimum(4000, "claude-haiku-4-5", "anthropic/direct",
+                                 tokens_are_estimated=False)
         self.assertIs(r.status, Status.FAIL)
 
     def test_breakpoint_overrun_fails(self):
-        r = checks.check_breakpoint_budget(5)
+        r = checks.check_breakpoint_budget(5, "anthropic/direct")
         self.assertIs(r.status, Status.FAIL)
         self.assertIn("limit of 4", r.summary)
 
     def test_rolling_marker_reserves_two(self):
-        self.assertIs(checks.check_breakpoint_budget(3, rolling_marker=True).status, Status.ABSTAIN)
-        self.assertIs(checks.check_breakpoint_budget(2, rolling_marker=True).status, Status.PASS)
+        self.assertIs(checks.check_breakpoint_budget(
+            3, "anthropic/direct", rolling_marker=True).status, Status.ABSTAIN)
+        self.assertIs(checks.check_breakpoint_budget(
+            2, "anthropic/direct", rolling_marker=True).status, Status.PASS)
 
     def test_no_breakpoints_surface_abstains(self):
         r = checks.check_breakpoint_budget(1, target_id="deepseek/direct")
@@ -281,15 +286,18 @@ class TestChecks(unittest.TestCase):
     def test_run_all_cannot_pass_with_a_bogus_ttl(self):
         rs = checks.run_all(prefix_tokens=20000, model="claude-sonnet-4-6",
                             breakpoints=2, ttls_in_order=["bogus"],
+                            target_id="anthropic/direct",
                             tokens_are_estimated=False)
         self.assertIs(checks.worst(rs), Status.FAIL)
 
     def test_worst_reduces_correctly(self):
         rs = checks.run_all(prefix_tokens=3000, model="claude-haiku-4-5",
-                            breakpoints=2, tokens_are_estimated=False)
+                            breakpoints=2, target_id="anthropic/direct",
+                            tokens_are_estimated=False)
         self.assertIs(checks.worst(rs), Status.FAIL)
         rs = checks.run_all(prefix_tokens=20000, model="claude-sonnet-4-6",
-                            breakpoints=2, tokens_are_estimated=False)
+                            breakpoints=2, target_id="anthropic/direct",
+                            tokens_are_estimated=False)
         self.assertIs(checks.worst(rs), Status.PASS)
 
 
@@ -502,7 +510,7 @@ class TestZeroInvoiceRenders(unittest.TestCase):
         ts = TraceSet(requests=[Request(request_id="a", sent_at=t0,
                                         model="claude-opus-5",
                                         usage={"input_tokens": 1000},
-                                        segments=[], agent="a")],
+                                        segments=[], agent="a", target_id="anthropic/direct")],
                       tier=Tier.USAGE_ONLY)
         return analyze(ts, invoice_usd=invoice)
 
@@ -614,7 +622,7 @@ class TestMalformedUsageIsExcludedNotFatal(unittest.TestCase):
     def test_a_request_built_directly_is_guarded_too(self):
         from cacheeconomics.trace import Request
         self.assertFalse(Request(request_id="x", sent_at=None, model="m",
-                                 usage="input_tokens").has_usage)
+                                 usage="input_tokens", target_id="anthropic/direct").has_usage)
 
 
 class TestEveryNamedModelHasARate(unittest.TestCase):
@@ -929,11 +937,11 @@ class TestRoundFourteen(unittest.TestCase):
         return TraceSet(requests=[
             Request(request_id="ok", sent_at=t0, model="claude-opus-5", agent="a",
                     session="s", ttl_requested="5m", usage=dict(u), segments=[],
-                    status=200),
+                    status=200, target_id="anthropic/direct"),
             Request(request_id="fail", sent_at=t0 + timedelta(seconds=60),
                     model="claude-opus-5", agent="a", session="s",
                     ttl_requested="5m", usage=fail_usage, segments=[],
-                    status=500)], tier=Tier.USAGE_ONLY, source="x")
+                    status=500, target_id="anthropic/direct")], tier=Tier.USAGE_ONLY, source="x")
 
     def test_a_failed_call_that_billed_blocks_a_draft(self):
         """`analyze` starts from `ts.analysable`, which drops non-200 rows, so
@@ -1131,3 +1139,78 @@ class TestADraftFigureIsNotADollarFigureThatWasChecked(unittest.TestCase):
         states = {k: v.released_as for k, v in a.spend.items()
                   if hasattr(v, "released_as")}
         self.assertIn(DRAFT, states.values())
+
+
+class TestTheEstimateBandIsTheMeasuredErrorNotATidyTenPercent(unittest.TestCase):
+    """`check_minimum` treated a byte-ratio estimate as accurate to +-10%.
+
+    The overestimate side is measured, and it is not 10%.
+    `segment.ESTIMATOR_WORST_OVERESTIMATE` records 2.81x -- the worst cumulative
+    overestimate of that estimator against the provider's own tokenizer, over 26
+    prefixes from six bodies. The plugin has used it as its placement margin for
+    as long as it has existed. The static check used a symmetric band beside it,
+    and the two disagreed about the same question on the same input.
+
+    Reproduced before the change: `check_minimum(600, 'claude-opus-5')` returned
+    PASS -- "600 tokens clears the 512 minimum" -- while at the measured worst
+    those 600 estimated tokens are 213 real ones, far below 512. The +-10% band
+    spans 540-660, never straddles 512, so it did not even abstain.
+
+    What the 2.81 does *not* support is a claim about the estimator's true
+    bound: 26 prefixes over six bodies is a floor on the error, not a proof. It
+    is used to decide when the check may not answer, never to produce a figure.
+    """
+
+    MODEL = "claude-opus-5"          # 512 on anthropic/direct
+    SURFACE = "anthropic/direct"
+
+    def _est(self, n):
+        return checks.check_minimum(n, self.MODEL, self.SURFACE,
+                                    tokens_are_estimated=True)
+
+    def test_the_reproduction_now_abstains(self):
+        r = self._est(600)
+        self.assertIs(r.status, Status.ABSTAIN)
+        self.assertNotIn("clears", r.summary)
+
+    def test_and_says_how_low_the_real_count_could_be(self):
+        """An abstention nobody can act on is only a quieter guess."""
+        r = self._est(600)
+        self.assertIn("213", r.detail)          # 600 / 2.81
+        self.assertIn("2.81", r.detail)
+
+    def test_it_does_not_overstate_what_the_measurement_proves(self):
+        """26 prefixes over six bodies is a floor on the error, and the text
+        that leans on it has to say so where a client reads it."""
+        r = self._est(600)
+        self.assertIn("26 prefixes", r.detail)
+        self.assertIn("not a proof", r.detail)
+
+    def test_an_estimate_clear_of_its_own_error_still_passes(self):
+        """The other direction. A check that abstains on everything is a check
+        somebody switches off, and then it catches nothing."""
+        r = self._est(512 * 3)
+        self.assertIs(r.status, Status.PASS)
+
+    def test_an_exact_count_is_still_decided_at_the_threshold(self):
+        """The band applies to estimates. A counted 600 is above 512, and
+        widening the estimate's band must not make a measured number vague."""
+        r = checks.check_minimum(600, self.MODEL, self.SURFACE,
+                                 tokens_are_estimated=False)
+        self.assertIs(r.status, Status.PASS)
+
+    def test_the_check_and_the_plugin_use_one_margin(self):
+        """The twin-path half. These are two implementations of "is this prefix
+        long enough to be worth a marker", and they disagreed: the plugin
+        refused at 2.81x while the check blessed at 1.1x, so a linter in CI
+        passed a prompt the runtime would then decline to mark.
+        """
+        from cacheeconomics.plugin import CachePlugin
+        from cacheeconomics.segment import ESTIMATOR_WORST_OVERESTIMATE
+        p = CachePlugin(key=b"k" * 32)
+        self.assertAlmostEqual(ESTIMATOR_WORST_OVERESTIMATE - 1,
+                               p.minimum_margin)
+        minimum = registry.min_cacheable_tokens(self.SURFACE, self.MODEL)
+        floor = minimum * (1 + p.minimum_margin)
+        self.assertIs(self._est(int(floor) + 1).status, Status.PASS)
+        self.assertIs(self._est(int(floor) - 1).status, Status.ABSTAIN)

@@ -46,7 +46,7 @@ from datetime import datetime
 from glob import glob
 
 from ..registry import normalize_model
-from ..trace import Request, Tier, TraceSet, _parse_ts
+from ..trace import UNATTRIBUTED, Request, Tier, TraceSet, _parse_ts
 
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 
@@ -80,11 +80,28 @@ def _usage_only(u: dict) -> dict:
 
 def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
                   limit: int | None = None,
-                  target_id: str = "anthropic/direct") -> TraceSet:
+                  target_id: str = UNATTRIBUTED) -> TraceSet:
     """Every assistant turn across the transcripts under `root`.
 
     One assistant record is one billed request. User records, attachments,
     file-history snapshots and the rest carry no usage and are skipped.
+
+    `target_id` is not read from the data and cannot be: a transcript records
+    the conversation, not the wire request, and carries no provider field
+    anywhere -- checked across 190 of them. It used to default to
+    `anthropic/direct` with a blocking note attached, on the reasoning that
+    Claude Code talks to Anthropic directly unless CLAUDE_CODE_USE_BEDROCK or
+    CLAUDE_CODE_USE_VERTEX is set.
+
+    That reasoning is still true and is still how the CLI is configured -- `ce
+    claude-code` passes the surface explicitly, and its `--target-id` help says
+    so. What changed is that a *library* caller who never chose a surface no
+    longer has one chosen for them: the default is now the absence of a surface,
+    which is registered unpriceable, so the report withholds dollars and says
+    why instead of quoting Anthropic's rate table at somebody on Bedrock.
+
+    The note below still fires whenever the assumption is made, because an
+    assumption that decides which rate table applies has to be visible.
     """
     # Recursive: subagent transcripts live in per-session subdirectories, and a
     # flat glob silently missed 73 of 122 files here — which would have dropped
@@ -194,6 +211,18 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
             ))
 
     blocking: list[str] = []
+    if requests and target_id == UNATTRIBUTED:
+        # Not an assumption -- the absence of one. The analyzer will exclude
+        # every request from every dollar figure and say so; this states the
+        # same fact at the point it becomes true, and blocks release for it.
+        blocking.append(
+            "No provider surface was stated for these transcripts. A transcript "
+            "records the conversation rather than the wire request and carries "
+            "no provider field, so it cannot be read from the data either -- and "
+            "the surface decides which rate table applies. Every dollar figure "
+            "is withheld until one is named. Pass --target-id (most likely "
+            "anthropic/direct, unless CLAUDE_CODE_USE_BEDROCK or "
+            "CLAUDE_CODE_USE_VERTEX is set on the machine that produced these).")
     if requests and target_id == "anthropic/direct":
         # A transcript records the conversation, not the wire request, and
         # carries no provider field anywhere -- checked across 190 of them.
