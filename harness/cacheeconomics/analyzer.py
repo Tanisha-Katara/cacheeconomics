@@ -799,6 +799,14 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 _lookback = registry.capability(scope[1], "lookback_blocks")
             except registry.RegistryError:
                 _lookback = None
+            # Below the provider's minimum no entry is written, so there is
+            # nothing for a later request to read and nothing a longer lifetime
+            # could recover. `simulate()` drops these markers before they can be
+            # read; this rule was pricing recovery from them.
+            try:
+                _minimum = registry.min_cacheable_tokens(scope[1], scope[2])
+            except (registry.RegistryError, IndexError):
+                _minimum = None
             # The most recent earlier write whose span this request could read,
             # not simply the previous write in the scope. Walking backwards
             # stops at the first match, which is the longest still-relevant one
@@ -808,7 +816,8 @@ def _f_ttl_vs_cadence(reqs, ratios, window, rate_for) -> Finding | None:
                 per_token = rate / 1e6
                 match = None
                 for prev_at, prev_span, prev_tokens in reversed(earlier):
-                    if span_is_reusable_by(prev_span, spans, _lookback):
+                    if span_is_reusable_by(prev_span, spans, _lookback,
+                                          _minimum):
                         match = (prev_at, prev_tokens)
                         break
                 for span in spans:

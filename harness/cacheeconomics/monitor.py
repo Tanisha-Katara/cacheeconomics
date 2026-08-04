@@ -522,19 +522,30 @@ class Monitor:
             window = registry.capability(r.target_id, "lookback_blocks")
         except registry.RegistryError:
             window = None
+        # Below the provider's minimum no entry is written, so a boundary
+        # shorter than it can never be read back. The batch helper applies this
+        # and this side did not, so RT-TTL fired on a sub-minimum marker where
+        # TTL-1 refuses -- a divergence introduced by fixing one side.
+        try:
+            floor = registry.min_cacheable_tokens(r.target_id, r.model)
+        except registry.RegistryError:
+            floor = None
         top = max(marked)
         ordered = sorted(r.segments, key=lambda s: s.index)
         # Marker positions as lengths in this sequence, which is the unit
         # `lookback_blocks` and `span_is_reusable_by` both count in.
         marks = [i + 1 for i, s in enumerate(ordered) if s.cache_marked]
-        out, seq = [], []
+        out, seq, running = [], [], 0
         for s in ordered:
             if s.index > top:
                 break
             seq.append(s.id)
+            running += s.tokens or 0
             length = len(seq)
             if window is not None and not any(
                     0 <= m - length <= window for m in marks):
+                continue
+            if floor is not None and running < floor:
                 continue
             out.append(hash(tuple(seq)))
         return out

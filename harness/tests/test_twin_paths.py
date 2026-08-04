@@ -2672,3 +2672,75 @@ class TestTheCountedClaimIsStatedInMoney(unittest.TestCase):
         _, ts = self._notes(100_000)
         self.assertEqual(ts.tokens_counted, 1.0)
         self.assertLess(ts.structural_coverage_billed, 0.99)
+
+
+class TestASpanTooShortToCacheIsNotReused(unittest.TestCase):
+    """`simulate()` drops markers below the provider's minimum before they can
+    be read: below it no entry is written and the provider returns no error.
+
+    `span_is_reusable_by` implemented three of the simulator's four read
+    conditions -- containment, reachability, lookback -- and not that one. So a
+    span too short to have been written could still be matched and priced as a
+    recovered read, and MIN-1 and TTL-1 could appear in one report, one saying
+    the marker cannot cache and the other pricing the recovery from it.
+    """
+
+    def _reqs(self, marker_tokens):
+        out = []
+        for i in range(12):
+            segs = [Segment(id="sys", role="system", tokens=marker_tokens,
+                            index=0, cache_marked=True, ttl="5m"),
+                    Segment(id=f"turn{i}", role="user", tokens=100, index=1)]
+            w = marker_tokens + 100
+            out.append(Request(
+                request_id=f"r{i}", sent_at=T0 + timedelta(seconds=600 * i),
+                model="claude-opus-5", target_id="anthropic/direct",
+                ttl_requested="5m", session="s",
+                usage={"input_tokens": w, "cache_creation_input_tokens": w},
+                segments=segs))
+        return out
+
+    def _codes(self, marker_tokens):
+        ts = TraceSet(requests=self._reqs(marker_tokens),
+                      tier=Tier.INSTRUMENTED, source="twin")
+        return {f.code for f in analyze(ts, invoice_usd=500.0).findings}
+
+    def test_a_sub_minimum_marker_earns_no_ttl_recovery(self):
+        minimum = registry.min_cacheable_tokens("anthropic/direct", "claude-opus-5")
+        codes = self._codes(minimum // 2)
+        self.assertIn("MIN-1", codes, "fixture no longer trips the minimum rule")
+        self.assertNotIn("TTL-1", codes)
+
+    def test_a_marker_above_the_minimum_still_does(self):
+        """The other direction, and the one that makes the test above mean
+        something: adding the condition must not silence the rule."""
+        minimum = registry.min_cacheable_tokens("anthropic/direct", "claude-opus-5")
+        codes = self._codes(minimum * 60)
+        self.assertNotIn("MIN-1", codes)
+        self.assertIn("TTL-1", codes)
+
+    def test_the_runtime_twin_refuses_it_too(self):
+        """Fixing only the batch side made RT-TTL fire where TTL-1 refuses --
+        a divergence created by the fix, which is this branch's most-repeated
+        shape and the reason the parity class exists."""
+        m, fired = monitor.Monitor(), []
+        minimum = registry.min_cacheable_tokens("anthropic/direct", "claude-opus-5")
+        for r in self._reqs(minimum // 2):
+            fired += m.observe(r)
+        codes = {a.code for a in fired}
+        self.assertIn("RT-MIN", codes)
+        self.assertNotIn("RT-TTL", codes)
+
+    def test_and_the_runtime_twin_still_fires_above_it(self):
+        m, fired = monitor.Monitor(), []
+        minimum = registry.min_cacheable_tokens("anthropic/direct", "claude-opus-5")
+        for r in self._reqs(minimum * 60):
+            fired += m.observe(r)
+        self.assertIn("RT-TTL", {a.code for a in fired})
+
+    def test_the_helper_implements_the_condition_directly(self):
+        span = (1, 200, ("sys",))
+        later = [(1, 200, ("sys",)), (2, 3200, ("sys", "t"))]
+        self.assertTrue(trace.span_is_reusable_by(span, later))
+        self.assertFalse(trace.span_is_reusable_by(span, later, None, 512))
+        self.assertTrue(trace.span_is_reusable_by(span, later, None, 100))

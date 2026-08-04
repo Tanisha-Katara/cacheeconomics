@@ -740,7 +740,8 @@ def marked_spans(segments) -> list[tuple]:
     return out
 
 
-def span_is_reusable_by(span, later_spans, lookback=None) -> bool:
+def span_is_reusable_by(span, later_spans, lookback=None,
+                        minimum=None) -> bool:
     """Could a request carrying `later_spans` read an entry covering `span`?
 
     All three conditions from the simulator's read path, rather than invented
@@ -751,6 +752,12 @@ def span_is_reusable_by(span, later_spans, lookback=None) -> bool:
         An entry sitting past every marker this request places cannot be found.
       - it is within `lookback` blocks of one of those breakpoints, the
         simulator's `any(0 <= m - length <= window)`.
+      - it is at least `minimum` tokens, because below the provider's minimum
+        cacheable prefix no entry is written at all. `simulate()` drops those
+        markers before they can be read; this did not, so a span too short to
+        cache could still be matched and priced as a recovered read. Verified:
+        MIN-1 and TTL-1 fired on one trace, one saying the marker cannot cache
+        and the other pricing the recovery from it.
 
     The window used to be left out here, on the reasoning that `simulate.py`
     gates it behind `enforce_lookback` and so the neutral arm does without it.
@@ -784,6 +791,8 @@ def span_is_reusable_by(span, later_spans, lookback=None) -> bool:
     if lookback is not None and not any(
             0 <= n - length <= lookback for n, _tk, _id in later_spans):
         return False                      # too far back from every breakpoint
+    if minimum is not None and _tokens < minimum:
+        return False                      # too short to have been written
     return outermost_ids[:length] == ids
 
 
