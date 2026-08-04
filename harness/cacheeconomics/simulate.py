@@ -614,44 +614,87 @@ class BakeOff:
 GATE_THRESHOLD_PCT = 10.0
 
 
-def _unreached_billed(trace, reqs) -> dict:
-    """The trace's billed-but-unmodellable rows that this run did not receive.
+# What `Request.agent` says when nothing said. A row wearing this could belong
+# to any group, so it qualifies all of them rather than none.
+UNATTRIBUTED_AGENT = "unknown"
 
-    `TraceSet.excluded_billed` answers "which billed rows are not in
-    `analysable`", which is the right question when the caller hands over
-    `ts.analysable` and the wrong one when it hands over `ts.requests`. Reading
-    it unconditionally made twenty requests that all reached the arms report as
-    "20 carrying no usage fields" and turned five green fixtures indeterminate.
-    What blocks a figure is a billed row the arms never saw, so that is what
-    this counts: the trace's rows minus the ones actually passed in.
 
-    Asked of a narrowed `TraceSet` rather than re-derived here. The rule for
-    what counts as billed-and-excluded lives on the dataclass, it has three
-    members and a per-member definition, and a second copy of it in this module
-    is the exact drift the rest of this file is written against. `skipped_rows`
-    survives the narrowing because it is a field: a line that never became a
-    `Request` cannot be in `reqs`, so it is always unreached.
+def _agent_trace(trace, agent: str):
+    """The trace as it looks to one agent's group.
 
-    Fail-closed on anything it cannot narrow -- a caller may pass a stand-in
-    rather than a real `TraceSet`, and "I could not check" counts every
-    exclusion rather than none.
+    Carries that agent's rows plus every row nobody could attribute, so a failed
+    row belonging to agent B stops blocking agent A's clean group while a failed
+    row belonging to nobody still blocks both. `skipped_rows` rides along
+    untouched because it is a field, which is exactly right: a line that never
+    parsed into a `Request` names no agent and cannot be anyone's alone.
+
+    Everything else on the trace stays as it was. Alignment, coverage and
+    whether the sizes were counted describe the capture, and one agent's slice
+    of a file cannot be better evidenced than the file.
     """
-    declared = getattr(trace, "excluded_billed", None) or {}
-    if not declared:
-        return {}
+    if trace is None:
+        return None
     rows = getattr(trace, "requests", None)
     if rows is None:
-        return declared
-    present = {r.request_id for r in reqs}
-    unreached = [r for r in rows if r.request_id not in present]
-    if len(unreached) == len(rows):
-        # Nothing was handed over from this trace at all, or the ids do not
-        # line up. Either way narrowing proves nothing, so take the trace's word.
-        return declared
+        return trace
+    mine = [r for r in rows
+            if r.agent == agent or r.agent == UNATTRIBUTED_AGENT]
     try:
-        return _dc_replace(trace, requests=unreached).excluded_billed or {}
-    except (TypeError, ValueError, AttributeError):
-        return declared
+        return _dc_replace(trace, requests=mine)
+    except (TypeError, ValueError):
+        # Not a dataclass we can narrow. The whole file's exclusions apply to
+        # every group, which is what this function exists to stop but is still
+        # the safe direction to be wrong in.
+        return trace
+
+
+def _trace_exclusions(trace, reqs) -> tuple[dict, str]:
+    """The trace's billed-but-unmodellable rows, and any breach of the contract.
+
+    The contract is one line and it is an invariant, not a condition:
+
+        every request handed to the arms is in `trace.analysable`.
+
+    `analysable` is the trace's own answer to "which rows may an arm model at
+    all", so a caller passing anything else is not making a narrower claim, it
+    is modelling rows the trace has already said cannot be modelled. Both
+    directions of getting this wrong have now shipped, one per round:
+
+    Deriving the exclusions unconditionally counted rows the arms *did* receive:
+    twenty structure-only fixture requests reported as "20 carrying no usage
+    fields" and five green tests went indeterminate. Correct diagnosis, wrong
+    cure -- I then subtracted the rows present in `reqs`, which cleared the
+    blocker whenever the caller passed them. Measured on the same twelve good
+    requests plus one structured status-500 billing 5,000,000 input tokens:
+    `bake_off(ts.analysable, trace=ts)` withheld, and `bake_off(ts.requests,
+    trace=ts)` released spend and printed a verdict; with a no-usage row instead
+    it printed "beats the automatic baseline by 20.0%".
+
+    The reasoning error was treating presence in `reqs` as evidence a row is
+    safe to model. It is not. A failed call populated no cache entry and a
+    no-usage row has no counters to reconcile, so handing them to the simulator
+    does not make them modellable -- it means every arm has now modelled a cache
+    entry that never existed. That is worse than omitting them, not better.
+
+    So the exclusions are read from the trace whole, and a breach of the subset
+    invariant is itself a blocker rather than a reason to recompute anything.
+    """
+    declared = dict(getattr(trace, "excluded_billed", None) or {})
+    analysable = getattr(trace, "analysable", None)
+    if analysable is None:
+        # Not a TraceSet, or one that cannot answer. Take its exclusions at face
+        # value and claim nothing about the subset.
+        return declared, ""
+    allowed = {r.request_id for r in analysable}
+    stray = sorted({r.request_id for r in reqs} - allowed)
+    if not stray:
+        return declared, ""
+    return declared, (
+        f"{len(stray)} of {len(reqs)} requests handed to the arms are not in the "
+        f"trace's analysable set (first: {stray[0]!r}), so the arms have modelled "
+        f"cache behaviour for rows the trace says cannot be modelled -- a failed "
+        f"call populated no cache entry, and a row with no usage counters has "
+        f"nothing to reconcile against. Pass `trace.analysable`")
 
 
 def structural_evidence(trace) -> tuple[bool, str]:
@@ -976,7 +1019,8 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # exclusions down, and a trace cannot hide exclusions a caller knows about
     # from some other pass over the same export.
     excluded_billed = dict(excluded_billed or {})
-    for _reason, _n in (_unreached_billed(trace, reqs) or {}).items():
+    _derived, not_a_subset = _trace_exclusions(trace, reqs)
+    for _reason, _n in _derived.items():
         excluded_billed[_reason] = max(excluded_billed.get(_reason, 0), int(_n))
     # And the rest of that class. `excluded_billed` was threaded through for the
     # one instance that was reported, which left every *other* fact the analyzer
@@ -1002,6 +1046,7 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # wrong twice already, both times in the direction that flatters the tool.
     _, unprovable = _usages(reqs)
     spend_ok = (not misscaled and not omitted and not excluded_billed
+                and not not_a_subset
                 and not unprovable and structure_ok and (
                     reconciled is True
                     or money.draft_override_applies(reconciled is not None,
@@ -1018,7 +1063,9 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # structural blocker somewhere to sit that is not "no invoice was supplied".
     # Telling a reader to fetch an invoice when the real fix is to count the
     # tokens is the mis-addressed remedy the analyzer already complains about.
-    if excluded_billed:
+    if not_a_subset:
+        spend_why = not_a_subset
+    elif excluded_billed:
         spend_why = (
             "the trace carries billed rows that no arm could model ("
             + ", ".join(f"{n} {reason}" for reason, n in sorted(excluded_billed.items()))
@@ -1094,11 +1141,27 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # This is the correction to a judgement I recorded as deliberate and got
     # wrong, on a defect the reviewer reproduced rather than one I found.
     if (omitted or misscaled or excluded_billed or unprovable
-            or not structure_ok):
+            or not structure_ok or not_a_subset):
         # Per-reason counts are reported alongside, never summed: they overlap,
         # and a request omitted for two reasons is still one request.
         reasons = ", ".join(f"{len(ids)} {name}"
                             for name, ids in sorted(by_reason.items()) if ids)
+        if not_a_subset:
+            # First, because it invalidates the arms themselves rather than
+            # qualifying them. Every other blocker here says "this figure
+            # describes less than you think"; this one says the replay modelled
+            # cache entries that never existed, so the comparison is not a
+            # narrower answer to Gate 1, it is an answer to a different question.
+            breach = f"indeterminate: {not_a_subset}."
+            return BakeOff(group=group, n_requests=len(reqs), window_days=window,
+                           arms=pess, optimistic=opt, moves=moves,
+                           unstructured=skipped, untimed=untimed,
+                           unpriceable=unpriceable, unmodelled_ttl=unmodelled,
+                           unmodelled_target=unknown_target,
+                           verdict=breach, verdict_relocation=breach,
+                           delta_pct=None, delta_pct_relocation=None,
+                           delta_pct_optimistic=None,
+                           delta_pct_relocation_optimistic=None)
         if excluded_billed:
             excluded_note = (
                 "indeterminate: the trace carries billed rows that never reached "
@@ -1225,17 +1288,37 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
     # per-agent run cannot reconcile against it. Passing it through would let
     # each group compare its own slice to the full bill and release on whichever
     # slice happened to land within 5%.
-    # Passed to every group rather than apportioned. An excluded billed row
-    # cannot be attributed to an agent -- a failed request may carry no agent at
-    # all, and an unreadable line certainly does not -- so the honest statement
-    # is that no group's figure describes complete spend.
-    # The trace goes to every group unapportioned for the same reason: alignment,
-    # coverage and whether the sizes were counted are properties of the capture,
-    # not of one agent's slice of it, and a slice cannot be better evidenced than
-    # the file it came out of.
+    #
+    # Exclusions are scoped to the group when the trace can attribute them, and
+    # global only when it cannot. The previous version handed every group the
+    # whole file's exclusions, on the reasoning that "an excluded billed row
+    # cannot be attributed to an agent". That is true of some of them and false
+    # of most: a failed request usually carries the same `agent` field every
+    # other row does. Applying the global set made one failed row belonging to
+    # agent B turn agent A's complete, clean group indeterminate -- a derivation
+    # that was global where the question is group-scoped, which is the same
+    # shape as the two defects above it.
+    #
+    # What stays global is what genuinely cannot be attributed: `skipped_rows`,
+    # which is a field and survives the narrowing because a line that never
+    # became a `Request` names no agent; and rows whose agent is the loader's
+    # placeholder, which could belong to any group and therefore qualify all of
+    # them. Both fall out of `_agent_trace` rather than being restated here.
+    #
+    # The rest of the trace is deliberately not narrowed: alignment, coverage
+    # and whether the sizes were counted are properties of the capture, not of
+    # one agent's slice, and a slice cannot be better evidenced than the file it
+    # came out of.
     out = [bake_off(rs, group=g, on_date=on_date, effective_rate=effective_rate,
                     allow_unreconciled=allow_unreconciled,
-                    excluded_billed=excluded_billed, trace=trace)
+                    # Dropped in favour of the group-scoped derivation when a
+                    # trace is available, because forwarding it would put the
+                    # whole file's exclusions back on every group and defeat the
+                    # scoping. With no trace there is nothing to attribute with,
+                    # so the caller's set applies to everyone -- fail-closed, and
+                    # what this function did for every caller before.
+                    excluded_billed=None if trace is not None else excluded_billed,
+                    trace=_agent_trace(trace, g))
            for g, rs in sorted(groups.items()) if len(rs) >= 3]
     # Ranking, which is the other thing `raw()` is for: ordering groups by size
     # has to work before anyone decides whether the sizes may be printed.

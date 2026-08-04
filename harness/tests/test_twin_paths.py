@@ -1422,24 +1422,151 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
                          "the bake-off released against an invoice the report "
                          "called a coincidence over a partial denominator")
 
-    def test_rows_the_caller_did_hand_over_are_not_counted_as_excluded(self):
-        """The other direction, and it cost five green fixtures to learn.
+    def test_handing_over_an_unmodellable_row_does_not_launder_it(self):
+        """The trap the previous version of this test walked into.
 
-        `TraceSet.excluded_billed` answers "not in `analysable`", which is the
-        wrong question when the caller passes `ts.requests`. Reading it
-        unconditionally reported twenty requests that all reached the arms as
-        "20 carrying no usage fields". What blocks a figure is a billed row the
-        arms never saw.
+        It asserted that rows the caller passed stop counting as excluded, on
+        the reasoning that "what blocks a figure is a billed row the arms never
+        saw". That reasoning treats presence in `reqs` as evidence a row is safe
+        to model, and it is not: a failed call populated no cache entry and a
+        no-usage row has no counters to reconcile, so handing them over means
+        every arm has now modelled a cache entry that never existed. Worse, not
+        better.
+
+        Measured on the version that shipped it, twelve good requests plus one
+        structured status-500 billing 5,000,000 input tokens:
+        `bake_off(ts.analysable, trace=ts)` withheld, and `bake_off(ts.requests,
+        trace=ts)` released spend and printed a Gate 1 verdict. With a no-usage
+        row instead of the failed one it printed "beats the automatic baseline
+        by 20.0%".
         """
-        reqs = [replace(r, usage={}) for r in self._reqs()]
-        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
-        self.assertEqual(ts.excluded_billed, {"carrying no usage fields": 12},
-                         "the fixture no longer reproduces the condition")
-        # Every one of those rows is handed to the arms, so none of them is a
-        # row the comparison failed to see.
-        b = simulate.bake_off(reqs, group="g", allow_unreconciled=True, trace=ts)
-        self.assertNotIn("never reached the arms", b.verdict)
-        self.assertIsNotNone(b.delta_pct)
+        for label, stray in (
+                ("failed but billed", Request(
+                    request_id="failed", sent_at=T0 + timedelta(seconds=99999),
+                    model="claude-opus-5", agent="a", tenant="t", session="s",
+                    target_id="anthropic/direct", ttl_requested="5m", status=500,
+                    usage={"input_tokens": 5_000_000,
+                           "cache_creation_input_tokens": 0,
+                           "cache_read_input_tokens": 0},
+                    segments=[Segment(id="hdrF", role="system",
+                                      tokens=5_000_000, index=0)])),
+                ("carrying no usage fields", Request(
+                    request_id="blind", sent_at=T0 + timedelta(seconds=99998),
+                    model="claude-opus-5", agent="a", tenant="t", session="s",
+                    target_id="anthropic/direct", ttl_requested="5m",
+                    usage={}, segments=[Segment(id="hdrB", role="system",
+                                                tokens=100, index=0)]))):
+            with self.subTest(label):
+                reqs = self._reqs() + [stray]
+                ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+                self.assertTrue(ts.excluded_billed,
+                                f"{label}: the fixture stopped reproducing")
+                b = simulate.bake_off(ts.requests, group="g",
+                                      allow_unreconciled=True, trace=ts)
+                for end, p, fig in self._arms(b):
+                    self.assertFalse(fig.released, f"{label}: {end}/{p}")
+                self.assertIsNone(b.delta_pct, label)
+                self.assertIn("indeterminate", b.verdict)
+
+    def test_the_subset_invariant_is_what_says_so(self):
+        """And it is an invariant, not a condition: every request handed to the
+        arms is in `trace.analysable`. Stated as one checkable sentence so there
+        is no case analysis to get subtly wrong the way the last two versions
+        did."""
+        ts = self._clean()
+        self.assertEqual([r.request_id for r in ts.analysable],
+                         [r.request_id for r in ts.requests],
+                         "the clean fixture must be wholly analysable, or the "
+                         "breach below is indistinguishable from the baseline")
+        ok = simulate.bake_off(ts.analysable, group="g",
+                               allow_unreconciled=True, trace=ts)
+        self.assertIsNotNone(ok.delta_pct)
+        stray = Request(
+            request_id="stray", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent="a", tenant="t", session="s",
+            target_id="anthropic/direct", ttl_requested="5m", usage={},
+            segments=[Segment(id="s", role="system", tokens=10, index=0)])
+        b = simulate.bake_off(list(ts.analysable) + [stray], group="g",
+                              allow_unreconciled=True, trace=ts)
+        self.assertIsNone(b.delta_pct)
+        self.assertIn("not in the trace's analysable set", b.verdict)
+        self.assertIn("'stray'", b.verdict, "the breach must name a row")
+
+    # --- the exclusions are scoped to whoever they belong to ----------------
+
+    def _two_agents(self, stray_agent):
+        """Six clean requests each for alpha and beta, plus one failed billed
+        row belonging to `stray_agent`."""
+        reqs = []
+        for agent in ("alpha", "beta"):
+            for i in range(6):
+                reqs.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[Segment(id=f"hdr{agent}{i}", role="system",
+                                      tokens=300, index=0),
+                              Segment(id="body", role="system", tokens=30_000,
+                                      index=1, cache_marked=True, ttl="5m")]))
+        reqs.append(Request(
+            request_id="failed", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent=stray_agent, tenant="t", session="sx",
+            target_id="anthropic/direct", ttl_requested="5m", status=500,
+            usage={"input_tokens": 5_000_000, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id="hdrF", role="system", tokens=5_000_000,
+                              index=0)]))
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+
+    def _by_agent(self, ts):
+        return {b.group: b for b in simulate.bake_off_by_agent(
+            ts.analysable, allow_unreconciled=True, trace=ts)}
+
+    def test_one_agents_excluded_row_does_not_blank_another_agents_group(self):
+        """The derivation was global where the question is group-scoped.
+
+        `bake_off_by_agent` handed every group the whole file's
+        `excluded_billed` and the whole trace, on the reasoning that an excluded
+        row cannot be attributed to an agent. That is true of some of them and
+        false of most -- a failed request usually carries the same `agent` field
+        every other row does -- so one failed row belonging to beta made alpha's
+        six clean requests indeterminate.
+        """
+        ts = self._two_agents("beta")
+        self.assertEqual(ts.excluded_billed, {"failed but billed": 1})
+        out = self._by_agent(ts)
+        self.assertEqual(set(out), {"alpha", "beta"})
+        self.assertTrue(out["alpha"].arms["as-shipped"]["spend"].released,
+                        "alpha's clean group was blanked by beta's failed row")
+        self.assertIsNotNone(out["alpha"].delta_pct)
+        self.assertFalse(out["beta"].arms["as-shipped"]["spend"].released,
+                         "beta owns the failed row and must carry it")
+        self.assertIsNone(out["beta"].delta_pct)
+
+    def test_a_row_belonging_to_nobody_still_blocks_every_group(self):
+        """The other half, and the half that makes the scoping safe. A row the
+        loader could not attribute could belong to any group, so it qualifies
+        all of them -- scoping must not become a way to lose a blocker."""
+        ts = self._two_agents("unknown")
+        out = self._by_agent(ts)
+        self.assertEqual(set(out), {"alpha", "beta"})
+        for g, b in out.items():
+            self.assertFalse(b.arms["as-shipped"]["spend"].released,
+                             f"{g} released over an unattributable billed row")
+            self.assertIsNone(b.delta_pct, g)
+
+    def test_an_unreadable_line_stays_global(self):
+        """`skipped_rows` names no agent and cannot, so it blocks everyone."""
+        ts = self._two_agents("beta")
+        ts = replace(ts, skipped_rows=1)
+        for g, b in self._by_agent(ts).items():
+            self.assertFalse(b.arms["as-shipped"]["spend"].released,
+                             f"{g} released over a line the loader dropped")
 
     def test_a_caller_that_says_nothing_gets_nothing(self):
         """Fail closed, which is the half a keyword argument cannot enforce on
@@ -1555,9 +1682,10 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
     def _simulator_gate_inputs(cls):
         """Every `TraceSet` attribute the bake-off's gates actually read.
 
-        Both helpers, not just the structural one. `_unreached_billed` is where
-        the excluded-row half of the gate lives, and a walk that only looked at
-        `structural_evidence` would have reported `excluded_billed` as
+        Every helper the gate reads the trace through, not just the structural
+        one. `_trace_exclusions` is where the excluded-row half lives and
+        `_agent_trace` is where the per-group narrowing does; a walk that looked
+        only at `structural_evidence` would report `excluded_billed` as
         unconsulted at the exact moment it started being consulted.
         """
         import ast
@@ -1565,7 +1693,8 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         import textwrap
 
         found = set()
-        for fn in (simulate.structural_evidence, simulate._unreached_billed):
+        for fn in (simulate.structural_evidence, simulate._trace_exclusions,
+                   simulate._agent_trace):
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
             found |= cls._attrs_read_off(tree, "trace")
         return found
@@ -1604,7 +1733,6 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
     # that reached the analyzer's gate and the simulator's optional side-channel
     # argument, and nothing said the two had to agree.
     NOT_A_GATE = {
-        "analysable": "the arms' input -- choosing the subset is the caller's job",
         "source": "provenance for the reader, not a condition on a figure",
         "notes": "prose the report renders; the simulator has no note surface",
         "blocking_notes": "same, and already classified by the analyzer",

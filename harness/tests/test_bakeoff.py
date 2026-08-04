@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -56,8 +57,29 @@ def instrumented(reqs, **kw):
     say what they are asserting it over; tests that assert an *indeterminate*
     verdict do not need this, because the condition they are testing blocks
     first either way.
+
+    Rows with no `usage` get the minimum that makes them internally consistent:
+    the segment total as uncached input. Many simulator fixtures were written
+    structure-only, with `usage={}` standing for "this test is not about
+    counters" -- but a row with no counters is not in `analysable`, so a
+    `TraceSet` built from it declares every row a billed row no arm could
+    model, which is both true of the declaration and false of the intent.
+
+    Synthetic, and safe to synthesise here because it was measured rather than
+    assumed: over `volatile_head(20)`, `volatile_head(30)` and two other
+    structure-only fixtures, adding this usage left every arm's reads, writes
+    and raw spend byte-identical. The arms price from segments and the modelled
+    cache and never read `usage`. It deliberately claims no cache behaviour --
+    zero reads, zero writes -- because the fixture never recorded any; it claims
+    only that the prompt these segments describe was billed once at its own
+    size, which is what makes `segment_sum_ratio` 1.0 and the row analysable.
     """
-    return TraceSet(requests=list(reqs), tier=Tier.INSTRUMENTED, **kw)
+    fixed = [r if r.has_usage
+             else replace(r, usage={"input_tokens": sum(s.tokens for s in r.segments),
+                                    "cache_read_input_tokens": 0,
+                                    "cache_creation_input_tokens": 0})
+             for r in reqs]
+    return TraceSet(requests=fixed, tier=Tier.INSTRUMENTED, **kw)
 
 
 def volatile_head(n=6, model="claude-opus-5"):
@@ -253,7 +275,8 @@ class TestBakeOff(unittest.TestCase):
 
     def test_relocation_beats_placement_when_the_prefix_is_blocked(self):
         reqs = volatile_head(n=20)
-        b = simulate.bake_off(reqs, trace=instrumented(reqs))
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertGreater(b.delta_pct_relocation, b.delta_pct)
 
     def test_verdict_says_linter_below_the_gate(self):
@@ -607,7 +630,8 @@ class TestNoFabricatedReads(unittest.TestCase):
 
     def test_the_headline_is_the_pessimistic_end_of_the_range(self):
         reqs = volatile_head(n=30)
-        b = simulate.bake_off(reqs, trace=instrumented(reqs))
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertLessEqual(b.delta_pct, b.delta_pct_optimistic,
                              "the reported verdict must not be the flattering end")
         # A tie states itself in words rather than as "0.0%". That case became
@@ -2531,7 +2555,8 @@ class TestPartialBakeOffsAreIndeterminate(unittest.TestCase):
 
     def test_a_clean_trace_still_produces_a_verdict(self):
         reqs = self._clean()
-        b = simulate.bake_off(reqs, trace=instrumented(reqs))
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertIsNotNone(b.delta_pct)
         self.assertNotIn("indeterminate", b.verdict)
 
@@ -2849,7 +2874,8 @@ class TestUnknownMinimumsAreNotAssumedCacheable(unittest.TestCase):
 
     def test_a_registered_model_still_produces_a_verdict(self):
         reqs = self._reqs("claude-opus-5")
-        b = simulate.bake_off(reqs, trace=instrumented(reqs))
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertIsNotNone(b.delta_pct)
 
 
