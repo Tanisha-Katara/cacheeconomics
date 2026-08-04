@@ -1469,3 +1469,100 @@ class TestAnInvoiceDoesNotUnderwriteAProjection(unittest.TestCase):
         ok, _ = _projection_supported(a.window_days, len(ts.requests))
         self.assertTrue(ok, f"demo window {a.window_days:.2f}d is below the floor")
         self.assertTrue(a.spend["monthly_input_usd"].released)
+
+
+class TestSilenceUnderAnUnnamedSurfaceIsSpokenAloud(unittest.TestCase):
+    """Three runtime checks read the registry for the request's surface and
+    `return` when it does not know it.
+
+    Measured: a 200-token marker below the 512-token minimum raises RT-MIN on
+    `anthropic/direct` and nothing at all on an unnamed surface. The operator
+    sees a quiet dashboard and reads it as healthy — the same shape as RT-BLIND,
+    which already exists for a stream carrying no prompt structure.
+    """
+
+    def _run(self, target):
+        m, fired = monitor.Monitor(), []
+        for i in range(20):
+            segs = [Segment(id="sys", role="system", tokens=200, index=0,
+                            cache_marked=True, ttl="5m"),
+                    Segment(id=f"t{i}", role="user", tokens=100, index=1)]
+            fired += m.observe(Request(
+                request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
+                model="claude-opus-5", target_id=target, ttl_requested="5m",
+                session="s",
+                usage={"input_tokens": 300, "cache_creation_input_tokens": 300},
+                segments=segs))
+        return [a.code for a in fired]
+
+    def test_a_named_surface_reports_the_short_marker(self):
+        self.assertIn("RT-MIN", self._run("anthropic/direct"))
+
+    def test_an_unnamed_surface_says_the_checks_are_inactive(self):
+        codes = self._run(UNATTRIBUTED)
+        self.assertIn("RT-NOSURFACE", codes)
+        self.assertNotIn("RT-MIN", codes, "it cannot know this; it must not say it")
+
+    def test_it_is_said_once_not_per_request(self):
+        self.assertEqual(self._run(UNATTRIBUTED).count("RT-NOSURFACE"), 1)
+
+    def test_a_named_surface_does_not_get_the_notice(self):
+        self.assertNotIn("RT-NOSURFACE", self._run("anthropic/direct"))
+
+
+class TestAStandDownAlertSurvivesChurn(unittest.TestCase):
+    """`_record_alert` suppressed by `_said` while `alerts` is a bounded deque
+    that evicts oldest-first.
+
+    So ordinary alert churn dropped the one stand-down warning and `_said` kept
+    refusing to re-emit it. Measured: visible after the first stand-down, gone
+    after churn, never re-emitted — the operator whose mutation had stopped
+    could no longer find out why. The dedup added to stop spam guaranteed the
+    silence instead.
+    """
+
+    def _alert(self):
+        return monitor.Alert("RT-UNATTRIBUTED", "medium", ("t", "x"),
+                             "stood down", "detail", subject="unattributed")
+
+    def test_a_repeat_is_suppressed_while_it_is_still_visible(self):
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=0)
+        self.assertTrue(p._record_alert(self._alert()))
+        self.assertFalse(p._record_alert(self._alert()))
+
+    def test_it_comes_back_once_it_has_been_evicted(self):
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=0)
+        p._record_alert(self._alert())
+        for i in range(plugin.MAX_ALERTS + 5):
+            p.alerts.append(monitor.Alert("RT-NOISE", "low", ("t", "x"),
+                                          f"n{i}", "d", subject=str(i)))
+        self.assertNotIn("RT-UNATTRIBUTED", {a.code for a in p.alerts})
+        self.assertTrue(p._record_alert(self._alert()))
+        self.assertIn("RT-UNATTRIBUTED", {a.code for a in p.alerts})
+
+    def test_the_alert_list_stays_bounded(self):
+        """Re-emission must not become unbounded growth."""
+        p = plugin.CachePlugin(key=b"k" * 32, warmup=0)
+        for _ in range(plugin.MAX_ALERTS * 3):
+            p._record_alert(self._alert())
+            p.alerts.append(monitor.Alert("RT-NOISE", "low", ("t", "x"),
+                                          "n", "d", subject="n"))
+        self.assertLessEqual(len(p.alerts), plugin.MAX_ALERTS)
+
+
+class TestUnattributedIsNotASurfaceYouCanConfigure(unittest.TestCase):
+    """The mutation guard checked truthiness, and `UNATTRIBUTED` is truthy. So
+    `mutate=True, target_id=UNATTRIBUTED` passed the guard and then stood down
+    on every request — the silent behaviour the guard exists to replace."""
+
+    def test_it_is_refused_like_an_omitted_surface(self):
+        from cacheeconomics.plugin import CachePlugin, litellm_handler
+        p = CachePlugin(key=b"k" * 32, warmup=0)
+        with self.assertRaises(ValueError):
+            litellm_handler(p, mutate=True, target_id=UNATTRIBUTED)
+
+    def test_a_real_surface_is_still_accepted(self):
+        from cacheeconomics.plugin import CachePlugin, litellm_handler
+        p = CachePlugin(key=b"k" * 32, warmup=0)
+        self.assertTrue(litellm_handler(p, mutate=True,
+                                        target_id="anthropic/direct"))

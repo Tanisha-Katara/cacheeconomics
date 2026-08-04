@@ -259,6 +259,34 @@ class Monitor:
             if ("RT-BLIND", "blind") not in shape_st.firing:
                 shape_st.firing[("RT-BLIND", "blind")] = True
                 alerts.append(blind)
+        # The surface equivalent of RT-BLIND, and for the same reason: three
+        # checks read the registry for this target and `return` when it does
+        # not know it -- RT-BLOCKED and RT-MIN need the minimum cacheable
+        # prefix, RT-BUDGET needs the breakpoint budget. Measured: a 200-token
+        # marker below the 512-token minimum raises RT-MIN on
+        # `anthropic/direct` and *nothing at all* on an unnamed surface. The
+        # operator sees a quiet dashboard and reads it as healthy.
+        #
+        # Said once per scope, like RT-BLIND, through the same `firing` table
+        # rather than a second dedup mechanism.
+        try:
+            registry.min_cacheable_tokens(request.target_id, request.model)
+        except registry.RegistryError:
+            if ("RT-NOSURFACE", "nosurface") not in shape_st.firing:
+                shape_st.firing[("RT-NOSURFACE", "nosurface")] = True
+                alerts.append(Alert(
+                    "RT-NOSURFACE", "low", shape_scope,
+                    f"no recorded limits for {request.target_id!r}, so several "
+                    f"checks are inactive",
+                    "The prefix-minimum, blocked-prefix and marker-budget checks "
+                    "all need this surface's recorded limits, and there are none "
+                    "on file for it. Their silence means unmeasured, not healthy: "
+                    "a marker below the minimum caches nothing and the provider "
+                    "returns no error either. Cadence, drift, fan-out and rebuild "
+                    "are unaffected -- they do not depend on the surface.",
+                    subject="nosurface", at=request.sent_at,
+                    fix="Name the surface on the stream, or add its limits to "
+                        "the registry with a dated source."))
         for st, scope, checks in (
             (shape_st, shape_scope, shape_checks),
             (pool_st, pool_scope, usage_checks),

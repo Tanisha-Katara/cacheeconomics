@@ -220,12 +220,30 @@ class CachePlugin:
         self._said: OrderedDict = OrderedDict()
 
     def _record_alert(self, alert) -> bool:
-        """Keep an alert, once per subject per scope. Returns whether it was
-        new, so a caller can tell "reported" from "already reported"."""
+        """Keep an alert, once per subject per scope, for as long as it is
+        still visible. Returns whether it was new.
+
+        Suppression is tied to *visibility*, not to having been said once.
+        `self.alerts` is a bounded deque that evicts oldest-first, so ordinary
+        alert churn could drop the one stand-down warning while `_said` kept
+        refusing to re-emit it. Measured: visible after the first stand-down,
+        gone after churn, and never re-emitted -- the operator whose mutation
+        had stopped could no longer find out why.
+
+        Re-checking membership costs a scan of a deque capped at MAX_ALERTS.
+        That runs on the emitting path only, which by construction is rare: an
+        alert that fires on every request is exactly the one this suppresses.
+        """
         key = (alert.scope, alert.code, alert.subject)
         if key in self._said:
-            return False
+            still_visible = any(
+                (a.scope, a.code, a.subject) == key for a in self.alerts)
+            if still_visible:
+                return False
+            # Evicted. The condition is still true and nothing on screen says
+            # so, so it is said again rather than remembered into silence.
         self._said[key] = True
+        self._said.move_to_end(key)
         while len(self._said) > MAX_FIRING * 8:
             self._said.popitem(last=False)
         self.alerts.append(alert)
@@ -761,7 +779,12 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
     #
     # Failing here is louder and cheaper than either: one line of config, at
     # start-up, instead of a silent behaviour change discovered from a bill.
-    if mutate and not target_id:
+    # `UNATTRIBUTED` is not a surface, it is the absence of one, so it must not
+    # satisfy a requirement to name one. The guard checked truthiness only, and
+    # that string is truthy: `mutate=True, target_id=UNATTRIBUTED` passed and
+    # then stood down on every request, which is the silent behaviour this whole
+    # guard exists to replace.
+    if mutate and (not target_id or target_id == UNATTRIBUTED):
         raise ValueError(
             "litellm_handler(mutate=True) requires target_id. Placing a cache "
             "marker needs the surface's minimum cacheable prefix, supported "
