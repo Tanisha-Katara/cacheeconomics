@@ -643,7 +643,7 @@ class Monitor:
         # registry lookups inside `_prefix_hashes` are not made at all on
         # traffic whose lifetime the check will refuse, which is why they are
         # no longer announced there either.
-        lifetime = self._ttl_rt_ttl_can_read(r, reads)
+        lifetime, _offered = self._ttl_rt_ttl_can_read(r, reads)
         # Everything below is per evaluable lifetime, timeline included.
         #
         # Partitioning the *gaps* alone left one shared span->timestamp map
@@ -827,14 +827,19 @@ class Monitor:
 
     @staticmethod
     def _ttl_rt_ttl_can_read(r, reads: _RegistryReads):
-        """The lifetime RT-TTL will actually reason about here, or None.
+        """`(lifetime, offered)` -- what RT-TTL may reason about here.
 
-        One definition, read by `_cadence_vs_ttl` to decide whether to speak,
-        by `_track_shape` to decide whether to collect evidence at all, and by
-        `_prefix_hashes` for its registry lookups. Restating the condition in
-        any of them is how the announcement, the evidence and the check drift
-        apart -- which is the shape of defect this file has already paid for
-        three times.
+        `lifetime` is the one in force, or None when this request is not
+        something RT-TTL can argue about. `offered` is every lifetime the
+        surface accepts for this model, because the *destination* of a switch
+        needs checking as much as its source.
+
+        One definition, read by `_cadence_vs_ttl` to decide whether to speak
+        and what it may recommend, by `_track_shape` to decide whether to
+        collect evidence at all, and by `_prefix_hashes` for its registry
+        lookups. Restating the condition in any of them is how the
+        announcement, the evidence and the check drift apart -- which is the
+        shape of defect this file has already paid for three times.
 
         Two conditions, and the second was missing. `TTL_SECONDS` is what this
         module can *reason* about; `registry.supported_ttls` is what the
@@ -844,6 +849,12 @@ class Monitor:
         with full confidence from twenty perfectly good observations. Both
         halves have to hold: a lifetime this module cannot model is not
         actionable, and a lifetime the surface does not offer is not available.
+
+        Returning the set rather than just the verdict is the other half of
+        that. Proving the *current* lifetime is offered says nothing about the
+        one being recommended, and on `amazon-bedrock/converse` +
+        `claude-opus-5`, where only 5m is offered, a 5m stream still advised
+        switching to 1h. The caller needs the set to check the destination.
         """
         lifetimes = r.marker_lifetimes
         # Two lifetimes in one request is a deliberate pattern -- a durable
@@ -851,7 +862,7 @@ class Monitor:
         # is about is genuinely ambiguous. Abstaining beats guessing at the
         # operator's expense.
         if len(lifetimes) > 1:
-            return None
+            return None, ()
         # The lifetime on the prefix this advice is about, not the row's.
         #
         # Preferring `ttl_requested` told an operator to "set a one-hour TTL on
@@ -861,7 +872,7 @@ class Monitor:
         # no-op the operator would have had to disprove themselves.
         ttl = next(iter(lifetimes), None) or r.ttl_requested
         if ttl not in TTL_SECONDS:
-            return None
+            return None, ()
         # Through the seam, so a surface that cannot answer this is announced
         # rather than quietly treated as permissive. Defaulting to "supported"
         # is how the false recommendation above would come back.
@@ -873,8 +884,9 @@ class Monitor:
                        "cannot tell a switch the provider would accept from "
                        "one it would reject)")
         if offered is None:
-            return None
-        return ttl if ttl in offered else None
+            return None, ()
+        offered = tuple(offered)
+        return (ttl if ttl in offered else None), offered
 
     @staticmethod
     def _marked_hashes(r) -> list:
@@ -1202,7 +1214,7 @@ class Monitor:
         # Which lifetime this advice is about, resolved first, because it also
         # selects the evidence. Shared with `_track_shape`, which files each
         # gap under the lifetime that was in force when it was observed.
-        ttl = self._ttl_rt_ttl_can_read(r, reads)
+        ttl, offered = self._ttl_rt_ttl_can_read(r, reads)
         if ttl is None:
             return
         # This lifetime's own rewrites, never the scope's pooled history. A
@@ -1214,7 +1226,13 @@ class Monitor:
             return
         gaps = sorted(observed)
         median = gaps[len(gaps) // 2]
-        if ttl == "5m" and 300 < median < 3600:
+        # The destination, not only the source. Proving the lifetime in force
+        # is offered says nothing about the one being recommended, and on
+        # `amazon-bedrock/converse` + `claude-opus-5` -- offered 5m and
+        # nothing else -- a ten-minute 5m rewrite cadence still advised
+        # switching to 1h. Every fix line below names a specific lifetime, so
+        # every one of them has to clear the same bar the current one did.
+        if ttl == "5m" and 300 < median < 3600 and "1h" in offered:
             yield Alert(
                 "RT-TTL", "medium", scope,
                 "requests arrive after the five-minute cache has expired",
@@ -1225,7 +1243,7 @@ class Monitor:
                 f"this is not a blanket change.",
                 subject="to-1h", at=r.sent_at,
                 fix="Set a one-hour TTL on the stable prefix for this workload.")
-        elif ttl == "1h" and median >= 3600:
+        elif ttl == "1h" and median >= 3600 and "5m" in offered:
             yield Alert(
                 "RT-TTL", "medium", scope,
                 "one-hour cache is expiring before the next request anyway",

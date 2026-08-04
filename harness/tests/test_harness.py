@@ -682,6 +682,110 @@ class TestEveryNamedModelHasARate(unittest.TestCase):
                 self.assertAlmostEqual(usd(cache_read=1_000_000), base * 0.1)
 
 
+class TestPerModelLifetimeNarrowingCannotBeSilentlyDropped(unittest.TestCase):
+    """`supported_ttls` is the surface's maximum; `supported_ttls_by_model`
+    narrows it where a lifetime is not GA for every model. Absence of the map
+    means "no narrowing recorded", which is the documented reading and true of
+    seven of the eight shipped rows -- so `registry.supported_ttls` reads it as
+    an optional field rather than alerting on it.
+
+    That is right, and it leaves a gap: absence is not answer-neutral when the
+    field is needed. Deleting the map from the Bedrock row widens
+    `claude-opus-5` from `['5m']` to `['5m', '1h']`, and every reader --
+    the allocator, the tier planner, RT-TTL's recommendation -- silently starts
+    treating a rejected lifetime as available. A schema drift or a careless
+    edit re-enables it with nothing watching.
+
+    So the narrowing is pinned here rather than alerted on at runtime. The
+    table records the *effect*, not the mechanism, which is what makes this
+    non-circular: a test that discovered "rows that narrow" by looking for
+    narrowing would go green the moment the narrowing disappeared.
+    """
+
+    # target -> (lifetimes the surface lists that are NOT available to every
+    #            model, the models that do get them).
+    #
+    # Source: `amazon-bedrock/converse`'s own provenance note -- 1h went GA on
+    # 2026-01-26 for these three models only. Everything else on that surface
+    # falls to the map's `_default` of 5m.
+    NARROWED = {
+        "amazon-bedrock/converse": (
+            {"1h"},
+            {"claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-5"},
+        ),
+    }
+
+    def _priced_models(self):
+        from cacheeconomics import registry
+        return sorted(registry.pricing()["models"])
+
+    def test_the_table_is_not_vacuous(self):
+        self.assertTrue(self.NARROWED)
+        self.assertTrue(self._priced_models())
+
+    def test_a_narrowed_model_is_not_offered_the_withheld_lifetime(self):
+        """The enforcement half. Deleting the map fails here."""
+        from cacheeconomics import registry
+        leaked = []
+        for target, (withheld, allowed) in self.NARROWED.items():
+            surface = set(registry.supported_ttls(target))
+            self.assertTrue(
+                withheld <= surface,
+                f"{target} no longer lists {withheld} surface-wide, so this "
+                f"entry describes a narrowing that cannot happen")
+            for model in self._priced_models():
+                if model in allowed:
+                    continue
+                offered = set(registry.supported_ttls(target, model))
+                for ttl in withheld & offered:
+                    leaked.append(f"{target}+{model} offered {ttl}")
+        self.assertEqual(
+            [], sorted(leaked),
+            "the per-model narrowing is gone, so these models are being "
+            "offered a lifetime the surface does not support for them. Every "
+            "reader of `supported_ttls` -- the allocator, the tier planner and "
+            "RT-TTL's recommendation -- will now treat it as available:\n    "
+            + "\n    ".join(sorted(leaked)))
+
+    def test_the_models_that_do_have_it_still_do(self):
+        """The other direction, so the fix for the above cannot be to withhold
+        the lifetime from everybody."""
+        from cacheeconomics import registry
+        for target, (withheld, allowed) in self.NARROWED.items():
+            for model in sorted(allowed):
+                with self.subTest(target=target, model=model):
+                    offered = set(registry.supported_ttls(target, model))
+                    self.assertTrue(
+                        withheld <= offered,
+                        f"{target}+{model} lost {withheld - offered}")
+
+    def test_every_row_that_narrows_is_registered_here(self):
+        """The sync half, so a narrowing added tomorrow is protected without
+        anyone remembering this class exists. Same shape as
+        `test_the_round_trip_table_covers_every_state_carrying_slot`: the
+        members are found at runtime, the expectations are written down."""
+        from cacheeconomics import registry
+        unregistered = []
+        for row in registry.providers()["targets"]:
+            caps = row.get("capabilities") or {}
+            by_model = caps.get("supported_ttls_by_model")
+            if not isinstance(by_model, dict):
+                continue
+            surface = set(caps.get("supported_ttls") or [])
+            narrows = any(
+                surface - set(allowed)
+                for name, allowed in by_model.items()
+                if not name.startswith("_comment")
+                and isinstance(allowed, list))
+            if narrows and row["id"] not in self.NARROWED:
+                unregistered.append(row["id"])
+        self.assertEqual(
+            [], sorted(unregistered),
+            "these rows narrow a lifetime per model with nothing pinning it, "
+            "so deleting the map would widen them silently: "
+            + ", ".join(sorted(unregistered)))
+
+
 class TestAnUnknownCacheLifetimeIsNotFree(unittest.TestCase):
     """`trace.write_tokens` sums every positive value under `cache_creation`,
     because for detection the provider saying it wrote is enough. Pricing needs

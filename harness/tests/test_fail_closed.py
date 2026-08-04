@@ -590,14 +590,22 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         everything must resolve to Vertex, and any use of the handler default
         at the recheck shows up as `anthropic/direct`.
 
-        And attribute every read to the call site that made it, because the
-        marker on the returned body proves only that `decision.applied` got
-        past the early return -- not that the recheck itself executed. Three
-        different places ask this question on one request: `_decide`, the
-        runtime monitor's RT-BUDGET check, and the post-patch recheck. Reading
-        the caller's frame is what makes the assertion below satisfiable by the
-        third alone; deleting the recheck outright leaves the other two
-        answering, and every previous version of this test passed on them.
+        Every version of this test before the fifth asserted on the registry
+        *lookup* rather than on what the guard did with it, and each one was a
+        better necessary condition than the last without ever becoming a
+        sufficient one. A `_pre_call` that performs the lookup, discards it and
+        deletes the `marker_count` comparison satisfies all of them.
+
+        So the assertion is behavioural and the surface is the lever. The spy
+        answers the post-patch recheck with a budget of 1 -- but only when the
+        recheck asks about the resolved surface -- while `_decide` and the
+        runtime monitor keep seeing Vertex's real budget of 4. The prompt is
+        shaped so the allocator places 2 markers, which is over that budget of
+        1 and under the real one. A veto is then the only way the returned body
+        can come back unmarked, and a veto requires the recheck to read the
+        budget, read it *for the resolved surface*, and compare it against what
+        was patched. Remove any one of those three and the body comes back
+        carrying its markers.
         """
         import asyncio
         import os
@@ -606,77 +614,88 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
 
         from cacheeconomics import registry
         from cacheeconomics.plugin import CachePlugin, litellm_handler
+        from cacheeconomics.segment import marker_count
 
         # The function that holds the post-patch recheck. Named rather than
         # line-numbered so ordinary edits to plugin.py do not move it, and so a
         # rename fails loudly here instead of quietly matching nothing.
         RECHECK_SITE = ("plugin.py", "_pre_call")
-
+        RESOLVED = "google-cloud/vertex"
         t0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
-        asked = []
         real = registry.capability
 
-        def spy(target_id, name, *a, **kw):
-            frame = _sys._getframe(1)
-            asked.append((os.path.basename(frame.f_code.co_filename),
-                          frame.f_code.co_name, target_id, name))
-            return real(target_id, name, *a, **kw)
+        def drive(budget_at_recheck=None):
+            """Returns the marker count on the body the hook handed back."""
+            def spy(target_id, name, *a, **kw):
+                value = real(target_id, name, *a, **kw)
+                if name != "max_breakpoints" or budget_at_recheck is None:
+                    return value
+                frame = _sys._getframe(1)
+                site = (os.path.basename(frame.f_code.co_filename),
+                        frame.f_code.co_name)
+                # Only the recheck, and only when it asks about the surface the
+                # request actually resolved to. A recheck pinned to the
+                # handler's `anthropic/direct` default falls through to the
+                # real budget of 4 and never vetoes.
+                if site == RECHECK_SITE and target_id == RESOLVED:
+                    return budget_at_recheck
+                return value
 
-        p = CachePlugin(key=b"k" * 32, warmup=4)
-        # Spaced timestamps: a tight loop on wall-clock time reads as
-        # concurrent traffic, which is correctly modelled as a cache miss, and
-        # nothing is ever placed.
-        inner, n = p.on_request, {"i": 0}
+            p = CachePlugin(key=b"k" * 32, warmup=4)
+            # Spaced timestamps: a tight loop on wall-clock time reads as
+            # concurrent traffic, correctly modelled as a cache miss, and
+            # nothing is ever placed.
+            inner, n = p.on_request, {"i": 0}
 
-        def timed(body, **kw):
-            kw["at"] = t0 + timedelta(seconds=90 * n["i"])
-            n["i"] += 1
-            return inner(body, **kw)
+            def timed(body, **kw):
+                kw["at"] = t0 + timedelta(seconds=90 * n["i"])
+                n["i"] += 1
+                return inner(body, **kw)
 
-        p.on_request = timed
-        # Deliberately not Vertex. `mutate=True` requires a surface, and making
-        # it the wrong one turns "did the recheck use the handler default"
-        # into an observable rather than an argument.
-        h = litellm_handler(p, mutate=True, target_id="anthropic/direct")
-        out = None
+            p.on_request = timed
+            # Deliberately not Vertex. `mutate=True` requires a surface, and
+            # making it the wrong one turns "did the recheck use the handler
+            # default" into an observable rather than an argument.
+            h = litellm_handler(p, mutate=True, target_id="anthropic/direct")
+            out = None
 
-        async def go():
-            nonlocal out
-            for i in range(20):
-                data = {"model": "claude-opus-5", "litellm_call_id": f"c{i}",
-                        "metadata": {"session_id": "conv"},
-                        "custom_llm_provider": "vertex_ai",
-                        "messages": [
-                            {"role": "system", "content": "policy " * 4000},
-                            {"role": "user", "content": f"t{i}"}]}
-                out = await h.async_pre_call_hook(None, None, data, "completion")
+            async def go():
+                nonlocal out
+                for i in range(24):
+                    data = {"model": "claude-opus-5",
+                            "litellm_call_id": f"c{i}",
+                            "metadata": {"session_id": "conv"},
+                            "custom_llm_provider": "vertex_ai",
+                            # Two stable blocks, so the allocator has two
+                            # markers to place and a budget of 1 is breachable.
+                            "messages": [
+                                {"role": "system", "content": "policy " * 4000},
+                                {"role": "system",
+                                 "content": "tool docs " * 4000},
+                                {"role": "user", "content": f"t{i}"}]}
+                    out = await h.async_pre_call_hook(None, None, data,
+                                                      "completion")
 
-        registry.capability = spy
-        try:
-            asyncio.run(go())
-        finally:
-            registry.capability = real
+            registry.capability = spy
+            try:
+                asyncio.run(go())
+            finally:
+                registry.capability = real
+            return marker_count(out)
 
-        marked = any(isinstance(m.get("content"), list)
-                     and any("cache_control" in b for b in m["content"])
-                     for m in out["messages"])
-        # Necessary, not sufficient: it says the mutating path ran, which is
-        # what gives the recheck a chance to run. The assertion that the
-        # recheck *did* run is the next one.
-        self.assertTrue(marked, "nothing was patched, so the mutating path "
-                                "never completed")
-        budgets = [(f, fn, t) for f, fn, t, n in asked
-                   if n == "max_breakpoints"]
-        recheck = [t for f, fn, t in budgets if (f, fn) == RECHECK_SITE]
-        self.assertTrue(
-            recheck,
-            "the post-patch recheck never asked about the budget. Budget reads "
-            "seen, by call site: "
-            + repr(sorted({(f, fn) for f, fn, _ in budgets})))
-        self.assertNotIn("anthropic/direct", recheck,
-                         "the live hook enforced Anthropic's budget on a Vertex "
-                         "request; it must ask about the resolved surface")
-        self.assertEqual({"google-cloud/vertex"}, set(recheck))
+        # Control. Without it the veto below could pass because nothing was
+        # ever placed, which is the vacuity three earlier versions shipped.
+        placed = drive()
+        self.assertGreater(placed, 1,
+                           "the allocator placed nothing to breach a budget "
+                           "with, so the veto assertion would be vacuous")
+        self.assertEqual(
+            0, drive(budget_at_recheck=1),
+            "the patched body went out carrying more markers than the resolved "
+            "surface allows. The post-patch recheck must read the budget for "
+            "the surface the request resolved to and veto the patch when the "
+            "body exceeds it -- reading it and not enforcing, or enforcing "
+            "against the handler's default surface, both land here.")
 
 
 class TestSegmentIdsAreScopedToTheTenant(unittest.TestCase):

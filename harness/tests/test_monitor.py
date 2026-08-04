@@ -459,6 +459,43 @@ class TestTheCadenceEvidenceIsTheLifetimesOwn(unittest.TestCase):
             minutes += 10
         self.assertIn("RT-TTL", [a.code for a in fired])
 
+    def test_the_lifetime_it_recommends_must_also_be_offered(self):
+        """Proving the lifetime in force is supported says nothing about the
+        one being recommended. `amazon-bedrock/converse` + `claude-opus-5` is
+        offered 5m and nothing else -- 1h never went GA for that model -- and
+        a ten-minute 5m rewrite cadence there still emitted `subject='to-1h'`
+        with `fix='Set a one-hour TTL...'`, advice pointing at a combination
+        the registry says is rejected.
+
+        Third round in a row where the fix covered one direction of a two-sided
+        thing: wording not state, invent not destroy, source not destination.
+        """
+        self.assertEqual(["5m"], registry.supported_ttls(
+            "amazon-bedrock/converse", "claude-opus-5"))
+        self.assertEqual([], self._cadence("amazon-bedrock/converse",
+                                           "claude-opus-5"))
+
+    def test_a_model_that_is_offered_the_destination_still_gets_it(self):
+        """The control, so the gate is not a blanket silence. Same surface,
+        same cadence, a model for which 1h did go GA."""
+        self.assertIn("1h", registry.supported_ttls(
+            "amazon-bedrock/converse", "claude-haiku-4-5"))
+        fired = self._cadence("amazon-bedrock/converse", "claude-haiku-4-5")
+        self.assertEqual(["to-1h"], [a.subject for a in fired])
+
+    def _cadence(self, target, model, ttl="5m", step=10, n=16):
+        """A rewrite cadence inside the window RT-TTL argues about."""
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(n):
+            fired += m.observe(req(
+                i, [sg(0, "system", 8000, "sys", marked=True, ttl=ttl),
+                    sg(1, "user", 100, f"t{i}")],
+                ttl=ttl, target=target, model=model,
+                at=T0 + timedelta(minutes=minutes), session="s"))
+            minutes += step
+        return [a for a in fired if a.code == "RT-TTL"]
+
     def test_a_surface_that_cannot_answer_reports_the_gap(self):
         """Abstaining is right; abstaining silently is the defect this whole
         seam exists for. An unnamed surface cannot say which lifetimes it
@@ -1162,7 +1199,8 @@ class TestTheNoticeNamesTheRealCause(unittest.TestCase):
         m = Monitor()
         r = req(0, [sg(0, "system", 8000, "sys", marked=True, ttl="1h")],
                 ttl="1h", target="amazon-bedrock/converse")
-        self.assertIsNone(m._ttl_rt_ttl_can_read(r, monitor._RegistryReads()))
+        self.assertIsNone(
+            m._ttl_rt_ttl_can_read(r, monitor._RegistryReads())[0])
 
     def test_the_gate_and_the_check_share_one_definition(self):
         """The announcement is gated on whether RT-TTL can read the lifetime.
@@ -1174,9 +1212,9 @@ class TestTheNoticeNamesTheRealCause(unittest.TestCase):
             with self.subTest(ttl=ttl):
                 r = req(0, [sg(0, "system", 8000, "sys", marked=True, ttl=ttl)],
                         ttl=ttl)
-                self.assertEqual(expected,
-                                 m._ttl_rt_ttl_can_read(r,
-                                                        monitor._RegistryReads()))
+                ttl, offered = m._ttl_rt_ttl_can_read(
+                    r, monitor._RegistryReads())
+                self.assertEqual(expected, ttl)
 
     def test_a_contested_row_that_also_lacks_the_key_says_both(self):
         """Contested and absent are flags, not alternatives. Shipped
@@ -1263,7 +1301,8 @@ class TestTheNoticeNamesTheRealCause(unittest.TestCase):
                     sg(1, "user", 4000, "turn", marked=True, ttl="5m")],
                 ttl="5m")
         self.assertEqual(2, len(r.marker_lifetimes))
-        self.assertIsNone(m._ttl_rt_ttl_can_read(r, monitor._RegistryReads()))
+        self.assertIsNone(
+            m._ttl_rt_ttl_can_read(r, monitor._RegistryReads())[0])
 
 
 if __name__ == "__main__":
