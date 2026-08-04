@@ -735,17 +735,33 @@ class TestTheDraftOverrideMeansTheSameThingEverywhere(unittest.TestCase):
                                           index=1)])
                 for i in range(30)]
 
+    def _ts(self):
+        """Instrumented, fully covered, sizes counted and agreeing with the bill.
+
+        Stated so this class keeps testing the *invoice* rule. Arm spend now also
+        asks whether the segment sizes it is priced from can carry money at all,
+        and a bake-off handed a bare list of requests has been told nothing about
+        that -- so without this every case below would withhold for the wrong
+        reason and `test_no_invoice_plus_the_override_still_releases` would pass
+        by accident in the one direction it must not.
+        """
+        return TraceSet(requests=self._reqs(), tier=Tier.INSTRUMENTED, source="x")
+
     def test_a_failed_invoice_blocks_the_bake_off_despite_the_override(self):
         for invoice in (999_999.0, -5.0, 0.0, float("nan")):
             with self.subTest(invoice=invoice):
-                b = simulate.bake_off(self._reqs(), group="g", invoice_usd=invoice,
+                ts = self._ts()
+                b = simulate.bake_off(ts.analysable, group="g", trace=ts,
+                                      invoice_usd=invoice,
                                       allow_unreconciled=True)
                 self.assertFalse(b.arms["as-shipped"]["spend"].released)
 
     def test_no_invoice_plus_the_override_still_releases(self):
         """The override has to keep working, or internal drafts are impossible
         and the flag is decoration."""
-        b = simulate.bake_off(self._reqs(), group="g", allow_unreconciled=True)
+        ts = self._ts()
+        b = simulate.bake_off(ts.analysable, group="g", trace=ts,
+                              allow_unreconciled=True)
         self.assertTrue(b.arms["as-shipped"]["spend"].released)
 
     def test_both_modules_ask_the_shared_rule(self):
@@ -832,7 +848,7 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
     def _both_withhold(self, ts, label):
         a = analyze(ts, allow_unreconciled=True)
         b = simulate.bake_off(ts.analysable, group="g", allow_unreconciled=True,
-                              excluded_billed=ts.excluded_billed)
+                              excluded_billed=ts.excluded_billed, trace=ts)
         self.assertFalse(a.spend["input_usd"].released, f"{label}: analyzer released")
         self.assertFalse(b.arms["as-shipped"]["spend"].released,
                          f"{label}: bake-off released while the report withheld")
@@ -881,7 +897,7 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
         self.assertEqual(ts.excluded_billed, {})
         a = analyze(ts, allow_unreconciled=True)
         b = simulate.bake_off(ts.analysable, group="g", allow_unreconciled=True,
-                              excluded_billed=ts.excluded_billed)
+                              excluded_billed=ts.excluded_billed, trace=ts)
         self.assertTrue(a.spend["input_usd"].released)
         self.assertTrue(b.arms["as-shipped"]["spend"].released)
 
@@ -936,6 +952,413 @@ class TestTheBakeOffRefusesOnTheSameEvidenceAsTheReport(unittest.TestCase):
                 "excluded_billed", {k.arg for k in c.keywords},
                 f"{c.func.attr} is called without excluded_billed, so rows the "
                 f"loader dropped cannot reach the spend gate")
+
+    # PENDING MERGE, not a defect in this branch. `simulate.bake_off` grew a
+    # `trace=` argument and fails closed without it, so the parity below holds
+    # for any caller that passes it and the dollars are withheld for any caller
+    # that does not -- which is the safe direction and is why this is xfail and
+    # not red. What is missing is the one line of wiring in a file this track
+    # does not own:
+    #
+    #   harness/cacheeconomics/cli.py, cmd_bakeoff
+    #     - the `simulate.bake_off_by_agent(...)` call: add `trace=ts`
+    #     - the `simulate.bake_off(...)` call:          add `trace=ts`
+    #
+    # `ts` is already in scope on the first line of the function. Once both are
+    # added this test passes, reports "unexpected success", and the decorator
+    # must be deleted -- the same forcing function `test_invariants.py` uses, so
+    # the marker cannot outlive the gap it documents.
+    @unittest.expectedFailure
+    def test_the_cli_hands_the_trace_over(self):
+        """The structural half of the same parity, and the same failure mode.
+
+        `excluded_billed` had to be threaded through before the simulator could
+        refuse on rows the loader dropped. Tier, alignment, structural coverage
+        and counted-versus-estimated sizes are the rest of that class: they live
+        on the `TraceSet` and on nothing the arms receive, so `cmd_bakeoff`
+        handing over `ts.analysable` alone leaves them unreachable rather than
+        merely unsupplied.
+        """
+        import ast
+        import inspect
+
+        from cacheeconomics import cli
+        tree = ast.parse(inspect.getsource(cli.cmd_bakeoff))
+        calls = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and isinstance(n.func, ast.Attribute)
+                 and n.func.attr.startswith("bake_off")]
+        self.assertTrue(calls, "no bake-off call found in cmd_bakeoff")
+        for c in calls:
+            self.assertIn(
+                "trace", {k.arg for k in c.keywords},
+                f"{c.func.attr} is called without trace, so the facts that "
+                f"decide whether a figure priced from segment boundaries may be "
+                f"published cannot reach the spend gate")
+
+
+class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
+    """One trace, two dollar-publishing paths, and the simulator may not be the
+    lenient one.
+
+    Both paths price money from the same segment sizes. `analyze` has refused to
+    attach money to those sizes since it learned to -- on tier, on alignment
+    score, on structural coverage by rows and by billed tokens, on whether the
+    sums agree with the bill, and on whether they were counted rather than split
+    by byte share. `bake_off` could ask none of it: its parameters were `reqs,
+    group, on_date, effective_rate, invoice_usd, allow_unreconciled,
+    excluded_billed`, and not one of those facts lives on a `Request`, so the
+    gates were unreachable rather than merely unsupplied.
+
+    Measured before the fix, on the fixture below -- twelve requests whose
+    segment sizes reconcile with the bill exactly, so the size gate already in
+    the simulator had nothing to say:
+
+        condition                       analyze VOL-1     bake_off arms
+        tokens_counted = 0.0            [withheld]        $2.27 / $1.82
+        INFERRED, alignment unmeasured  [withheld]        $2.27 / $1.82
+        INFERRED, alignment 0.72        [withheld]        $2.27 / $1.82
+        structural_coverage = 0.50      [withheld]        $2.27 / $1.82
+        token_sums_publishable = False  [withheld]        $2.27 / $1.82
+        tier = USAGE_ONLY               [withheld]        $2.27 / $1.82
+
+    In every row `analyze` withheld $1,366/month of VOL-1 and the bake-off over
+    the identical requests printed four per-arm totals with a verdict beside
+    them.
+
+    So this asserts the implication rather than any one condition: on the same
+    trace, the simulator never releases arm spend where the report withheld
+    structural money. The conditions are enumerated because they are what exists
+    today; the drift alarm at the bottom is what covers the next one.
+
+    Only the absolutes. The analyzer keeps an untrusted structural finding and
+    drops it to low confidence rather than deleting it, and `delta_pct` is the
+    bake-off's equivalent claim, so it still prints. What that leaves open is
+    recorded in the report rather than asserted here.
+    """
+
+    # Volatile 300-token head in front of a 30,000-token marked body: enough to
+    # raise VOL-1, and 300 + 30,000 sums to exactly what the provider billed, so
+    # the simulator's own size gate is satisfied and cannot be the thing doing
+    # the withholding. Synthetic fixture, not a capture.
+    def _reqs(self, n=12):
+        return [Request(
+            request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
+            model="claude-opus-5", agent="a", tenant="t", session="s",
+            target_id="anthropic/direct", ttl_requested="5m",
+            usage={"input_tokens": 300, "cache_creation_input_tokens": 30_000,
+                   "cache_read_input_tokens": 0},
+            segments=[Segment(id=f"hdr{i}", role="system", tokens=300, index=0),
+                      Segment(id="body", role="system", tokens=30_000, index=1,
+                              cache_marked=True, ttl="5m")])
+            for i in range(n)]
+
+    def _clean(self, **kw):
+        return TraceSet(requests=self._reqs(), tier=Tier.INSTRUMENTED,
+                        source="x", **kw)
+
+    # The conditions the analyzer's structural gate knows about, each expressed
+    # as the trace it would be measured from. Named, because the failure message
+    # has to say which one split the two paths apart.
+    def _untrusted_traces(self):
+        return {
+            "sizes estimated rather than counted":
+                self._clean(tokens_counted=0.0),
+            "inferred structure, alignment never measured":
+                TraceSet(requests=self._reqs(), tier=Tier.INFERRED, source="x"),
+            "inferred structure, alignment below the floor":
+                TraceSet(requests=self._reqs(), tier=Tier.INFERRED,
+                         alignment=0.72, source="x"),
+            "half the requests carry no structure":
+                self._clean(structural_coverage=0.50),
+            "segment sums do not agree with the bill":
+                self._clean(token_sums_publishable=False),
+            "usage-only ingest":
+                TraceSet(requests=self._reqs(), tier=Tier.USAGE_ONLY, source="x"),
+        }
+
+    def _structural_money(self, a):
+        return [(f.code, f.avoidable_usd_month) for f in a.findings
+                if f.structural and f.avoidable_usd_month is not None]
+
+    def _arms(self, b):
+        return [(end, p, arm["spend"])
+                for end, d in (("pessimistic", b.arms), ("optimistic", b.optimistic))
+                for p, arm in d.items()]
+
+    def test_the_fixture_gives_both_paths_a_figure_to_publish(self):
+        """Guard the guard. If the trace raised no structural finding, or the
+        arms priced nothing, the implication below would hold vacuously -- which
+        is how the first version of this file's sibling passed while checking
+        nothing."""
+        ts = self._clean()
+        a = analyze(ts, allow_unreconciled=True)
+        figs = self._structural_money(a)
+        self.assertTrue(figs, "no structural finding carries money on this "
+                              "fixture, so the parity below checks nothing")
+        for code, fig in figs:
+            self.assertTrue(fig.released, f"{code} withheld on the clean trace")
+        b = simulate.bake_off(ts.analysable, group="g", allow_unreconciled=True,
+                              excluded_billed=ts.excluded_billed, trace=ts)
+        for end, p, fig in self._arms(b):
+            self.assertTrue(fig.released, f"{end}/{p} withheld on the clean trace")
+            self.assertTrue(fig.raw() > 0, f"{end}/{p} priced nothing")
+
+    def test_the_conditions_actually_make_the_report_withhold(self):
+        """And that each named trace reproduces the condition it is named for.
+        A trace that quietly stopped triggering the analyzer's gate would turn
+        its row below into an assertion about nothing."""
+        for label, ts in self._untrusted_traces().items():
+            with self.subTest(label):
+                figs = self._structural_money(
+                    analyze(ts, allow_unreconciled=True))
+                self.assertTrue(figs, f"{label}: no structural money to withhold")
+                for code, fig in figs:
+                    self.assertFalse(
+                        fig.released,
+                        f"{label}: {code} released, so this row is testing "
+                        f"something other than what it claims")
+
+    def test_the_simulator_withholds_wherever_the_report_does(self):
+        """The invariant. Same trace, both paths, every arm at both assumption
+        ends -- and the simulator is never the permissive one."""
+        for label, ts in self._untrusted_traces().items():
+            with self.subTest(label):
+                b = simulate.bake_off(ts.analysable, group="g",
+                                      allow_unreconciled=True,
+                                      excluded_billed=ts.excluded_billed,
+                                      trace=ts)
+                for end, p, fig in self._arms(b):
+                    self.assertFalse(
+                        fig.released,
+                        f"{label}: {end}/{p} published arm spend that `analyze` "
+                        f"withheld on the same trace")
+
+    def test_writes_of_unprovable_lifetime_withhold_on_both(self):
+        """The other half of the class, found by probing rather than reported.
+
+        `_residual_blocker` names four conditions. Three of them already stopped
+        the bake-off one layer earlier, because a request with no timestamp or no
+        price contributes to no arm and lands in `omitted`. The fourth does not:
+        a marked block whose lifetime the trace never states still replays
+        perfectly well, so the simulator priced it and published.
+
+        Measured on twelve requests, sizes reconciling exactly with the bill:
+
+          marked block, no lifetime anywhere -- `analyze` withheld, bake-off
+          printed $2.2725, which is the 5m guess; a 1h write is 2.0x against a
+          5m write's 1.25x, so the guess runs in the flattering direction.
+
+          row says 5m and the marker says 1h, which `_declared_ttl` calls
+          unprovable because one of the two is stale -- `analyze` withheld,
+          bake-off printed $3.6360 and a 50.0% headline where the same trace
+          with a provable lifetime reads 20.0%.
+        """
+        for label, row_ttl, seg_ttl in (
+                ("no lifetime anywhere", None, None),
+                ("the row and the marker disagree", "5m", "1h")):
+            with self.subTest(label):
+                reqs = [replace(
+                    r, ttl_requested=row_ttl,
+                    segments=[replace(s, ttl=seg_ttl) if s.cache_marked else s
+                              for s in r.segments])
+                    for r in self._reqs()]
+                ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+                a = analyze(ts, allow_unreconciled=True)
+                self.assertFalse(a.spend["input_usd"].released,
+                                 f"{label}: the report released, so this case is "
+                                 f"no longer testing what it claims")
+                b = simulate.bake_off(ts.analysable, group="g",
+                                      allow_unreconciled=True,
+                                      excluded_billed=ts.excluded_billed,
+                                      trace=ts)
+                for end, p, fig in self._arms(b):
+                    self.assertFalse(
+                        fig.released,
+                        f"{label}: {end}/{p} priced a write whose lifetime the "
+                        f"trace never established and published it")
+                self.assertIn("lifetime the trace never established",
+                              b.arms["as-shipped"]["spend"].withheld_because)
+
+    def test_the_billed_coverage_floor_is_asked_even_though_it_is_shadowed(self):
+        """Nine small structured requests beside one enormous unstructured one:
+        the shape that published $3,175 a month from 8.3% of the bill.
+
+        Today the bake-off would refuse this anyway, one layer earlier -- the
+        unstructured request contributes to no arm and lands in `omitted` -- so
+        the assertion is on the gate rather than on the arms. Stated that way on
+        purpose: a test asserting the arms would pass with the billed-coverage
+        check deleted, which is a test of the wrong thing.
+        """
+        reqs = self._reqs(n=11)
+        reqs.append(Request(
+            request_id="huge", sent_at=T0 + timedelta(seconds=99999),
+            model="claude-opus-5", agent="a", tenant="t", session="s",
+            target_id="anthropic/direct", ttl_requested="5m",
+            usage={"input_tokens": 5_000_000, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 0}, segments=[]))
+        ts = TraceSet(requests=reqs, tier=Tier.INSTRUMENTED, source="x")
+        self.assertEqual(ts.structural_coverage, 1.0,
+                         "the row-count figure has to look healthy, or this is "
+                         "not the shape the billed figure exists to catch")
+        self.assertLess(ts.structural_coverage_billed, 0.10)
+        ok, why = simulate.structural_evidence(ts)
+        self.assertFalse(ok)
+        self.assertIn("billed input tokens", why)
+
+    def test_a_caller_that_says_nothing_gets_nothing(self):
+        """Fail closed, which is the half a keyword argument cannot enforce on
+        its own. The trace here is the clean one that releases above; the only
+        difference is that the caller did not state it."""
+        ts = self._clean()
+        b = simulate.bake_off(ts.analysable, group="g", allow_unreconciled=True,
+                              excluded_billed=ts.excluded_billed)
+        for end, p, fig in self._arms(b):
+            self.assertFalse(fig.released,
+                             f"{end}/{p} released with no trace supplied")
+        self.assertIn("no trace was supplied",
+                      b.arms["as-shipped"]["spend"].withheld_because)
+
+    def test_the_reason_reaches_the_render(self):
+        """A withheld figure whose reason never prints is the same as a missing
+        caveat, which this package treats as the defect and not the fix."""
+        ts = self._clean(tokens_counted=0.0)
+        text = str(simulate.bake_off(ts.analysable, group="g",
+                                     allow_unreconciled=True,
+                                     excluded_billed=ts.excluded_billed,
+                                     trace=ts))
+        self.assertIn("per-arm spend withheld:", text)
+        self.assertIn("estimated rather than counted", text)
+        for line in text.splitlines():
+            if any(line.strip().startswith(p) for p in simulate.ARMS):
+                self.assertIn("[withheld]", line)
+                self.assertNotIn("$", line, f"a dollar amount survived: {line}")
+
+    def test_the_per_agent_run_gates_on_the_same_evidence(self):
+        """`bake_off_by_agent` is a second entry point to the same figures, and
+        a gate applied at one entry point and not the other is this file's
+        subject."""
+        ts = self._clean(tokens_counted=0.0)
+        for b in simulate.bake_off_by_agent(ts.analysable,
+                                            allow_unreconciled=True,
+                                            excluded_billed=ts.excluded_billed,
+                                            trace=ts):
+            for end, p, fig in self._arms(b):
+                self.assertFalse(fig.released,
+                                 f"by-agent {b.group}: {end}/{p} released")
+        released = simulate.bake_off_by_agent(
+            self._clean().analysable, allow_unreconciled=True,
+            excluded_billed=self._clean().excluded_billed, trace=self._clean())
+        self.assertTrue(released, "no group survived the 3-request minimum, so "
+                                  "the assertion above checked nothing")
+        for b in released:
+            self.assertTrue(b.arms["as-shipped"]["spend"].released,
+                            f"by-agent {b.group} withheld on the clean trace")
+
+    # --- the drift alarm ---------------------------------------------------
+
+    @staticmethod
+    def _attrs_read_off(node, var):
+        """Every `<var>.x` and `getattr(<var>, "x")` under an AST node.
+
+        Read off the parsed code, never off the source text. A first version of
+        this grepped `inspect.getsource`, and deleting the gate while leaving the
+        attribute named in the docstring above it passed -- a drift alarm that
+        prose could satisfy.
+        """
+        import ast
+
+        out = set()
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+                    and n.value.id == var):
+                out.add(n.attr)
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "getattr" and len(n.args) >= 2
+                    and isinstance(n.args[0], ast.Name) and n.args[0].id == var
+                    and isinstance(n.args[1], ast.Constant)):
+                out.add(n.args[1].value)
+        return out
+
+    @classmethod
+    def _analyzer_gate_inputs(cls):
+        """The `TraceSet` attributes `analyze` feeds into `structure_trusted`.
+
+        Discovered, not listed. The enumerated conditions above are today's
+        members; this finds tomorrow's. Walks from the `structure_trusted`
+        assignment back through the local names it reads, collecting every
+        `ts.<attr>` and `getattr(ts, "<attr>")` those names are built from.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        from cacheeconomics import analyzer
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(analyzer.analyze)))
+        assigns = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        assigns.setdefault(t.id, []).append(node.value)
+
+        found, seen, queue = set(), set(), ["structure_trusted"]
+        while queue:
+            name = queue.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            for value in assigns.get(name, []):
+                found |= cls._attrs_read_off(value, "ts")
+                for n in ast.walk(value):
+                    if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load):
+                        queue.append(n.id)
+        return found
+
+    @classmethod
+    def _simulator_gate_inputs(cls):
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(
+            inspect.getsource(simulate.structural_evidence)))
+        return cls._attrs_read_off(tree, "trace")
+
+    def test_the_walker_finds_the_gate_it_is_pointed_at(self):
+        """Guard the guard, again. A walker that returns the empty set makes the
+        drift alarm below pass forever."""
+        found = self._analyzer_gate_inputs()
+        self.assertGreaterEqual(
+            len(found), 5,
+            f"the discovery walk found only {sorted(found)} -- `structure_trusted` "
+            f"was restructured and this alarm is now checking nothing")
+        self.assertTrue(
+            self._simulator_gate_inputs(),
+            "the simulator-side walk found nothing, so the comparison below "
+            "would fail for the wrong reason or pass for none")
+
+    def test_the_simulator_consults_every_input_the_report_does(self):
+        """The alarm itself. A sixth fact added to the analyzer's structural
+        gate fails here until the simulator asks it too -- which is the whole
+        reason this finding existed: the fifth was added and the simulator was
+        never told."""
+        missing = sorted(self._analyzer_gate_inputs()
+                         - self._simulator_gate_inputs())
+        self.assertEqual(
+            missing, [],
+            f"`analyze` gates structural money on {missing} and "
+            f"`simulate.structural_evidence` never reads it, so a trace the "
+            f"report refuses to cost can still publish per-arm dollars")
+
+    def test_the_floor_is_one_number_and_not_two(self):
+        """The threshold is imported from the analyzer rather than restated.
+        `PUBLISH_TOLERANCE` and the coarse factor had already drifted between
+        these two modules once."""
+        from cacheeconomics import analyzer
+
+        self.assertIs(simulate.ALIGNMENT_FLOOR, analyzer.ALIGNMENT_FLOOR)
 
 
 class TestTheLiveResponseParserReadsBothLiteLLMShapes(unittest.TestCase):

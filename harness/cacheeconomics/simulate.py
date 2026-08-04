@@ -44,8 +44,16 @@ from .allocate import (POLICIES as _PLACEMENT_POLICIES, Plan, observed_cadence,
                        reuse_chain_of)
 from .registry import RegistryError, capability, min_cacheable_tokens
 from .relocate import propose, relocation_lite
-from .trace import (PUBLISH_TOLERANCE, Request, segment_sum_ratio,
+from .trace import (PUBLISH_TOLERANCE, Request, Tier, segment_sum_ratio,
                     sums_publishable)
+
+# Imported, not restated. The floor below which a figure computed from segment
+# boundaries may not carry money is one number and the analyzer owns it; a
+# second copy here is exactly the drift `test_twin_paths` was written for, and
+# the segment-sum threshold had already drifted between these two modules once.
+# `analyzer` imports `trace`, `cost`, `money`, `allocate` and `registry` and
+# never imports this module, so the dependency runs one way only.
+from .analyzer import ALIGNMENT_FLOOR, _usages  # noqa: E402
 
 TTL_SECONDS = {"5m": 300, "1h": 3600}
 
@@ -606,10 +614,105 @@ class BakeOff:
 GATE_THRESHOLD_PCT = 10.0
 
 
+def structural_evidence(trace) -> tuple[bool, str]:
+    """May a dollar figure computed from this trace's segments be published.
+
+    Every arm here is priced from segment sizes: which segment a marker lands
+    in front of, how many tokens sit behind it, and therefore what a read or a
+    write costs. That is the same input the analyzer's structural findings are
+    costed from, and the analyzer has refused to attach money to it since it
+    learned to -- on tier, on alignment, on structural coverage by rows and by
+    billed tokens, on whether segment sums agree with the bill, and on whether
+    those sums were *counted* rather than divided up by byte share.
+
+    `bake_off` could not ask any of those questions. Its whole parameter list
+    was `reqs, group, on_date, effective_rate, invoice_usd, allow_unreconciled,
+    excluded_billed`, and not one of those facts lives on a `Request`, so the
+    gates were not merely unsupplied -- they were unreachable. Measured on one
+    trace of twelve requests whose segment sizes reconcile exactly with the
+    bill: `analyze` withheld VOL-1's $1,366/month on estimated token counts, on
+    an unmeasured alignment score, on a 72% alignment score, on 50% structural
+    coverage, on `token_sums_publishable=False`, and on a usage-only tier, while
+    `bake_off` over the identical trace printed $2.27 as-shipped against $1.82
+    allocator-lite in all six cases.
+
+    So the trace is the argument now. `None` means the caller stated nothing,
+    and nothing is not evidence: the figures are withheld rather than released,
+    because "the caller did not say" and "the caller checked and it was fine"
+    must not render the same way. That is the same reasoning `tokens_are_counted`
+    already applies to a trace that does not say whether it counted.
+
+    Only the absolutes are gated, which is where the analyzer draws the line
+    too: it keeps an untrusted structural finding at low confidence and
+    withholds its money. The percentage is what Gate 1 reads and it still
+    prints. See the report note in the caller for what that leaves open.
+    """
+    if trace is None:
+        return False, (
+            "no trace was supplied to the bake-off, so nothing here states "
+            "whether the segment sizes every arm is priced from were counted "
+            "rather than estimated, aligned against ground truth, or carried by "
+            "enough of the workload to describe it. Those facts live on the "
+            "trace, not on a request, and an unstated gate is not a passed one")
+    # Read exactly what the analyzer reads, by the same names. Two modules
+    # deciding one question have already drifted twice on this branch -- the
+    # draft override and the segment-sum threshold -- so the accompanying test
+    # walks `analyze` for the attributes feeding `structure_trusted` and fails
+    # if this function stops consulting the same set.
+    covered = getattr(trace, "structural_coverage", 0.0)
+    covered_billed = getattr(trace, "structural_coverage_billed", 0.0)
+    tier = getattr(trace, "tier", None)
+    alignment = getattr(trace, "alignment", None)
+    aligned = (tier is Tier.INSTRUMENTED
+               or (tier is Tier.INFERRED and alignment is not None
+                   and alignment >= ALIGNMENT_FLOOR))
+    # Fail-closed defaults, unlike the analyzer's, which is handed a real
+    # `TraceSet` and can afford to trust its dataclass defaults. Anything
+    # reaching here may be a stand-in.
+    sums_ok = getattr(trace, "token_sums_publishable", False)
+    tokens_counted = getattr(trace, "tokens_are_counted", False)
+    if not sums_ok:
+        return False, (
+            "segment token counts do not sum to the tokens the provider billed, "
+            "so the sizes every arm above is priced from disagree with the usage "
+            "that spend and the invoice are reconciled against")
+    if not aligned:
+        return False, (
+            f"segmentation is "
+            f"{'unmeasured' if alignment is None else f'{alignment:.0%}'} against "
+            f"instrumented ground truth, below the {ALIGNMENT_FLOOR:.0%} floor "
+            f"required to attach money to a figure computed from segment "
+            f"boundaries")
+    if covered < ALIGNMENT_FLOOR:
+        return False, (
+            f"only {covered:.0%} of requests carry prompt structure, below the "
+            f"{ALIGNMENT_FLOOR:.0%} floor. The requests without it took no part "
+            f"in any arm, and they may be the ones that would change the answer")
+    if not tokens_counted:
+        return False, (
+            "segment token counts are estimated rather than counted: the billed "
+            "total is divided between segments in proportion to their bytes, "
+            "which measures 19.2% off at the median and 181% at worst against "
+            "the provider's own tokenizer. Every arm above is priced from that "
+            "split, and this package will not publish spend that reconciles "
+            "worse than 5%. Run tier-b/count_tokens.py over the export and the "
+            "same figures become measurements")
+    if covered_billed < ALIGNMENT_FLOOR:
+        return False, (
+            f"requests carrying prompt structure account for only "
+            f"{covered_billed:.0%} of the billed input tokens, below the "
+            f"{ALIGNMENT_FLOOR:.0%} floor, even though {covered:.0%} of requests "
+            f"carry it. An invoice can reconcile the total and still not show "
+            f"that the requests structure was recorded for are the ones the "
+            f"spend came from")
+    return True, ""
+
+
 def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None,
              effective_rate: float | None = None, invoice_usd: float | None = None,
              allow_unreconciled: bool = False,
-             excluded_billed: dict | None = None) -> BakeOff:
+             excluded_billed: dict | None = None,
+             trace=None) -> BakeOff:
     """Run all four arms over the same requests and compare.
 
     The comparison that matters is against litellm-auto. Beating as-shipped
@@ -617,6 +720,24 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     automatic baseline is the question Gate 1 actually asks, which is also why
     the baseline is modelled with multi-breakpoint semantics rather than as a
     single span.
+
+    `trace` is the `TraceSet` the requests came out of, and it is optional only
+    in the sense that omitting it is allowed -- not in the sense that it costs
+    nothing. Without it the per-arm dollar amounts are withheld, because the
+    facts that decide whether a figure priced from segment boundaries may be
+    published live on the trace and not on a `Request`. Measured before this
+    argument existed: six separate trace conditions that made `analyze` withhold
+    VOL-1's money left `bake_off` printing $2.27 against $1.82 over the identical
+    requests.
+
+    Optional rather than positional because the alternative was measured too.
+    There are 47 call sites for `bake_off` and `bake_off_by_agent` -- 2 in the
+    CLI, 1 here, 44 in the tests -- and only 9 of them pass anything derived
+    from a `TraceSet`. The other 35 test sites hand over a list of `Request`
+    built in the test body, with no `TraceSet` in scope to pass. Making the
+    trace the required argument would have meant rewriting 35 tests to satisfy a
+    gate; a keyword that defaults to withholding buys the same guarantee,
+    because a caller who forgets it publishes nothing.
     """
     # Relocation produces one ordering for the whole group, so it uses the
     # fail-closed reduction. The arms let simulate() work per pool.
@@ -782,34 +903,76 @@ def bake_off(reqs: list[Request], group: str = "all", on_date: str | None = None
     # derives this; a caller that hands over `ts.analysable` and nothing else is
     # exactly the path that published $0.27 over a missing 5M-token request.
     excluded_billed = excluded_billed or {}
-    spend_ok = not misscaled and not omitted and not excluded_billed and (
-        reconciled is True
-        or money.draft_override_applies(reconciled is not None, allow_unreconciled))
+    # And the rest of that class. `excluded_billed` was threaded through for the
+    # one instance that was reported, which left every *other* fact the analyzer
+    # gates on -- tier, alignment, structural coverage by rows and by billed
+    # tokens, counted-versus-estimated sizes -- with no way in at all. A list of
+    # `Request` carries none of them, so the same trace withheld through
+    # `analyze` and published four arm totals through here. See
+    # `structural_evidence`, which states the measured before/after.
+    structure_ok, structure_why = structural_evidence(trace)
+    # Writes whose lifetime the trace never established. `Usage.from_anthropic`
+    # refuses to choose between a 1.25x write and a 2.0x one, so the analyzer
+    # drops these requests from its totals and withholds the figure; the
+    # simulator priced them at the 5m guess and published. Measured on twelve
+    # requests carrying a marked block with no lifetime anywhere: `analyze`
+    # withheld and the bake-off printed $2.2725. On twelve where the row said 5m
+    # and the marker said 1h -- which `_declared_ttl` calls unprovable because
+    # one of the two is stale -- it printed $3.6360 and a 50.0% headline where
+    # the provable version of the same trace reads 20.0%.
+    #
+    # Computed from the requests, like `misscaled` above and for the reason
+    # stated there, and using the analyzer's own function rather than a second
+    # opinion about what counts as proof of a lifetime. That rule has been got
+    # wrong twice already, both times in the direction that flatters the tool.
+    _, unprovable = _usages(reqs)
+    spend_ok = (not misscaled and not omitted and not excluded_billed
+                and not unprovable and structure_ok and (
+                    reconciled is True
+                    or money.draft_override_applies(reconciled is not None,
+                                                    allow_unreconciled)))
     # Which of those two released it. `bakeoff --allow-unreconciled` printed
     # per-arm dollar amounts with no draft marker anywhere, so the one surface
     # that puts several dollar figures side by side was also the one that never
     # said they were unchecked.
     spend_as = (money.RECONCILED if reconciled is True else money.DRAFT)
+    # Reordered so each blocker states itself. The size and omission branches
+    # used to sit below the invoice ones and were reached only because those
+    # carried `not misscaled and not omitted` guards; spelling the precedence
+    # out leaves every existing case on the same string it had, and gives the
+    # structural blocker somewhere to sit that is not "no invoice was supplied".
+    # Telling a reader to fetch an invoice when the real fix is to count the
+    # tokens is the mis-addressed remedy the analyzer already complains about.
     if excluded_billed:
         spend_why = (
             "the trace carries billed rows that no arm could model ("
             + ", ".join(f"{n} {reason}" for reason, n in sorted(excluded_billed.items()))
             + "), so every amount here describes a subset of the workload rather "
               "than its spend")
-    elif not misscaled and not omitted and reconciled is None:
-        spend_why = ("no invoice was supplied, so these are modelled list-price "
-                     "amounts that have not been tied to money actually spent. "
-                     "The percentage below does not depend on them")
-    elif not misscaled and not omitted and reconciled is False:
-        spend_why = (f"the as-shipped arm does not reconcile against the "
-                     f"${invoice_usd:,.2f} invoice within 5%, so the modelled "
-                     f"arms built from the same trace cannot be read as money")
     elif misscaled and omitted:
         spend_why = ("segment sizes do not reconcile with the tokens the provider "
                      "billed, and some requests contributed to no arm")
     elif misscaled:
         spend_why = ("segment sizes do not reconcile with the tokens the provider "
                      "billed, so this amount has an unknown scale")
+    elif omitted:
+        spend_why = (f"{omitted} of {len(reqs)} requests contributed nothing, so "
+                     f"this is a subtotal and not the workload's spend")
+    elif unprovable:
+        spend_why = (f"{len(unprovable)} of {len(reqs)} requests recorded cache "
+                     f"writes whose lifetime the trace never established, and a "
+                     f"1h write costs 2.0x against a 5m write's 1.25x. Every "
+                     f"amount here priced them at one of the two")
+    elif not structure_ok:
+        spend_why = structure_why
+    elif reconciled is None:
+        spend_why = ("no invoice was supplied, so these are modelled list-price "
+                     "amounts that have not been tied to money actually spent. "
+                     "The percentage below does not depend on them")
+    elif reconciled is False:
+        spend_why = (f"the as-shipped arm does not reconcile against the "
+                     f"${invoice_usd:,.2f} invoice within 5%, so the modelled "
+                     f"arms built from the same trace cannot be read as money")
     else:
         spend_why = (f"{omitted} of {len(reqs)} requests contributed nothing, so "
                      f"this is a subtotal and not the workload's spend")
@@ -916,7 +1079,8 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
                       effective_rate: float | None = None,
                       invoice_usd: float | None = None,
                       allow_unreconciled: bool = False,
-                      excluded_billed: dict | None = None) -> list[BakeOff]:
+                      excluded_billed: dict | None = None,
+                      trace=None) -> list[BakeOff]:
     """Per agent, because a single blended number hides the interesting cases."""
     groups: dict[str, list[Request]] = {}
     for r in reqs:
@@ -929,9 +1093,13 @@ def bake_off_by_agent(reqs: list[Request], on_date: str | None = None,
     # cannot be attributed to an agent -- a failed request may carry no agent at
     # all, and an unreadable line certainly does not -- so the honest statement
     # is that no group's figure describes complete spend.
+    # The trace goes to every group unapportioned for the same reason: alignment,
+    # coverage and whether the sizes were counted are properties of the capture,
+    # not of one agent's slice of it, and a slice cannot be better evidenced than
+    # the file it came out of.
     out = [bake_off(rs, group=g, on_date=on_date, effective_rate=effective_rate,
                     allow_unreconciled=allow_unreconciled,
-                    excluded_billed=excluded_billed)
+                    excluded_billed=excluded_billed, trace=trace)
            for g, rs in sorted(groups.items()) if len(rs) >= 3]
     # Ranking, which is the other thing `raw()` is for: ordering groups by size
     # has to work before anyone decides whether the sizes may be printed.

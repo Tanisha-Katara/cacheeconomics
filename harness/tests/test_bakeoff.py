@@ -3354,6 +3354,13 @@ class TestArmSpendIsATypedFigure(unittest.TestCase):
                          # unnamed row to first-party, which is the thing that
                          # default now refuses to do.
                          "target_id": "anthropic/direct",
+                         # Stated for the same reason `target_id` is. Releasing
+                         # arm spend now also asks whether the segment sizes it
+                         # is priced from were counted rather than split by byte
+                         # share, and a row that does not say counts as
+                         # estimated. These tests are about the *size* gate, so
+                         # they state the precondition instead of inheriting it.
+                         "tokens_counted": True,
                          "usage": {"input_tokens": 0,
                                    "cache_read_input_tokens": 0,
                                    "cache_creation_input_tokens": 1_000,
@@ -3367,7 +3374,11 @@ class TestArmSpendIsATypedFigure(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("\n".join(json.dumps(r) for r in rows))
             kw.setdefault("allow_unreconciled", True)
-            return simulate.bake_off(load_jsonl(path).analysable, **kw)
+            ts = load_jsonl(path)
+            # The trace, not just the rows the arms replay. Alignment, coverage
+            # and counted-versus-estimated sizes live here and nowhere on a
+            # `Request`, so a bake-off handed only `analysable` cannot ask them.
+            return simulate.bake_off(ts.analysable, trace=ts, **kw)
         finally:
             os.unlink(path)
 
@@ -3504,6 +3515,9 @@ class TestSizesInsideTheOldFactorStillWithhold(unittest.TestCase):
                 # get one from the loader answering an unnamed row with
                 # first-party.
                 "target_id": "anthropic/direct",
+                # As above: this class isolates the size gate, so the
+                # counted-sizes precondition is stated rather than assumed.
+                "tokens_counted": True,
                 "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
                           "cache_creation_input_tokens": self.BILLED,
                           "cache_creation": {
@@ -3522,7 +3536,7 @@ class TestSizesInsideTheOldFactorStillWithhold(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("\n".join(json.dumps(r) for r in rows))
             ts = load_jsonl(path)
-            return ts, simulate.bake_off(ts.analysable, **kw)
+            return ts, simulate.bake_off(ts.analysable, trace=ts, **kw)
         finally:
             os.unlink(path)
 
@@ -3649,14 +3663,26 @@ class TestBakeOffNeedsAnInvoiceToo(unittest.TestCase):
     at the same rates, so they inherit its credibility once it has earned it.
     """
 
-    def _reqs(self):
+    def _ts(self):
         from cacheeconomics.trace import load_jsonl
         return load_jsonl(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "fixtures", "demo-traces.jsonl")).analysable
+            "fixtures", "demo-traces.jsonl"))
+
+    def _bake(self, **kw):
+        """The whole trace, not only the rows the arms replay.
+
+        This class isolates the *invoice* half of the release rule, and the
+        structural half now has to be satisfied for the invoice to be the thing
+        under test. The demo fixture is instrumented with counted segment sizes
+        and full coverage, so passing it establishes the precondition rather
+        than waiving it.
+        """
+        ts = self._ts()
+        return simulate.bake_off(ts.analysable, trace=ts, **kw)
 
     def test_no_invoice_withholds_the_absolutes(self):
-        b = simulate.bake_off(self._reqs())
+        b = self._bake()
         self.assertFalse(b.arms["as-shipped"]["spend"].released)
         self.assertIn("no invoice was supplied",
                       b.arms["as-shipped"]["spend"].withheld_because)
@@ -3664,29 +3690,42 @@ class TestBakeOffNeedsAnInvoiceToo(unittest.TestCase):
     def test_the_percentage_survives_that(self):
         """It is scale-invariant and it is what Gate 1 reads. Withholding it
         because the dollars are unreconciled would be theatre."""
-        b = simulate.bake_off(self._reqs())
+        b = self._bake()
         self.assertIsNotNone(b.delta_pct)
         self.assertIn("vs litellm-auto", str(b))
 
     def test_a_reconciling_invoice_releases(self):
-        b = simulate.bake_off(self._reqs(), invoice_usd=17.45)
+        b = self._bake(invoice_usd=17.45)
         self.assertTrue(b.arms["as-shipped"]["spend"].released)
 
     def test_an_invoice_that_does_not_reconcile_withholds(self):
-        b = simulate.bake_off(self._reqs(), invoice_usd=99.00)
+        b = self._bake(invoice_usd=99.00)
         self.assertFalse(b.arms["as-shipped"]["spend"].released)
         self.assertIn("does not reconcile",
                       b.arms["as-shipped"]["spend"].withheld_because)
 
     def test_the_draft_flag_is_the_deliberate_override(self):
-        b = simulate.bake_off(self._reqs(), allow_unreconciled=True)
+        b = self._bake(allow_unreconciled=True)
         self.assertTrue(b.arms["as-shipped"]["spend"].released)
 
     def test_a_nonsense_invoice_does_not_release(self):
         for bad in (0.0, -17.45):
             with self.subTest(invoice=bad):
-                b = simulate.bake_off(self._reqs(), invoice_usd=bad)
+                b = self._bake(invoice_usd=bad)
                 self.assertFalse(b.arms["as-shipped"]["spend"].released)
+
+    def test_the_same_trace_without_the_trace_argument_withholds(self):
+        """The reconciling invoice from two tests up, minus the trace.
+
+        Nothing about the workload changed -- only whether the caller stated the
+        evidence. An unstated gate is not a passed one, so the figures that
+        released above are withheld here.
+        """
+        ts = self._ts()
+        b = simulate.bake_off(ts.analysable, invoice_usd=17.45)
+        self.assertFalse(b.arms["as-shipped"]["spend"].released)
+        self.assertIn("no trace was supplied",
+                      b.arms["as-shipped"]["spend"].withheld_because)
 
     def test_the_per_agent_run_does_not_reconcile_against_the_whole_invoice(self):
         """The bill covers the workload, not one agent's slice of it. Passing it
