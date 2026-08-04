@@ -1047,44 +1047,280 @@ class TestTheCountCacheIsScopedToItsCounter(unittest.TestCase):
         self.assertNotIn("claude-opus-5", blob)
 
 
-class TestEverySuffixWeDeriveFromOutIsIgnored(unittest.TestCase):
-    """The operator chooses `--out`. They do not choose the suffixes this
-    toolchain appends to it, so keeping those out of a commit is our job.
+class _ModelStub(http.server.BaseHTTPRequestHandler):
+    """A count endpoint that records which tokenizer each payload asked for.
 
-    `count_tokens.py` derives three: `.cache.json`, `.partial-write` and
-    `.partial`. The first two were added to `.gitignore` and the third — the
-    one written when some rows could not be counted, holding the enriched
-    export with request bodies intact — was not. Same defect class, one suffix
-    over, which is how the first two came to be added in the first place.
-
-    This asserts the *class* rather than the three names: it reads the suffixes
-    out of the source, so a fourth one added later fails here instead of in
-    somebody's repository.
+    Answers proportionally to body size *and* scales by model, so the same text
+    counted by two models gives two different answers. A stub answering the same
+    for both would let a cache shared between them pass.
     """
 
-    def _derived_suffixes(self):
+    seen = []
+    SCALE = {"claude-opus-5": 4, "claude-haiku-4-5": 1}
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(
+            int(self.headers.get("content-length") or 0)) or b"{}")
+        model = body.get("model")
+        type(self).seen.append(model)
+        n = len(json.dumps(body, default=str)) // 4 * type(self).SCALE.get(model, 1)
+        payload = json.dumps({"input_tokens": n}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
+    """`--model` was stamped over the model each row's own body carried
+    (`payload["model"] = model`), and it was also the model half of the single
+    `counter_id` every row was cached under.
+
+    So an export holding both an opus planner and a haiku worker — the ordinary
+    shape of a month of agent traffic — was counted end to end by one tokenizer
+    and cached under one key. Measured before the fix on the two-row export
+    below, whose rows differ only in the model they name: 5 of 5 outgoing
+    payloads carried `claude-haiku-4-5`, including both prefixes of the row
+    whose body said `claude-opus-5`, and the two rows came back with identical
+    `segment_tokens`. Those counts then load as *exact* — `tokens_counted`
+    reaches 1.0 and structural money is released on per-segment sizes the other
+    model was never asked for.
+
+    The scoping property `TestTheCountCacheIsScopedToItsCounter` establishes is
+    only worth something if the model in the key is the one that answered, which
+    is why these two classes belong next to each other.
+    """
+
+    def setUp(self):
+        _ModelStub.seen = []
+        self.stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _ModelStub)
+        self.port = self.stub.server_address[1]
+        threading.Thread(target=self.stub.serve_forever, daemon=True).start()
+        self.addCleanup(self.stub.shutdown)
+        self.dir = tempfile.mkdtemp()
+        self.out = os.path.join(self.dir, "counted.jsonl")
+
+    def _export(self, *models):
+        """One row per model, bodies otherwise identical.
+
+        Identical text on purpose: any difference in the counts that come back
+        is then attributable to the tokenizer and nothing else.
+        """
+        p = os.path.join(self.dir, "mixed.jsonl")
+        with open(p, "w") as f:
+            for m in models:
+                body = {"system": [{"type": "text", "text": "policy " * 200}],
+                        "messages": [{"role": "user", "content": "hi"}]}
+                if m is not None:
+                    body["model"] = m
+                f.write(json.dumps({"sent_at": "2026-08-01T09:00:00Z",
+                                    "body": body,
+                                    "usage": {"input_tokens": 500}}) + "\n")
+        return p
+
+    def _run(self, src, *extra):
+        return subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"), src,
+             "-o", self.out,
+             "--endpoint", f"http://127.0.0.1:{self.port}/count", *extra],
+            capture_output=True, text=True, timeout=90,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+
+    def _rows(self):
+        return [json.loads(l) for l in open(self.out) if l.strip()]
+
+    def test_both_models_in_the_export_are_actually_asked(self):
+        r = self._run(self._export("claude-opus-5", "claude-haiku-4-5"))
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(set(_ModelStub.seen),
+                         {"claude-opus-5", "claude-haiku-4-5"},
+                         "a mixed export was counted by one tokenizer")
+
+    def test_no_payload_carries_a_model_no_row_asked_for(self):
+        """The other direction: not merely that both appeared, but that nothing
+        else did. A flag stamped over the rows shows up here."""
+        self._run(self._export("claude-opus-5", "claude-haiku-4-5"),
+                  "--model", "claude-sonnet-4-6")
+        self.assertNotIn("claude-sonnet-4-6", set(_ModelStub.seen),
+                         "the --model flag reached the wire for a row that "
+                         "named its own model")
+
+    def test_the_flag_does_not_override_a_row_that_names_a_model(self):
+        self._run(self._export("claude-opus-5"), "--model", "claude-haiku-4-5")
+        self.assertEqual(set(_ModelStub.seen), {"claude-opus-5"})
+
+    def test_a_row_naming_no_model_falls_back_to_the_flag(self):
+        """What `--model` is for now. Without a fallback such a row cannot be
+        counted at all, and an uncounted row is estimated."""
+        r = self._run(self._export(None), "--model", "claude-haiku-4-5")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(set(_ModelStub.seen), {"claude-haiku-4-5"})
+        self.assertTrue(any(row.get("segment_tokens") for row in self._rows()))
+
+    def test_force_model_is_the_only_way_to_override_a_row(self):
+        """The escape hatch for a gateway that will not accept the model ids the
+        export happens to contain. Explicit, and named in the run's output."""
+        r = self._run(self._export("claude-opus-5", "claude-haiku-4-5"),
+                      "--force-model", "claude-haiku-4-5")
+        self.assertEqual(set(_ModelStub.seen), {"claude-haiku-4-5"})
+        self.assertIn("(forced)", r.stdout)
+
+    def test_two_rows_differing_only_in_model_get_different_counts(self):
+        """The consequence, in the output rather than on the wire. Same text,
+        two tokenizers, so the same `segment_tokens` for both means one
+        tokenizer answered for both."""
+        self._run(self._export("claude-opus-5", "claude-haiku-4-5"))
+        rows = self._rows()
+        self.assertEqual(len(rows), 2)
+        opus, haiku = rows[0]["segment_tokens"], rows[1]["segment_tokens"]
+        self.assertTrue(any(opus), "fixture produced no counts at all")
+        self.assertNotEqual(opus, haiku,
+                            "identical bodies under two models were counted "
+                            "identically, so one tokenizer answered for both")
+
+    def test_the_cache_is_keyed_by_the_model_that_answered(self):
+        """A warm cache must resume for the models it was written for, and must
+        not answer for one it was not."""
+        src = self._export("claude-opus-5", "claude-haiku-4-5")
+        self._run(src)
+        first = len(_ModelStub.seen)
+        self.assertGreater(first, 0)
+        self._run(src)
+        self.assertEqual(len(_ModelStub.seen), first,
+                         "a warm cache re-counted rows it already held")
+        self._run(src, "--force-model", "claude-sonnet-4-6")
+        self.assertGreater(len(_ModelStub.seen), first,
+                           "counts written for two models were handed back for "
+                           "a third that was never asked")
+        self.assertIn("claude-sonnet-4-6", set(_ModelStub.seen))
+
+    def test_the_run_reports_which_tokenizers_answered(self):
+        """These counts load as exact, so which model produced them belongs in
+        the run's own output and not in an operator's assumption."""
+        r = self._run(self._export("claude-opus-5", "claude-haiku-4-5"))
+        self.assertIn("claude-opus-5", r.stdout)
+        self.assertIn("claude-haiku-4-5", r.stdout)
+
+    def test_a_model_that_is_not_a_usable_string_falls_back(self):
+        """Directly, for the shapes an export can carry that a subprocess run
+        cannot easily produce. A blank or non-string model is not a tokenizer
+        name, and sending it would fail every row rather than one."""
+        m = load("count_tokens")
+        self.assertEqual(m.row_model({"model": "claude-opus-5"}, "fb"),
+                         "claude-opus-5")
+        self.assertEqual(m.row_model({"model": "  claude-opus-5 "}, "fb"),
+                         "claude-opus-5")
+        for bad in ({}, {"model": ""}, {"model": "   "}, {"model": None},
+                    {"model": 5}, {"model": ["claude-opus-5"]}):
+            with self.subTest(body=bad):
+                self.assertEqual(m.row_model(bad, "fb"), "fb")
+        self.assertEqual(m.row_model({"model": "claude-opus-5"}, "fb", "forced"),
+                         "forced")
+
+    def test_a_dry_run_names_the_tokenizers_it_would_ask(self):
+        """A mixed export costs one set of prefix calls per model. The dry run
+        is where permission for the egress is asked for, so it says so."""
+        r = self._run(self._export("claude-opus-5", "claude-haiku-4-5"),
+                      "--dry-run")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertEqual(_ModelStub.seen, [], "a dry run sent something")
+        self.assertIn("claude-opus-5", r.stdout)
+        self.assertIn("claude-haiku-4-5", r.stdout)
+
+
+class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
+    """The operator chooses the input path and `--out`. They do not choose the
+    names this toolchain derives from either one, so keeping those out of a
+    commit is our job.
+
+    This class used to be `TestEverySuffixWeDeriveFromOutIsIgnored` and read the
+    suffixes `count_tokens.py` appends to `--out` out of its source. That is the
+    right pattern and it was half the surface. `run_diagnostic.py` derives the
+    counted export from the *input* path instead (`_counted_path`: `run.jsonl`
+    -> `run-counted.jsonl`), `sweep_report.py` does the same, and nothing
+    ignored the result: `git check-ignore -v tier-b/trace-counted.jsonl` matched
+    no rule, on a file that is the enriched export with the client's request
+    bodies intact. Same defect class as the three suffixes before it, derived
+    from the other end, and a test scoped to `--out` could not see it.
+
+    So the surface is now both directions and their composition — an `--out`
+    suffix appended to an input-derived name is itself a derived name — plus a
+    last test that discovers members by *running* the toolchain and looking at
+    what it left on disk. A name derived by some fourth route none of the above
+    models fails there instead of in somebody's repository.
+    """
+
+    INPUT_SHAPES = ("run.jsonl", "capture", "run.jsonl.gz", "a.jsonl/b.jsonl",
+                    "my.jsonl.backup.jsonl", ".jsonl", "no-ext-at-all",
+                    "traces/2026-07.jsonl")
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.root = os.path.dirname(TIER_B)
+
+    def _is_ignored(self, relpath):
+        """Would git stage this file if it appeared inside a checkout?
+
+        Probed at a path under `tier-b/`, because that is where an operator
+        working from a checkout puts a capture and therefore where the derived
+        names land — and because some of the existing rules are anchored there.
+        """
+        probe = os.path.join(TIER_B, relpath)
+        r = subprocess.run(["git", "check-ignore", "-q", probe],
+                           cwd=self.root, capture_output=True)
+        return r.returncode == 0
+
+    def _out_suffixes(self):
+        """Every suffix `count_tokens.py` appends to the operator's `--out`."""
         import re
         src = open(os.path.join(TIER_B, "count_tokens.py")).read()
         return sorted(set(re.findall(r'args\.out \+ "([^"]+)"', src)))
 
-    def test_the_source_still_derives_the_suffixes_we_think_it_does(self):
-        """Guards the guard: if the derivation stops looking like this, the
-        test below silently checks nothing."""
-        found = self._derived_suffixes()
-        self.assertTrue(found, "no derived suffixes found; the pattern moved")
+    def _input_derived(self):
+        """Every name the toolchain derives from an *input* path."""
+        counted_path = load("run_diagnostic")._counted_path
+        return sorted({counted_path(p) for p in self.INPUT_SHAPES})
+
+    def test_the_source_still_derives_what_we_think_it_does(self):
+        """Guards the guard: if either derivation stops looking like this, the
+        tests below silently check nothing."""
+        found = self._out_suffixes()
+        self.assertTrue(found, "no --out suffixes found; the pattern moved")
         self.assertIn(".partial", found)
         self.assertIn(".cache.json", found)
+        derived = self._input_derived()
+        self.assertTrue(derived, "no input-derived names found")
+        self.assertTrue(all(d != p for d, p in zip(derived, self.INPUT_SHAPES)))
 
-    def test_each_one_is_gitignored(self):
-        root = os.path.dirname(TIER_B)
-        for suffix in self._derived_suffixes():
+    def test_each_out_suffix_is_ignored(self):
+        for suffix in self._out_suffixes():
             with self.subTest(suffix=suffix):
-                probe = os.path.join(root, "some-run.jsonl" + suffix)
-                r = subprocess.run(["git", "check-ignore", "-q", probe],
-                                   cwd=root, capture_output=True)
-                self.assertEqual(r.returncode, 0,
-                                 f"'{suffix}' is written beside the operator's "
-                                 f"--out and git would stage it")
+                self.assertTrue(
+                    self._is_ignored("some-run.jsonl" + suffix),
+                    f"'{suffix}' is written beside the operator's --out and "
+                    f"git would stage it")
+
+    def test_each_input_derived_name_is_ignored(self):
+        for name in self._input_derived():
+            with self.subTest(name=name):
+                self.assertTrue(
+                    self._is_ignored(name),
+                    f"'{name}' is derived from the operator's input path, "
+                    f"holds the enriched export, and git would stage it")
+
+    def test_the_composition_of_the_two_is_ignored(self):
+        """`run_diagnostic.py` hands its derived path to `count_tokens.py` as
+        `--out`, so every suffix lands on every input-derived name. Covering
+        each direction alone would leave the product unchecked."""
+        for name in self._input_derived():
+            for suffix in self._out_suffixes():
+                with self.subTest(name=name + suffix):
+                    self.assertTrue(self._is_ignored(name + suffix),
+                                    f"'{name + suffix}' would be staged")
 
     def test_a_failed_count_writes_prompt_text_into_one_of_them(self):
         """The reason this matters: the file is not incidental, it carries the
@@ -1106,8 +1342,74 @@ class TestEverySuffixWeDeriveFromOutIsIgnored(unittest.TestCase):
         self.assertTrue(os.path.exists(partial), "expected a partial export")
         self.assertIn("SECRET-POLICY", open(partial).read())
 
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
+    def test_the_input_derived_export_carries_prompt_text_too(self):
+        """The same check for the other end. `-counted.jsonl` is the enriched
+        export, not a summary, and it is the file nothing ignored."""
+        src = os.path.join(self.dir, "trace.jsonl")
+        with open(src, "w") as f:
+            f.write(json.dumps({"request": {
+                "model": "claude-opus-5",
+                "system": [{"type": "text", "text": "SECRET-POLICY"}],
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CountStub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.shutdown)
+        subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "run_diagnostic.py"),
+             src, "--endpoint",
+             f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens",
+             "--allow-unreconciled"],
+            capture_output=True, text=True, timeout=120,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test",
+                     CACHEECONOMICS_HMAC_KEY="k" * 32))
+        counted = os.path.join(self.dir, "trace-counted.jsonl")
+        self.assertTrue(os.path.exists(counted), "no counted export was written")
+        self.assertIn("SECRET-POLICY", open(counted).read())
+
+    def test_everything_a_real_run_leaves_on_disk_is_ignored(self):
+        """Members discovered by running the thing, not by modelling it.
+
+        Both paths, because they leave different files behind: a run whose
+        counting succeeds and one whose endpoint is dead. Anything in the
+        directory afterwards that the operator did not name is ours, and has to
+        be unstageable.
+        """
+        src = os.path.join(self.dir, "capture.jsonl")
+        with open(src, "w") as f:
+            for i in range(3):
+                f.write(json.dumps({
+                    "sent_at": f"2026-07-29T09:0{i}:00Z",
+                    "body": {"model": "claude-opus-5",
+                             "system": [{"type": "text", "text": "s" * 800}],
+                             "messages": [{"role": "user", "content": "hi"}]},
+                    "usage": {"input_tokens": 100,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0}}) + "\n")
+        stub = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _CountStub)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        self.addCleanup(stub.shutdown)
+        live = f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens"
+        for endpoint in ("http://127.0.0.1:1/x", live):
+            subprocess.run(
+                [sys.executable, "-B", os.path.join(TIER_B, "run_diagnostic.py"),
+                 src, "--endpoint", endpoint, "--allow-unreconciled"],
+                capture_output=True, text=True, timeout=120,
+                env=dict(os.environ, ANTHROPIC_API_KEY="test",
+                         CACHEECONOMICS_HMAC_KEY="k" * 32))
+
+        left = set()
+        for dirpath, _dirs, files in os.walk(self.dir):
+            for name in files:
+                left.add(os.path.relpath(os.path.join(dirpath, name), self.dir))
+        self.assertTrue(left - {"capture.jsonl"},
+                        "the run produced nothing; this test proved nothing")
+        for name in sorted(left - {"capture.jsonl"}):
+            with self.subTest(name=name):
+                self.assertTrue(
+                    self._is_ignored(name),
+                    f"a real run left '{name}' beside the capture. The operator "
+                    f"named 'capture.jsonl' and nothing else, and git would "
+                    f"stage this one")
 
 
 class TestTheDiagnosticCannotOverwriteItsOwnInput(unittest.TestCase):

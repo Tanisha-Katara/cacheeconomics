@@ -51,3 +51,12 @@ __pycache__/
 # is our job. `*.partial-write` was added and this one, one suffix over, was
 # not.
 *.partial
+
+# The counted export itself. `run_diagnostic.py:_counted_path` and
+# `sweep_report.py:counted` derive this from the *input* path (run.jsonl ->
+# run-counted.jsonl), which is the other end of the toolchain from `--out` --
+# and the three rules above, added one at a time as each `--out` suffix was
+# noticed, all missed it for that reason. It is the enriched export with the
+# client's request bodies intact, written beside a capture the operator very
+# plausibly put inside a checkout.
+*-counted.*

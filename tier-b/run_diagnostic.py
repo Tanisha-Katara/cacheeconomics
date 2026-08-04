@@ -70,7 +70,14 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="report what counting would send, and send nothing")
     p.add_argument("--endpoint", help="send counting calls to your own gateway")
-    p.add_argument("--model", default="claude-haiku-4-5")
+    # No default here. `count_tokens.py` owns it, and this passed its own copy
+    # of the same string on every run -- which was fine while both said
+    # `claude-haiku-4-5` and silently wrong the moment one of them changed.
+    # It is a fallback for rows that name no model; rows that name one are
+    # counted with that model's tokenizer.
+    p.add_argument("--model",
+                   help="fallback tokenizer for rows whose body names no model. "
+                        "Rows that name a model are counted with it")
     args, passthrough = p.parse_known_args()
 
     # A sibling path, derived from the basename only. This was
@@ -96,8 +103,9 @@ def main() -> int:
               "carry no dollar figures.", file=sys.stderr)
     else:
         cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), args.path,
-               "-o", counted_path,
-               "--model", args.model]
+               "-o", counted_path]
+        if args.model:
+            cmd += ["--model", args.model]
         if args.endpoint:
             cmd += ["--endpoint", args.endpoint]
         if args.dry_run:

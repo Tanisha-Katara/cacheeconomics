@@ -23,11 +23,15 @@ the sizes then come from the same tokenizer that bills them -- but there is no
 committed artifact measuring the residual the way inferred-token-split.json
 measures the 19.2%, so this does not quote a number for it.
 
-What it costs. One call per distinct prefix cut, cached, and the endpoint is
-free. Prompt caching only pays when the prefix is stable, so the prefix is
-shared across requests and counted once: measured on the demo trace, 286
-structured requests produced 345 distinct cuts, or 1.2 calls per request. The
-cache is written alongside the output so a re-run costs nothing.
+What it costs. One call per distinct prefix cut *per model*, cached, and the
+endpoint is free. Prompt caching only pays when the prefix is stable, so the
+prefix is shared across requests and counted once: measured on the demo trace,
+286 structured requests produced 345 distinct cuts, or 1.2 calls per request.
+That trace is single-model; an export that mixes models costs a separate set of
+cuts for each, because each row is counted by the tokenizer it names and the two
+do not agree. `--dry-run` reports the real figure for the export in hand and
+names the tokenizers it would ask. The cache is written alongside the output so
+a re-run costs nothing.
 
 **This sends prompt content to the provider.** For a workload already running on
 that provider it is the same content over the same wire to the same company. For
@@ -61,6 +65,26 @@ from cacheeconomics.tokenizer import count_segments              # noqa: E402
 # deployment, or a self-hosted proxy all mean the counting call has to go
 # somewhere else, and a hard-coded host makes the answer "edit the source".
 DEFAULT_ENDPOINT = "https://api.anthropic.com/v1/messages/count_tokens"
+
+
+def row_model(body: dict, fallback: str, force: str | None = None) -> str:
+    """Which tokenizer counts this row.
+
+    The row's own model, because an export is not one model. A month of a
+    client's traffic routinely mixes an opus planner with a haiku worker, and
+    the two do not tokenize the same text into the same number of tokens.
+
+    Bound per row rather than read inside `count`, because `prefix_cuts`
+    rebuilds each cut out of tools/system/messages alone -- the cut it hands the
+    counter does not carry the row's model, so the caller has to say.
+
+    `force` wins when set, for a gateway that will not accept the model ids the
+    export happens to contain. `fallback` is for rows that name no model at all.
+    """
+    if force:
+        return force
+    m = body.get("model") if isinstance(body, dict) else None
+    return m.strip() if isinstance(m, str) and m.strip() else fallback
 
 
 def counter(model: str, key: str, stats: dict, endpoint: str = DEFAULT_ENDPOINT,
@@ -99,8 +123,15 @@ def main() -> int:
     p.add_argument("path", help="JSONL export of logged request bodies")
     p.add_argument("-o", "--out", required=True, help="where to write the enriched export")
     p.add_argument("--model", default="claude-haiku-4-5",
-                   help="model whose tokenizer to ask (default: claude-haiku-4-5). "
-                        "Claude models share a tokenizer, so this rarely matters")
+                   help="fallback tokenizer, used only for rows whose body names "
+                        "no model (default: claude-haiku-4-5). Every other row is "
+                        "counted with the model it names, so a mixed export is "
+                        "counted by each of its models rather than by one")
+    p.add_argument("--force-model",
+                   help="count every row with this model's tokenizer, ignoring the "
+                        "model each row names. For a gateway that does not accept "
+                        "the model ids in the export. The counts are then that "
+                        "model's, for every row, and are cached under it")
     p.add_argument("--cache", help="cache file to read and write (default: <out>.cache.json)")
     p.add_argument("--allow-partial", action="store_true",
                    help="write the output and exit 0 even when some rows could "
@@ -130,9 +161,11 @@ def main() -> int:
             cache = json.load(f)
         # Naming the counter, because after key scoping a model or endpoint
         # change resumes from 0 against a full file, which otherwise reads as a
-        # missing cache rather than a deliberate recount.
+        # missing cache rather than a deliberate recount. The model half of that
+        # name is per row now, so it is reported at the end, once the rows have
+        # said which models they are; only the endpoint is knowable up front.
         print(f"  resumed from {len(cache):,} cached counts "
-              f"({args.model} via {args.endpoint})", file=sys.stderr)
+              f"(via {args.endpoint})", file=sys.stderr)
     elif args.dry_run and os.path.exists(cache_path):
         # A dry run starts from an empty cache on purpose. The question it
         # answers is "what would you send", and the honest answer is what a
@@ -144,12 +177,31 @@ def main() -> int:
               f"a dry run ignores them and reports a cold run)", file=sys.stderr)
 
     stats = {"calls": 0}
-    # Which tokenizer these counts came from. Folded into every cache key, so a
-    # cache written for one model or endpoint cannot be silently reused by
-    # another -- those counts load as *exact* and would release structural money
-    # on sizes the new model was never asked for.
-    counter_id = f"{args.model}\x00{args.endpoint}"
-    count = counter(args.model, key, stats, args.endpoint, args.dry_run)
+    # One counter per model in the export, built on first sight of that model.
+    #
+    # `--model` used to name the tokenizer for the whole run: it was stamped
+    # over whatever model each row's own body carried, and it was the model half
+    # of the single `counter_id` every row was cached under. So an export
+    # holding both an opus planner and a haiku worker -- the ordinary shape of a
+    # month of agent traffic -- was counted end to end by one tokenizer, and the
+    # counts loaded as *exact*, releasing structural money on per-segment sizes
+    # the other model was never asked for. Measured on a two-row synthetic
+    # mixed export: 5/5 outgoing payloads carried `claude-haiku-4-5`, including
+    # the row whose body said `claude-opus-5`.
+    #
+    # The model comes from the row. Which means the counter and its id do too:
+    # folding the model into the cache key is what stops a cache written for one
+    # model or endpoint being read back for another, and that property is only
+    # worth anything if the model in the key is the one that actually answered.
+    counters = {}
+
+    def counter_for(model: str):
+        if model not in counters:
+            counters[model] = (f"{model}\x00{args.endpoint}",
+                               counter(model, key, stats, args.endpoint,
+                                       args.dry_run))
+        return counters[model]
+
     if args.dry_run:
         print(f"  DRY RUN: nothing will be sent. Host that would receive the "
               f"prompt content: {args.endpoint}", file=sys.stderr)
@@ -192,6 +244,8 @@ def main() -> int:
                     emit(json.dumps(row))
                     skipped += 1
                     continue
+                counter_id, count = counter_for(
+                    row_model(body, args.model, args.force_model))
                 try:
                     row["segment_tokens"] = count_segments(body, count, cache,
                                                       counter_id)
@@ -229,6 +283,10 @@ def main() -> int:
             # exists to refuse, so the dry run reports and stops.
             print(f"\n  DRY RUN: {stats['calls']:,} calls would go to {args.endpoint}")
             print(f"  {counted:,} rows would be counted, {skipped:,} skipped.")
+            # Named, because the models are what the calls carry and a mixed
+            # export costs one set of prefix calls per model. An operator being
+            # asked to approve the egress should see both facts before agreeing.
+            print(f"  tokenizers asked: {', '.join(sorted(counters)) or 'none'}")
             print("  Nothing was sent and nothing was written.")
             return 0
 
@@ -251,6 +309,13 @@ def main() -> int:
             print(f"  failed    {failed:,} (left for the analyzer to estimate)")
         print(f"  API calls {stats['calls']:,} for {len(cache):,} distinct prefixes"
               + (f", {stats['calls'] / counted:.1f} per row" if counted else ""))
+        # Which tokenizers actually answered. Reported rather than assumed:
+        # these counts load as *exact*, so the model behind them belongs in the
+        # run's own output where an operator reading a mixed export can see it
+        # was counted by more than one -- and where a single unexpected name
+        # says the rows were not carrying the model anyone thought they were.
+        print(f"  models    {', '.join(sorted(counters)) or 'none'}"
+              + (" (forced)" if args.force_model else ""))
         print(f"  wrote     {out_path}")
         print(f"  cache     {cache_path} (re-runs are free)")
         if partial and not args.allow_partial:
