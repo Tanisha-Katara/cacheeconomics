@@ -44,3 +44,10 @@ __pycache__/
 # anything left under this name is an aborted run -- and it holds the enriched
 # bodies export, prompts included.
 *.partial-write
+
+# The other suffix count_tokens derives from --out. Written when some rows
+# could not be counted, and it holds the enriched export with request bodies
+# intact -- the operator chose the --out path, not this suffix, so ignoring it
+# is our job. `*.partial-write` was added and this one, one suffix over, was
+# not.
+*.partial

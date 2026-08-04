@@ -1045,3 +1045,66 @@ class TestTheCountCacheIsScopedToItsCounter(unittest.TestCase):
         self.assertNotIn("SECRET-POLICY", blob)
         self.assertNotIn("CONFIDENTIAL", blob)
         self.assertNotIn("claude-opus-5", blob)
+
+
+class TestEverySuffixWeDeriveFromOutIsIgnored(unittest.TestCase):
+    """The operator chooses `--out`. They do not choose the suffixes this
+    toolchain appends to it, so keeping those out of a commit is our job.
+
+    `count_tokens.py` derives three: `.cache.json`, `.partial-write` and
+    `.partial`. The first two were added to `.gitignore` and the third — the
+    one written when some rows could not be counted, holding the enriched
+    export with request bodies intact — was not. Same defect class, one suffix
+    over, which is how the first two came to be added in the first place.
+
+    This asserts the *class* rather than the three names: it reads the suffixes
+    out of the source, so a fourth one added later fails here instead of in
+    somebody's repository.
+    """
+
+    def _derived_suffixes(self):
+        import re
+        src = open(os.path.join(TIER_B, "count_tokens.py")).read()
+        return sorted(set(re.findall(r'args\.out \+ "([^"]+)"', src)))
+
+    def test_the_source_still_derives_the_suffixes_we_think_it_does(self):
+        """Guards the guard: if the derivation stops looking like this, the
+        test below silently checks nothing."""
+        found = self._derived_suffixes()
+        self.assertTrue(found, "no derived suffixes found; the pattern moved")
+        self.assertIn(".partial", found)
+        self.assertIn(".cache.json", found)
+
+    def test_each_one_is_gitignored(self):
+        root = os.path.dirname(TIER_B)
+        for suffix in self._derived_suffixes():
+            with self.subTest(suffix=suffix):
+                probe = os.path.join(root, "some-run.jsonl" + suffix)
+                r = subprocess.run(["git", "check-ignore", "-q", probe],
+                                   cwd=root, capture_output=True)
+                self.assertEqual(r.returncode, 0,
+                                 f"'{suffix}' is written beside the operator's "
+                                 f"--out and git would stage it")
+
+    def test_a_failed_count_writes_prompt_text_into_one_of_them(self):
+        """The reason this matters: the file is not incidental, it carries the
+        bodies. If a future change stops it doing so, this test should be
+        revisited rather than the ignore rule quietly kept."""
+        src = os.path.join(self.dir, "in.jsonl")
+        with open(src, "w") as f:
+            f.write(json.dumps({"request": {
+                "model": "claude-opus-5",
+                "system": [{"type": "text", "text": "SECRET-POLICY"}],
+                "messages": [{"role": "user", "content": "hi"}]}}) + "\n")
+        out = os.path.join(self.dir, "out.jsonl")
+        subprocess.run(
+            [sys.executable, "-B", os.path.join(TIER_B, "count_tokens.py"),
+             src, "--out", out, "--endpoint", "http://127.0.0.1:1/x"],
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, ANTHROPIC_API_KEY="test"))
+        partial = out + ".partial"
+        self.assertTrue(os.path.exists(partial), "expected a partial export")
+        self.assertIn("SECRET-POLICY", open(partial).read())
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
