@@ -155,6 +155,29 @@ class _ScopeState:
     firing: OrderedDict = field(default_factory=OrderedDict)
 
 
+# Why a lookup went unanswered, and what the operator does about it.
+#
+# A row that is absent and a row that is present and *disputed* are not the
+# same problem and do not have the same remedy: the first gets recorded, the
+# second gets settled. `ContestedRow` subclasses `RegistryError`, so a single
+# `except registry.RegistryError` reported the shipped `openai/bedrock` and
+# `google/gemini-explicit` rows as missing data and sent the reader to add a
+# value that is already on file -- against this project's standing rule that a
+# contested row is never treated as fact. Wrong cause, wrong file.
+_NOT_RECORDED = "not recorded for this surface"
+_RECORDED_NULL = "recorded as null"
+_CONTESTED = "on file but flagged contested, so it cannot be treated as fact"
+
+_REMEDIES = {
+    _NOT_RECORDED: "record the missing limits in the registry with a dated "
+                   "source, or name a surface on the stream that has them",
+    _RECORDED_NULL: "record the missing limits in the registry with a dated "
+                    "source, or name a surface on the stream that has them",
+    _CONTESTED: "settle the contested row against a dated source, or leave it "
+                "contested and accept that these checks stay off",
+}
+
+
 class _RegistryReads:
     """Every registry lookup one request's checks made, and which of them the
     registry could not answer.
@@ -169,11 +192,11 @@ class _RegistryReads:
     `registry` directly is not, and INV-5 in the test suite is what catches
     that, by watching which keys the module actually reads.
 
-    Two ways a lookup goes unanswered, and both reach the same silent state:
-    `RegistryError` when the surface records no such key, and a recorded
-    `None`. A recorded *zero* is an answer -- `deepseek/direct` allows no
-    explicit breakpoints, which is a fact about the surface and not a gap in
-    the registry -- so `is None` is the test, never falsiness.
+    Three ways a lookup goes unanswered, all reaching the same silent state:
+    the surface records no such key, the surface is contested, and the key is
+    recorded as `None`. A recorded *zero* is an answer -- `deepseek/direct`
+    allows no explicit breakpoints, which is a fact about the surface and not
+    a gap in the registry -- so `is None` is the test, never falsiness.
 
     Bounded by construction: one entry per literal key named in this file, and
     one `needed_for` string per call site. Both are fixed at import time.
@@ -186,16 +209,32 @@ class _RegistryReads:
     def get(self, key, fn, *, needed_for):
         """Read `key` from the registry, recording it when the answer is not
         there. Returns None in that case, and the caller decides what to do --
-        abstain, or carry on unbounded -- because that differs per check."""
+        abstain, or carry on unbounded -- because that differs per check.
+
+        `needed_for` may be None, meaning this request reads the value but no
+        check here can act on its absence. The value is still read and still
+        used; it is simply not announced, because an alert naming a cause that
+        is not the reason the operator is getting no answer is an alert that
+        fires on ordinary traffic -- and one that fires on ordinary traffic
+        gets switched off, which ends in the same silence this class exists to
+        break. The live case is the lookback bound on a lifetime RT-TTL does
+        not evaluate: filling the registry gap would change nothing, so the
+        gap is not why RT-TTL is quiet.
+        """
         try:
             value = fn()
+        except registry.ContestedRow:
+            # Before the base class, which it subclasses. Reversing these two
+            # clauses is the defect, not a style choice.
+            why = _CONTESTED
         except registry.RegistryError:
-            why = "not recorded for this surface"
+            why = _NOT_RECORDED
         else:
             if value is not None:
                 return value
-            why = "recorded as null"
-        self.unanswered.setdefault(key, (why, set()))[1].add(needed_for)
+            why = _RECORDED_NULL
+        if needed_for:
+            self.unanswered.setdefault(key, (why, set()))[1].add(needed_for)
         return None
 
 
@@ -357,6 +396,11 @@ class Monitor:
         example = (" A marker below the minimum caches nothing and the "
                    "provider returns no error either."
                    if "min_cacheable_tokens" in reads.unanswered else "")
+        # The remedy follows the cause too, for the same reason the detail
+        # does. Adding a value and settling a disputed one are different jobs
+        # in different files, and a surface can present both at once.
+        fix = "; ".join(sorted({_REMEDIES[why]
+                                for why, _ in reads.unanswered.values()}))
         return Alert(
             "RT-NOSURFACE", "low", scope,
             f"{r.target_id!r} cannot answer {what} these checks make, so they "
@@ -365,8 +409,7 @@ class Monitor:
             f"unmeasured, not healthy.{example} Only the checks named here are "
             f"affected -- the rest read nothing from the registry.",
             subject="nosurface:" + ",".join(missing), at=r.sent_at,
-            fix="Name the surface on the stream, or record these limits in the "
-                "registry with a dated source.")
+            fix=fix[:1].upper() + fix[1:] + ".")
 
     def _fire(self, st: _ScopeState, a: Alert, into: list) -> None:
         """Emit an alert once per `(code, subject)` for this scope.
@@ -602,20 +645,35 @@ class Monitor:
         # Both lookups abstain into "no narrowing" rather than into silence,
         # which over-credits rather than under-reporting -- so RT-NOSURFACE has
         # to say the timeline is unbounded, not merely that a check is off.
+        #
+        # Announced only when RT-TTL could act on this request at all. RT-TTL
+        # is the sole consumer of this timeline and abstains on any lifetime
+        # outside `TTL_SECONDS` before either bound can matter --
+        # `openai/direct` advertises 30m only, so every ordinary request there
+        # was being told the missing lookback unbounds a check that was quiet
+        # for an entirely different reason. Filling the gap would have changed
+        # nothing, which makes it the wrong cause to name. The values are still
+        # read and still applied; only the attribution is conditional.
+        served = Monitor._ttl_rt_ttl_can_read(r) is not None
         window = reads.get(
             "lookback_blocks",
             lambda: registry.capability(r.target_id, "lookback_blocks"),
-            needed_for="RT-TTL (its rewrite timeline is then unbounded and "
-                       "credits rewrites the provider could not have read back)")
+            needed_for=("RT-TTL (its rewrite timeline is then unbounded and "
+                        "credits rewrites the provider could not have read "
+                        "back)") if served else None)
         # Below the provider's minimum no entry is written, so a boundary
         # shorter than it can never be read back. The batch helper applies this
         # and this side did not, so RT-TTL fired on a sub-minimum marker where
         # TTL-1 refuses -- a divergence introduced by fixing one side.
+        #
+        # A missing minimum still gets announced on a marked request, by
+        # RT-MIN's own call site in `_below_minimum`, with RT-MIN named as the
+        # consequence. Gating here drops a second attribution, never the alert.
         floor = reads.get(
             "min_cacheable_tokens",
             lambda: registry.min_cacheable_tokens(r.target_id, r.model),
-            needed_for="RT-TTL (rewrites of a prefix too short to cache are "
-                       "then counted as recoverable)")
+            needed_for=("RT-TTL (rewrites of a prefix too short to cache are "
+                        "then counted as recoverable)") if served else None)
         top = max(marked)
         ordered = sorted(r.segments, key=lambda s: s.index)
         # Marker positions as lengths in this sequence, which is the unit
@@ -635,6 +693,33 @@ class Monitor:
                 continue
             out.append(hash(tuple(seq)))
         return out
+
+    @staticmethod
+    def _ttl_rt_ttl_can_read(r):
+        """The lifetime RT-TTL will actually reason about here, or None.
+
+        One definition, read by `_cadence_vs_ttl` to decide whether to speak
+        and by `_prefix_hashes` to decide whether its registry lookups are
+        worth announcing. Restating the condition in the second place is how
+        the announcement and the check drift apart -- which is the shape of
+        defect this file has already paid for twice.
+        """
+        lifetimes = r.marker_lifetimes
+        # Two lifetimes in one request is a deliberate pattern -- a durable
+        # prefix under an advancing turn -- and which one a cadence argument
+        # is about is genuinely ambiguous. Abstaining beats guessing at the
+        # operator's expense.
+        if len(lifetimes) > 1:
+            return None
+        # The lifetime on the prefix this advice is about, not the row's.
+        #
+        # Preferring `ttl_requested` told an operator to "set a one-hour TTL on
+        # the stable prefix" on a request whose stable prefix was already 1h and
+        # whose trailing turn was 5m -- the row field cannot express a mixed
+        # request, so it reported the wrong one and the recommendation was a
+        # no-op the operator would have had to disprove themselves.
+        ttl = next(iter(lifetimes), None) or r.ttl_requested
+        return ttl if ttl in TTL_SECONDS else None
 
     @staticmethod
     def _marked_hashes(r) -> list:
@@ -915,6 +1000,15 @@ class Monitor:
     def _marker_budget(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Marker count creeping toward the limit, which errors at the limit."""
         count = sum(1 for s in r.segments if s.cache_marked)
+        # Before the lookup, not after. Zero markers cannot exhaust any
+        # non-negative budget, so this request is answered without the registry
+        # and reading first raised RT-NOSURFACE on ordinary unmarked traffic to
+        # `openai/direct` -- a coverage warning about a check that was not
+        # abstaining, it was concluding. Worse, the subject it burned is the
+        # one a later marked request on the same scope would have used, so the
+        # genuine abstention was then suppressed as a repeat.
+        if not count:
+            return
         budget = reads.get(
             "max_breakpoints",
             lambda: registry.capability(r.target_id, "max_breakpoints"),
@@ -945,22 +1039,11 @@ class Monitor:
         # the report refused to make the same claim from the same trace.
         if len(st.rewrite_gaps) < self.min_samples:
             return
-        # The lifetime on the prefix this advice is about, not the row's.
-        #
-        # Preferring `ttl_requested` told an operator to "set a one-hour TTL on
-        # the stable prefix" on a request whose stable prefix was already 1h and
-        # whose trailing turn was 5m -- the row field cannot express a mixed
-        # request, so it reported the wrong one and the recommendation was a
-        # no-op the operator would have had to disprove themselves.
-        lifetimes = r.marker_lifetimes
-        if len(lifetimes) > 1:
-            # Two lifetimes in one request is a deliberate pattern -- a durable
-            # prefix under an advancing turn -- and which one this cadence
-            # argues about is genuinely ambiguous. Abstaining beats guessing at
-            # the operator's expense.
-            return
-        ttl = next(iter(lifetimes), None) or r.ttl_requested
-        if ttl not in TTL_SECONDS:
+        # Which lifetime this advice is about, and whether it is one this check
+        # can argue about at all. Shared with `_prefix_hashes`, which announces
+        # its registry lookups only on the requests this returns a value for.
+        ttl = self._ttl_rt_ttl_can_read(r)
+        if ttl is None:
             return
         gaps = sorted(st.rewrite_gaps)
         median = gaps[len(gaps) // 2]

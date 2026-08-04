@@ -437,14 +437,29 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         asyncio.run(go())
         return max((list(p) for p in placed), key=len, default=[])
 
-    def _run(self, h, model, calls=6, provider=None):
+    def _run(self, h, model, calls=6, provider=None, marked=False):
+        """`marked` places a caller's own cache breakpoint on the body.
+
+        Off by default, so the four surface-resolution tests below are
+        unchanged. The budget test turns it on because a request carrying no
+        markers has no budget question to ask -- zero cannot exhaust any
+        non-negative budget -- and the live budget check now answers that case
+        without consulting the registry at all. Marker-free traffic therefore
+        produces no observable question, and asserting on one was asserting
+        that a check reads the registry when it does not need to.
+        """
         import asyncio
         scopes = []
 
         async def go():
             for i in range(calls):
+                content = [{"type": "text", "text": "policy " * 3000}]
+                if marked:
+                    content[0]["cache_control"] = {"type": "ephemeral"}
                 data = {"model": model, "litellm_call_id": f"c{i}",
-                        "messages": [{"role": "user", "content": "policy " * 3000}]}
+                        "messages": [{"role": "user",
+                                      "content": content if marked
+                                      else "policy " * 3000}]}
                 if provider:
                     data["custom_llm_provider"] = provider
                 await h.async_pre_call_hook(None, None, data, "completion")
@@ -575,6 +590,16 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
         applying the mutation and watching the value-based version pass. So the
         observable property is not the result but the question: which surface
         did the guard actually ask about.
+
+        `marked=True` because the question only exists on traffic that has
+        markers to budget. This ran on marker-free bodies and passed on the
+        strength of the runtime monitor's `_marker_budget`, which used to read
+        the budget before checking whether the request carried any markers --
+        so the guard being observed was one that should not have been asking.
+        Measured: 6 reads of `max_breakpoints` on `google-cloud/vertex` from a
+        body with no cache_control anywhere. With a caller-placed marker the
+        same 6 reads happen for a real reason, and the assertions below are
+        unchanged.
         """
         from cacheeconomics import registry
         asked = []
@@ -586,7 +611,8 @@ class TestTheLivePathResolvesItsSurface(unittest.TestCase):
 
         registry.capability = spy
         try:
-            self._run(self._hook(), "claude-haiku-4-5", provider="vertex_ai")
+            self._run(self._hook(), "claude-haiku-4-5", provider="vertex_ai",
+                      marked=True)
         finally:
             registry.capability = real
 
