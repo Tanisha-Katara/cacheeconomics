@@ -321,3 +321,34 @@ Actions that must accompany the merge:
 
 **The last item is not optional.** It is the one review that covers what the
 per-track reviews structurally cannot.
+
+---
+
+## 12. `registry._load` accepts NaN and Infinity from disk
+
+Python's JSON parser accepts the non-standard `NaN`, `Infinity` and `-Infinity`
+literals by default. **Verified through `registry._load` itself**, not merely
+`json.loads`: a registry file containing them returns
+`{'read': nan, 'write_5m': inf, 'write_1h': -1}`.
+
+**Downstream, measured before the consumers were guarded:**
+
+    NaN       ->  usd = nan   rendered "$nan"; --format json emits a bare NaN,
+                              which is INVALID JSON and breaks any consumer
+    Infinity  ->  usd = inf
+    -1.0      ->  usd = -5.00  a negative bill
+    0.0       ->  usd = 0.00   writes priced free
+
+**Every consumer is now guarded** — `cost.is_multiplier` requires finite and
+`> 0`, and `tiers._surface` refuses a present-but-invalid multiplier — so this
+is defence in depth rather than a live hole. It is still the stronger fix,
+because it stops the value entering the process rather than catching it at each
+use, and "each use" is a set that has already been wrong twice this round.
+
+**The change:** `json.load(f, parse_constant=...)` raising on the three
+constants. Verified that `parse_constant` closes it.
+
+**Why unowned:** `registry.py` was assigned to Track C for one additive change
+(`allow_contested`), and this is a different concern in the same file. Track B
+found it, guarded every consumer it owns, and correctly declined to edit a file
+outside its remit.
