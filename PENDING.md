@@ -32,21 +32,30 @@ which was the whole point of the documented default.
 
 ---
 
-## 2. Projection gating for per-finding figures
+## 2. ~~Projection gating for per-finding figures~~ — CLOSED
 
-`_monthly` has seven callers; six are per-finding `avoidable_usd_month` and
-only `monthly_input_usd` was gated by the projection floor.
+**My measurement of this was wrong and is corrected here.** I stated, in the
+approved plan and in this file, that "exactly 11" tests break when the gate is
+extended, measured with a read-only pytest probe. Track A found a naive gate
+breaks **17**, and the correct implementation breaks **9**. My probe never
+modelled the interaction that explains the difference: a naive gate OVERWRITES
+an existing refusal, replacing "segment sizes disagree with what was billed"
+with the weaker projection reason. `_withhold_projection` only downgrades a
+figure that is currently *released*, which cut the migration to 9 — all
+positive controls for other gates, none about projections.
 
-**Measured:** exactly **11** tests fail when the gate is extended to finding
-figures, measured with a read-only pytest plugin. All 11 assert *other* gates —
-structural coverage, alignment, counted tokens, size agreement — and merely
-need some released figure to exist. None is about projections. An earlier note
-in `analyzer.py` said "ten"; 11 is the measured number.
+Closed in Track A with a split figure: `avoidable_usd_window`, measured over the
+observed window and never extrapolated, beside the gated `avoidable_usd_month`.
 
-**Status: IN FLIGHT, not deferred.** Being closed in Track A of the current
-round via a split figure (`avoidable_usd_window`, measured and never
-extrapolated, beside the gated `avoidable_usd_month`). Recorded here because
-`analyzer.py:2084` points at this file for it.
+**A second defect was found inside the fix, and it was also mine.** The floor was
+computed once from the WHOLE trace's window and request count, then applied to
+every finding — so a finding resting on a tiny subset published a monthly figure
+whenever unrelated traffic cleared the floor. Measured: a 10-request, 2.3-day
+trace whose only two cache writers went out **1 second apart** published EFF-1 at
+$6.43/mo and FAN-1 at $14.79/mo, both `reconciled`, totalling $21.21/mo — on a
+2-request sample, while the 8 filler requests that carried the floor contributed
+exactly $0. Each rule now passes the timestamps of the requests that actually
+moved its figure, and `sample_times` is required with no default.
 
 ---
 
@@ -175,3 +184,140 @@ afterwards.
 documentation, record it with the source and the date observed, and only then
 does the alert go quiet — because the answer exists, not because the question
 was suppressed.
+
+---
+
+## 9. `TraceSet`'s structural fields default to "measured and fine"
+
+A `TraceSet` constructed directly — which the public API allows — answers every
+structural question affirmatively without anything having measured it:
+
+    structural_coverage: float = 1.0
+    tokens_counted: float = 1.0
+    token_sums_reconciled: bool = True
+    token_sums_publishable: bool = True
+
+So `TraceSet(requests=reqs, tier=Tier.INSTRUMENTED)` declares counted tokens and
+publishable segment sums that no loader established. Both the analyzer and the
+bake-off gate read these, so a gate that fails closed on `trace=None` fails
+**open** on a bare `TraceSet`.
+
+**Measured** (Track E, applied temporarily then reverted): flipping the four
+defaults to `0.0/0.0/False/False` fails **26 tests, 11 of them analyzer tests
+that never call the simulator** — `TestStructuralClaimsNeedMeasuredSegmentation`,
+`TestStructuralCoverageGatesStructuralMoney`,
+`TestCoverageThatGatesMoneyIsWeightedByMoney`,
+`TestStructuralMoneyNeedsCountedTokens`.
+
+That count is the finding, not an obstacle to it: **the analyzer shares this
+hole rather than inheriting it from the simulator.** Eleven analyzer tests
+currently rely on a permissive default to reach the code they exercise.
+
+**Partially backstopped, which is why it has not bitten yet.** A false
+declaration is caught from the requests for three of them —
+`token_sums_publishable` by `misscaled`, `structural_coverage` by `unstructured`
+reaching `omitted`, and `structural_coverage_billed` is a property that cannot
+be declared at all. **Not** backstopped: `tokens_counted`, `tier`, `alignment`,
+`skipped_rows`. `tokens_counted=1.0` is the real hole — nothing on a `Request`
+carries the information needed to contradict it.
+
+**Exact change when picked up:** `harness/cacheeconomics/trace.py`, `class
+TraceSet`, the four field defaults above. Expect to reclassify 11 analyzer
+tests, which is the actual work — the one-line default change is not.
+
+**Do not do this inside another track.** It moves analyzer behaviour, and the
+tests it breaks are the ones that assert the analyzer's own trust gates.
+
+---
+
+## 10. `min_cacheable_tokens` cannot be inspected on a contested row
+
+`registry.capability(target_id, name, allow_contested=False)` takes an
+`allow_contested` flag; `registry.min_cacheable_tokens(target_id, model)` does
+not. So on a contested surface — shipped: `openai/bedrock`,
+`google/gemini-explicit` — a caller cannot distinguish "this row records a
+minimum, but the row is disputed" from "this row records no minimum at all".
+
+**Consequence, found by Track C:** `RT-NOSURFACE` can name the dispute but not
+whether the value also needs recording. It now reports the key as *not
+inspected* rather than guessing, which is correct — "present" understates a row
+that needs values, "absent" invents a gap — but it is an answer the operator
+cannot act on precisely.
+
+**Why not fixed there:** reproducing the registry's `inherits_minimums_from`
+walk inside `monitor.py` would be a second copy of the registry's own knowledge,
+and every second copy in this codebase has drifted. The fix belongs in
+`registry.py`: either give `min_cacheable_tokens` the same `allow_contested`
+parameter `capability` has, or add a diagnostic that reports row-level contested
+status separately from per-key presence.
+
+**Scope:** `registry.py` only, plus whatever calls it. Small, but it is the
+public registry API and no track owned it this round.
+
+---
+
+## 11. FIVE BRANCHES COMPLETE AND UNVERIFIED EXTERNALLY
+
+**Status: not merged. Do not merge without reading this entry.**
+
+Five worktree branches carry substantial fixes. Every one is committed, tested
+and self-reported as complete. **None has passed a clean external review**, and
+the external reviewer became unavailable mid-run:
+
+    Codex usage limit reached; resets 2026-08-11 19:42
+
+Confirmed by direct probe, not inferred from a single failure.
+
+### Why this entry exists rather than a merge
+
+The plan this round was executed under states: *if a stage's review cannot run,
+that stage is not done — it is marked unverified externally here and does not
+merge. It is never quietly counted as passing.* This is that record.
+
+Two independent reasons merging is not justified:
+
+1. **No track ever returned a clean review.** 48 scoped reviews across 5 tracks;
+   every one found at least one real defect. The final verdict on every track
+   was `needs-attention`.
+2. **The most recent work on every track is unreviewed.** Tracks C and E have
+   strong final rounds that no reviewer has seen. Merging them rests on my
+   assessment alone, which is the exact failure this round was convened to fix.
+
+### Branch state at the point of the outage
+
+    worktree-agent-a595754573f25fde6   Track A   4a12b92   projections, TTL-1, multiplier validation
+    worktree-agent-abe30441cb92d4802   Track B   b1039fc   surface defaults, assumed_inputs, cost.py bool
+    worktree-agent-a316a0a62e83df9b7   Track C   d632025   monitor abstentions, TTL narrowing, budget guard
+    worktree-agent-a4bfc871983f7a67b   Track D   1f15ecd   tier-b counting, provenance, egress rule
+    worktree-agent-a1b3f34e94aac1182   Track E   9f0e8d1   bake-off trust gates, by-agent, DRAFT rendering
+
+`main` is untouched at the INV-6b commit: 1327 passing, CI green.
+
+### Open findings at the outage, by track
+
+- **A** — reviewed through round 5; round 6 unreviewed.
+- **B** — reviewed through round 8; round 9 (`cost.py` bool fix) unreviewed.
+- **C** — reviewed through round 7; round 8 unreviewed.
+- **D** — TWO HIGH FINDINGS OPEN AND UNFIXED: `countable()` proves priceability
+  rather than endpoint serveability, so a dated id like
+  `claude-opus-5-99999999` still sends prompt content; and the loader gate
+  accepts provenance whose `tokenizer_model` is `None`, which the counter itself
+  refuses. **Track D must not merge in its current state.**
+- **E** — reviewed through round 6; round 7 unreviewed.
+
+### Merge order and actions, when verification resumes
+
+Order: **B → A → C → E → D** (B first: 22 files, the widest surface).
+
+Actions that must accompany the merge:
+
+    retire KNOWN_JSON_UNPROVENANCED and KNOWN_SILENT_ABSTENTIONS in test_invariants.py
+    delete the xfail markers each track flagged (each carries a comment naming the trigger)
+    rebuild web/harness-bundle.js ONCE, after all five  (Track E changed BakeOff.__str__,
+      so rendered output differs, not only internals)
+    full suite, three disclosure verifiers, CLI smoke, generated fixtures unchanged
+    a FINAL external review of the merged result — five individually-correct
+      diffs can still be jointly wrong, and no per-track review looks at the seams
+
+**The last item is not optional.** It is the one review that covers what the
+per-track reviews structurally cannot.
