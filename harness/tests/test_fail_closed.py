@@ -302,31 +302,34 @@ class TestTheRateFreeMarkingIsAccurate(unittest.TestCase):
 
 
 class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
-    """An ingest adapter records what it had to assume. Nothing read it.
+    """An input the loader assumed is not an input it read, and a figure priced
+    from one must not carry the provenance of an invoice check.
 
-    `ts.blocking_notes` is how a loader says something qualifies every figure in
-    this trace -- most sharply, that the *surface* was assumed rather than named
-    by the export, which makes the rate table and the cache multipliers an
-    assumption too. The release decision never consulted it, so the invoice
-    reconciled against assumed rates and every figure came back
-    `released_as='reconciled'`: the provenance of an invoice check, on a number
-    computed from a guess. Measured on the fixture below, all six figures.
+    The sharpest case is the surface: assume it and the rate table and the cache
+    multipliers are assumptions too, so the invoice reconciles against a guess.
+    Measured before this existed: every figure in `spend`, the finding's, and
+    `total_avoidable_month` all came back `released_as='reconciled'`.
 
-    The remedy is DRAFT rather than withholding. The invoice did reconcile; what
-    is assumed is what it reconciled against, so the evidence is weaker than it
-    looks rather than absent -- and DRAFT already means exactly "released, and
-    not for forwarding", with a banner both renderers print before any figure.
+    Keyed on `ts.assumed_inputs`, not on `ts.blocking_notes`. The first version
+    read the notes and that was wrong three ways -- it over-blocks, because the
+    litellm adapter uses the same list to mean "these rows were excluded" and a
+    trace that then reconciles is correctly RECONCILED; it decides a release
+    label by matching prose, which is the failure that stopped QUALIFIES_SPEND
+    being the classifier in the first place; and the fact is per-input, so a
+    sentence cannot say whether the surface or the rate was the assumption.
+    `TestABlockingNoteAloneDoesNotRelabelACorrectReport` pins the first of those.
 
-    A third state spelled ASSUMED would be the precise word. It would also mean
-    changing `money.RELEASES`, `simulate.py` and the round-trip table in
-    `test_invariants.py`, two of which are outside this track, so it is measured
-    and reported rather than half-built.
+    DRAFT rather than withheld: the invoice did reconcile, what is assumed is
+    what it reconciled *against*, so the evidence is weaker than it looks rather
+    than absent. A third state spelled ASSUMED would be the precise word and
+    would mean changing `money.RELEASES`, `simulate.py` and the round-trip table
+    in `test_invariants.py`, two of which are outside this track.
     """
 
     NOTE = ("The surface was assumed to be anthropic/direct; the export names "
             "none. Rates and cache multipliers here are an assumption.")
 
-    def _analysis(self, blocking=True):
+    def _trace(self, assumed=("surface",), blocking=False):
         reqs = [Request(request_id=f"r{i}",
                         sent_at=T0 + timedelta(hours=6 * i),
                         model="claude-opus-5", target_id="anthropic/direct",
@@ -336,8 +339,17 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
                         segments=[])
                 for i in range(12)]
         ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY,
-                      notes=[self.NOTE] if blocking else [],
+                      notes=[self.NOTE] if (assumed or blocking) else [],
                       blocking_notes=[self.NOTE] if blocking else [])
+        if assumed:
+            # Set dynamically: the field belongs to `trace.py`, which this track
+            # does not own, and `analyze` reads it with `getattr` for the same
+            # reason. A loader that never sets it assumed nothing.
+            ts.assumed_inputs = tuple(assumed)
+        return ts
+
+    def _analysis(self, assumed=("surface",), blocking=False):
+        ts = self._trace(assumed, blocking)
         invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
         return analyze(ts, invoice_usd=invoice)
 
@@ -384,22 +396,131 @@ class TestAnAssumptionIsNeverPublishedAsAMeasurement(unittest.TestCase):
             with self.subTest(figure=p):
                 self.assertEqual(money.DRAFT, f.released_as)
 
-    def test_the_draft_banner_says_which_assumption(self):
+    def test_the_draft_banner_names_the_assumption_and_not_the_invoice(self):
+        """The banner has to say the true thing. `report._draft_reason` takes
+        the *first* note beginning with "DRAFT", and its fallback sentence is
+        "released without invoice reconciliation" -- which is plainly false
+        here, because an invoice was supplied and it reconciled. One composed
+        note, listing every reason a report is a draft."""
         a = self._analysis()
-        banner = next((n for n in a.notes if n.startswith("DRAFT")), None)
-        self.assertIsNotNone(banner, "figures went out as drafts with no banner")
-        self.assertIn("surface was assumed", banner)
+        banners = [n for n in a.notes if n.startswith("DRAFT")]
+        self.assertEqual(1, len(banners),
+                         "two DRAFT notes means the first one speaks for both")
+        self.assertIn("surface", banners[0])
+        self.assertIn("assumed rather than read", banners[0])
+        self.assertNotIn("without invoice reconciliation", banners[0])
 
-    def test_a_trace_with_no_such_note_is_still_reconciled(self):
+    def test_the_gate_itself_is_untouched(self):
+        """The label changes; the gate does not. If reconciliation had failed
+        everything would be withheld and the label would be moot, and flipping
+        the gate here would make the two renderers disagree about a report
+        neither should be publishing."""
+        a = self._analysis()
+        self.assertTrue(a.reconciliation["within_ship_gate"])
+        self.assertTrue(a.spend["input_usd"].released)
+
+    def test_a_trace_that_assumed_nothing_is_still_reconciled(self):
         """The other direction. Downgrading everything to DRAFT would satisfy
         every assertion above and relabel every honest figure in the product."""
-        a = self._analysis(blocking=False)
+        a = self._analysis(assumed=())
         from cacheeconomics import money
         released = [(p, f) for p, f in self._figures(a) if f.released]
         self.assertTrue(released)
         for p, f in released:
             with self.subTest(figure=p):
                 self.assertEqual(money.RECONCILED, f.released_as)
+
+    def test_a_library_caller_gets_the_same_answer_as_the_cli(self):
+        """The property, not the patch.
+
+        A downgrade applied inside a CLI subcommand protects only the people who
+        use that subcommand. `analyze()` is the seam every caller goes through --
+        the bake-off, the tier-b scripts, anyone importing the package -- and it
+        is where the provenance has to be read. This calls it directly, with no
+        CLI anywhere in the stack.
+        """
+        from cacheeconomics import money
+        ts = self._trace(assumed=("surface",))
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        a = analyze(ts, invoice_usd=invoice)
+        self.assertEqual(money.DRAFT, a.spend["input_usd"].released_as)
+
+    def test_which_input_was_assumed_survives_into_the_banner(self):
+        """Per-input, not per-report. An assumed surface and an assumed rate are
+        different assumptions with different remedies, and the reader has to be
+        told which one happened -- which is the thing a single blocking-note
+        string could never carry."""
+        a = self._analysis(assumed=("effective rate",))
+        banner = next(n for n in a.notes if n.startswith("DRAFT"))
+        self.assertIn("effective rate", banner)
+        self.assertNotIn("surface", banner)
+
+
+class TestABlockingNoteAloneDoesNotRelabelACorrectReport(unittest.TestCase):
+    """The over-block that keying on `ts.blocking_notes` would have caused.
+
+    `blocking_notes` carries the QUALIFIES_SPEND phrase, and the litellm adapter
+    fills it to mean "these rows were excluded from the totals". A trace that
+    then reconciles is *correctly* RECONCILED: the excluded rows are excluded,
+    and what remains ties to the invoice. Keying the release label on the
+    presence of any blocking note would relabel every one of those reports as a
+    draft -- fixing an under-block by shipping an over-block, which this project
+    has done twice and paid for both times.
+
+    So the caveat still prints, in both renderers and before any figure, and the
+    provenance stays RECONCILED. Those are two different questions and this is
+    the test that keeps them apart.
+    """
+
+    EXCLUSION = ("3 row(s) carry no `custom_llm_provider` and no routing prefix "
+                 "on the model, so the surface is unknown and they are excluded "
+                 "from every dollar figure.")
+
+    def _analysis(self):
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(hours=6 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", session="s", agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 100_000},
+                        segments=[])
+                for i in range(12)]
+        ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY,
+                      notes=[self.EXCLUSION], blocking_notes=[self.EXCLUSION])
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return analyze(ts, invoice_usd=invoice)
+
+    def test_the_figures_stay_invoice_checked(self):
+        from cacheeconomics import money
+        a = self._analysis()
+        self.assertTrue(a.spend["input_usd"].released)
+        self.assertEqual(money.RECONCILED, a.spend["input_usd"].released_as)
+
+    def test_and_the_report_is_not_stamped_a_draft(self):
+        a = self._analysis()
+        self.assertEqual([], [n for n in a.notes if n.startswith("DRAFT")])
+
+    def test_but_the_caveat_still_travels_with_the_figures(self):
+        """Withholding the label is not withholding the warning."""
+        from cacheeconomics.analyzer import spend_caveats
+        a = self._analysis()
+        self.assertIn(self.EXCLUSION, spend_caveats(a))
+
+    def test_a_blocking_note_reaches_the_report_even_if_notes_omits_it(self):
+        """`Analysis.blocking_notes` is a filter over `notes`, so a note an
+        adapter recorded as blocking and did not also put in `notes` was
+        dropped -- it reached neither the report nor the caveat block. Every
+        adapter puts it in both today by convention, and this is the contract."""
+        from cacheeconomics.analyzer import spend_caveats
+        reqs = [Request(request_id="r0", sent_at=T0, model="claude-opus-5",
+                        target_id="anthropic/direct", tenant="t",
+                        ttl_requested="5m",
+                        usage={"input_tokens": 1_000}, segments=[])]
+        ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY,
+                      notes=[], blocking_notes=["only in blocking_notes"])
+        a = analyze(ts, allow_unreconciled=True)
+        self.assertIn("only in blocking_notes", a.notes)
+        self.assertIn("only in blocking_notes", spend_caveats(a))
 
 
 class TestABaselineArmDoesNotInventABudget(unittest.TestCase):

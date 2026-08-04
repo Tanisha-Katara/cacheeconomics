@@ -2161,6 +2161,15 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
                 released=recon["within_ship_gate"], withheld_because=_why)
 
     notes = list(ts.notes)
+    # `Analysis.blocking_notes` is built by *filtering* `notes`, so a note an
+    # adapter recorded as blocking and did not also put in `notes` was dropped
+    # on the floor -- it reached neither the report nor the caveat block that
+    # exists to print it before any figure. Every adapter happens to put such a
+    # note in both lists today, which is a convention rather than a contract,
+    # and the filter is where the convention silently becomes a requirement.
+    for n in ts.blocking_notes:
+        if n not in notes:
+            notes.append(n)
     if unprovable:
         notes.append(
             f"{len(unprovable)} of {len(reqs)} requests recorded cache writes without a "
@@ -2339,15 +2348,22 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
     # Reconciled unless the override below says otherwise. A silent default of
     # DRAFT would relabel every invoice-checked figure in the product.
     released_as = money.RECONCILED
+    # Collected rather than inserted, because there are two independent reasons
+    # a report can be a draft and `report._draft_reason` reads the *first* note
+    # beginning with "DRAFT". Inserting a second one meant whichever landed
+    # first spoke for both, and its fallback sentence -- "released without
+    # invoice reconciliation" -- is plainly false on a run where an invoice was
+    # supplied and reconciled. One note, composed, listing every reason.
+    draft_reasons: list[str] = []
     if (not gate_ok and money.draft_override_applies(recon is not None, allow_unreconciled)
             and not unprovable and not unpriceable_models
             and not unpriceable_surfaces and not undated
             and not skipped_rows and not blind_rows and not failed_billed):
         gate_ok = True
         released_as = money.DRAFT
-        notes.insert(0, "DRAFT — figures released without invoice reconciliation. "
-                        "Not for external use: these numbers have not been tied to a "
-                        "provider invoice and may not survive one.")
+        draft_reasons.append(
+            "figures released without invoice reconciliation. These numbers "
+            "have not been tied to a provider invoice and may not survive one.")
     elif (not gate_ok
           and money.draft_override_applies(recon is not None, allow_unreconciled)
           and _residual_blocker()):
@@ -2358,38 +2374,62 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         # thing again -- the fix was never an invoice, it was a rate.
         why = _residual_blocker()
 
-    # An ingest adapter can know something the analyzer cannot see, and record
-    # it as a blocking note: most sharply, that the *surface* was assumed rather
-    # than stated by the export. Nothing here read those, so a trace whose rate
-    # table was a guess reconciled against the invoice and published
-    # `released_as='reconciled'` -- the provenance of an invoice check, on a
-    # figure computed from an assumption. Measured on a twelve-request trace
-    # carrying one such note: every figure in `spend`, the finding, and
-    # `total_avoidable_month` all came back `reconciled`, and the assumption
-    # survived only as free text a renderer appended afterwards.
+    # An input the loader had to assume rather than read is not a measurement,
+    # and a figure computed from one must not carry the provenance of an invoice
+    # check. The sharpest case is the *surface*: assume it and the rate table and
+    # the cache multipliers are assumptions too, so the invoice reconciles
+    # against a guess. Measured before this existed: every figure in `spend`,
+    # every finding's, and `total_avoidable_month` all came back
+    # `released_as='reconciled'`, with the assumption surviving only as free
+    # text a renderer appended afterwards.
+    #
+    # Read from `assumed_inputs`, not from `ts.blocking_notes`, and the first
+    # version of this did read the notes. Three reasons it was wrong, the first
+    # measured by Track B:
+    #
+    #   - It over-blocks. `blocking_notes` carries the QUALIFIES_SPEND phrase,
+    #     which the litellm adapter uses to mean "these rows were excluded from
+    #     the totals" -- a trace that then reconciles is *correctly* RECONCILED,
+    #     because what remains does tie to the invoice. "Any blocking note means
+    #     draft" relabels reports that were right.
+    #   - It decides a release label by matching prose, which is the failure
+    #     `trace.py` records as the reason QUALIFIES_SPEND stopped being the
+    #     classifier in the first place.
+    #   - The fact is per-input, not per-report. An assumed surface and an
+    #     assumed effective rate are different assumptions with different
+    #     remedies, and a sentence cannot say which one happened.
+    #
+    # `getattr` with a default because the field belongs to `trace.py`, which is
+    # not this track's to edit; a loader that does not set it is a loader that
+    # assumed nothing, which is the safe reading either way.
     #
     # DRAFT rather than withheld, and the distinction is the point. The invoice
-    # did reconcile; what is assumed is the rate table it reconciled against, so
-    # a match is weaker evidence than it looks rather than no evidence. DRAFT is
-    # exactly that claim -- released, and not for forwarding -- and it carries
-    # the banner both renderers already print *before* any figure, which is
-    # where a caveat has to be to do any work.
+    # did reconcile; what is assumed is what it reconciled *against*, so the
+    # evidence is weaker than it looks rather than absent. DRAFT already means
+    # exactly that -- released, not for forwarding -- and carries a banner both
+    # renderers print before any figure.
     #
-    # Not a third release state. `ASSUMED` would be the precise word, and adding
-    # it means `money.RELEASES`, `simulate.py` and `test_invariants.py`'s
-    # round-trip table, two of which are outside this track. Measured and
+    # Not a third release state. `ASSUMED` would be the precise word and would
+    # mean changing `money.RELEASES`, `simulate.py` and the round-trip table in
+    # `test_invariants.py`, two of which are outside this track. Measured and
     # reported rather than half-built.
     #
-    # Deliberately after the override above: that branch sets DRAFT for its own
-    # reason and inserts its own note, and two DRAFT banners would say the same
-    # thing twice with different reasons.
-    if gate_ok and released_as == money.RECONCILED and ts.blocking_notes:
+    # `gate_ok` is deliberately not touched. If the invoice fails, everything is
+    # withheld and the label is moot; flipping it here would make the two
+    # renderers disagree about a report neither should be publishing.
+    assumed = tuple(getattr(ts, "assumed_inputs", ()) or ())
+    if gate_ok and assumed:
         released_as = money.DRAFT
-        notes.insert(0, "DRAFT — " + ts.blocking_notes[0].rstrip(". ") +
-                     ". The invoice reconciles, but it reconciles against that "
-                     "assumption, so these figures are not invoice-checked in "
-                     "the sense the word usually carries. Not for external use "
-                     "until the assumption is confirmed.")
+        draft_reasons.append(
+            "the " + ", ".join(sorted(assumed)) + " used to price this trace "
+            "was assumed rather than read from the export"
+            + (". An invoice was supplied and reconciles, but it reconciles "
+               "against that assumption, so these figures are not "
+               "invoice-checked in the sense the word usually carries."
+               if recon is not None else "."))
+    if draft_reasons:
+        notes.insert(0, "DRAFT — " + " ".join(draft_reasons)
+                     + " Not for external use.")
 
     # Structural claims carry a second gate. The first asks whether the money
     # ties to an invoice; this one asks whether the segmentation the claim rests
