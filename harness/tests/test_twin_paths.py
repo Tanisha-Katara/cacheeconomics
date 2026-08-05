@@ -1533,8 +1533,21 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         }
 
     def _structural_money(self, a):
-        return [(f.code, f.avoidable_usd_month) for f in a.findings
-                if f.structural and f.avoidable_usd_month is not None]
+        """The MEASURED figure, not the monthly projection.
+
+        The arms price the trace's own requests, so their spend is
+        window-scoped. Comparing it against `avoidable_usd_month` was comparing
+        a measured amount to an extrapolated one, and only worked while the
+        projection floor was global -- once Track A made the floor per-finding,
+        this fixture's one-hour window correctly withheld VOL-1's month while
+        releasing its window figure, and the parity check failed on the
+        mismatch rather than on any permissiveness.
+
+        `avoidable_usd_window` is what the arms are comparable to, and it is
+        what the parity claim was always about.
+        """
+        return [(f.code, f.avoidable_usd_window) for f in a.findings
+                if f.structural and f.avoidable_usd_window is not None]
 
     def _arms(self, b):
         return [(end, p, arm["spend"])
@@ -2613,8 +2626,15 @@ class TestTheBakeOffIsNeverMorePermissiveThanTheReport(unittest.TestCase):
         import textwrap
 
         found = set()
+        # `bake_off` itself is in the list because the assumed-input label cap
+        # lives there rather than in a helper: it decides the release
+        # PROVENANCE of a figure, which is a gate on what may be published even
+        # though it is not a gate on whether anything is. Track B added
+        # `assumed_inputs`, Track E read it in `bake_off`, and this walk
+        # reported it unconsulted at the exact moment it started being
+        # consulted -- the same shape this alarm was written for.
         for fn in (simulate.structural_evidence, simulate._trace_exclusions,
-                   simulate._agent_trace):
+                   simulate._agent_trace, simulate.bake_off):
             tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
             found |= cls._attrs_read_off(tree, "trace")
         return found
