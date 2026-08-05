@@ -31,16 +31,155 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# The same helper `run_diagnostic.py` uses, imported rather than copied. This
+# file derived the counted path itself with
+# `path.replace(".jsonl", "-counted.jsonl")`, which `run_diagnostic.py` was
+# fixed for and this copy was not -- so a sweep directory named `a.jsonl` turned
+# `sweep/a.jsonl/interval-10m.jsonl` into
+# `sweep/a-counted.jsonl/interval-10m-counted.jsonl`, a directory that does not
+# exist. Counting then failed, this fell back to the uncounted capture, and the
+# curve was drawn from byte-share estimates instead. Two copies of one
+# derivation is what produced that, so there is now one.
+sys.path.insert(0, HERE)
+from count_tokens import (DEFAULT_ENDPOINT, PROVENANCE_KEY,      # noqa: E402
+                          counted_path)
+from cacheeconomics.adapters.bodies import _find_body            # noqa: E402
+from cacheeconomics.tokenizer import counts_provenance           # noqa: E402
 
-def counted(path: str) -> str:
+
+def reusable_counts(src: str, out: str, endpoint: str = DEFAULT_ENDPOINT,
+                    target_id: str | None = None,
+                    tokenizer_id: str | None = None,
+                    assume_serves: bool = False):
+    """The capture in hand with `out`'s still-valid counts merged onto it, or
+    `(None, reason)`.
+
+    Two things were wrong with the version that answered "is `out` fresh?".
+
+    It returned `out` itself, so the counted file supplied the *whole* row --
+    usage, timestamps, status, session -- and only the body digest was checked.
+    Now the counted file contributes `segment_tokens` and its provenance and
+    nothing else; every other field comes from the capture by construction, so
+    there is no set of fields left to enumerate and get wrong.
+
+    And it recorded the model without ever comparing it. For the shape where the
+    model sits on the row rather than in the body, changing it left the body
+    digest identical, so a file counted by the previous tokenizer passed. Both
+    models are compared now, resolved from the *current* row, along with a
+    digest of that whole row.
+    """
+    try:
+        with open(src) as f:
+            src_rows = [json.loads(l) for l in f if l.strip()]
+        with open(out) as f:
+            out_rows = [json.loads(l) for l in f if l.strip()]
+    except (OSError, ValueError) as e:
+        return None, f"could not read it ({type(e).__name__})"
+
+    if len(src_rows) != len(out_rows):
+        return None, (f"it has {len(out_rows):,} rows and the capture now has "
+                      f"{len(src_rows):,}")
+
+    merged = []
+    for i, (s, o) in enumerate(zip(src_rows, out_rows)):
+        # The current row, never the stored one.
+        row = json.loads(json.dumps(s))
+        counts = o.get("segment_tokens") if isinstance(o, dict) else None
+        if counts is None:
+            merged.append(row)           # never counted; nothing to reuse
+            continue
+        p = o.get(PROVENANCE_KEY)
+        if not isinstance(p, dict):
+            return None, (f"row {i} carries counts with no record of what "
+                          f"produced them (written before counted exports "
+                          f"recorded it)")
+        body = _find_body(s) if isinstance(s, dict) else None
+        if not body:
+            return None, (f"row {i} carries counts but the capture no longer "
+                          f"has a recognisable body there")
+        # The same rule the prefix cache gets, because a counted export IS a
+        # cache -- of whole rows rather than of prefixes -- and it was the one
+        # of the two reuse paths the rule had not been applied to.
+        # `count_tokens.py` refuses to resume without an asserted identity;
+        # reusing a counted export written without one was the same claim
+        # ("nothing has changed since") made with nothing behind it, and
+        # `tokenizer_id=None` on both sides compared equal and passed.
+        if not tokenizer_id or not p.get("tokenizer_id"):
+            return None, (
+                f"row {i} names no tokenizer deployment "
+                f"(stored {p.get('tokenizer_id')!r}, this run "
+                f"{tokenizer_id!r}), so nothing shows the tokenizer that "
+                f"produced these counts is the one answering now")
+
+        # The package's vouching record -- version and the two digests the
+        # loader checks -- plus the settings that decide whether a *re-run*
+        # would agree. Built from `counts_provenance` rather than restated, so a
+        # field added to the contract is compared here the day it is added.
+        # The package's record -- version, digests, both models, the surface --
+        # plus the two settings only a re-run cares about. Built rather than
+        # restated, so this and the loader compare the same fields.
+        want = counts_provenance(body, s, target_id, endpoint,
+                                 tokenizer_id, assume_serves)
+        for field, expected in want.items():
+            if p.get(field) != expected:
+                return None, (f"row {i} was counted with "
+                              f"{field}={p.get(field)!r}, this run needs "
+                              f"{expected!r}")
+        row["segment_tokens"] = counts
+        row[PROVENANCE_KEY] = p
+        merged.append(row)
+    return merged, None
+
+
+def counted(path: str, endpoint: str = DEFAULT_ENDPOINT,
+            target_id: str | None = None,
+            tokenizer_id: str | None = None,
+            assume_serves: bool = False) -> str:
     """Exact token counts, or the structural findings carry no figures."""
-    out = path.replace(".jsonl", "-counted.jsonl")
+    out = counted_path(path)
     if os.path.exists(out):
-        return out
-    r = subprocess.run([sys.executable, os.path.join(HERE, "count_tokens.py"),
-                        path, "-o", out], capture_output=True, text=True)
+        merged, why = reusable_counts(path, out, endpoint, target_id,
+                                      tokenizer_id, assume_serves)
+        if why is None:
+            # Rewritten from the capture in hand rather than handed back as
+            # found. Every row is the current one; only the counts came from the
+            # old file, and only after their provenance matched this row.
+            with open(out, "w") as f:
+                for row in merged:
+                    f.write(json.dumps(row) + "\n")
+            return out
+        # Refused rather than recounted, and this is the deliberate half of the
+        # fix. Recounting on a mismatch would send this capture's prompt
+        # prefixes to `endpoint` because a file on disk happened to disagree --
+        # new egress, decided by the tool, on a path the operator approved for a
+        # different question. The stale file is also not silently believed. So
+        # the sweep says exactly what it found and analyses the capture
+        # uncounted, which the analyzer reports as estimated.
+        print(f"    refusing to reuse {os.path.basename(out)}: {why}.\n"
+              f"    analysing {os.path.basename(path)} uncounted; its segment "
+              f"sizes are estimated.\n"
+              f"    delete that file and re-run to count it again.",
+              file=sys.stderr)
+        return path
+    cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), path,
+           "-o", out]
+    if endpoint != DEFAULT_ENDPOINT:
+        cmd += ["--endpoint", endpoint]
+    if target_id:
+        cmd += ["--target-id", target_id]
+    if tokenizer_id:
+        cmd += ["--tokenizer-id", tokenizer_id]
+    if assume_serves:
+        cmd += ["--assume-endpoint-serves"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print(f"    counting failed: {r.stderr.strip()[:120]}", file=sys.stderr)
+        # Named, not just reported. This returns the *uncounted* capture, so
+        # every figure derived from this point is estimated while its
+        # neighbours in the same sweep are counted -- and a curve mixing the
+        # two says nothing about the difference between them.
+        print(f"    counting failed for {path}: {r.stderr.strip()[:120]}\n"
+              f"    analysing it uncounted; its segment sizes are estimated",
+              file=sys.stderr)
         return path
     return out
 
@@ -139,6 +278,26 @@ def analyse(path: str, target_id: str | None = None) -> dict:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--dir", required=True)
+    # Reachable at all, which they were not. `counted()` and `analyse()` both
+    # take these and `main` called both with defaults, so a sweep of a Bedrock,
+    # Vertex or gateway capture could not strip the surface's model prefix and
+    # could not send its counting calls anywhere but the default host -- and a
+    # counted file produced correctly with --target-id was then refused as stale
+    # by this path, because this path passed None. Removing --model left those
+    # exports no route through the sweep at all.
+    p.add_argument("--target-id",
+                   help="the provider surface these captures went to. Passed to "
+                        "counting and to analysis, which must agree on it")
+    p.add_argument("--endpoint", default=DEFAULT_ENDPOINT,
+                   help=f"where to send counting calls (default: "
+                        f"{DEFAULT_ENDPOINT})")
+    p.add_argument("--assume-endpoint-serves", action="store_true",
+                   help="count rows whose model id cannot be vouched for "
+                        "locally, asserting that --endpoint serves them")
+    p.add_argument("--tokenizer-id",
+                   help="identifier for the tokenizer deployment behind "
+                        "--endpoint; without it counted captures are not "
+                        "resumed from a cache")
     args = p.parse_args()
 
     files = sorted(f for f in glob.glob(os.path.join(args.dir, "interval-*.jsonl"))
@@ -149,13 +308,19 @@ def main() -> int:
 
     rows = []
     for f in files:
-        label = os.path.basename(f).replace("interval-", "").replace(".jsonl", "")
+        # `splitext`, not `.replace(".jsonl", "")`: the same idiom that made the
+        # counted path wrong, here only cosmetic (it would eat both extensions
+        # of `interval-10m.jsonl.jsonl` and label the point wrongly), but there
+        # is no reason to keep the one shape of this that reads as correct.
+        label = os.path.splitext(os.path.basename(f))[0].replace("interval-", "")
         print(f"  {label} ...", file=sys.stderr)
         c = cadence(f)
         if not c.get("n"):
             print("    no gaps; skipped", file=sys.stderr)
             continue
-        a = analyse(counted(f))
+        a = analyse(counted(f, args.endpoint, args.target_id,
+                            args.tokenizer_id, args.assume_endpoint_serves),
+                    args.target_id)
         rows.append({"label": label, **c, **a})
 
     def schedule_seconds(r):
@@ -188,8 +353,16 @@ def main() -> int:
 
     out = os.path.join(args.dir, "sweep-report.json")
     with open(out, "w") as f:
-        json.dump({"artifact": "interval-sweep-report", "artifact_version": 1,
+        # The surface and the counting host travel with the numbers. Both change
+        # what the points mean -- the surface decides which rate table applies
+        # and how model ids resolve, the endpoint decides which tokenizer sized
+        # the segments -- and an artifact that records neither cannot be told
+        # apart from one run against different settings.
+        json.dump({"artifact": "interval-sweep-report", "artifact_version": 2,
                    "project": "browser-use", "model": "claude-haiku-4-5",
+                   "target_id": args.target_id,
+                   "count_endpoint": args.endpoint,
+                   "tokenizer_id": args.tokenizer_id,
                    "points": rows}, f, indent=2)
     print(f"\n  wrote {out}")
     return 0

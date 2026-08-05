@@ -41,17 +41,13 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-
-def _counted_path(path: str) -> str:
-    """`run.jsonl` -> `run-counted.jsonl`, beside it.
-
-    Split on the basename so a directory named `something.jsonl` is left alone,
-    and give an extensionless input a real extension rather than a name
-    identical to itself.
-    """
-    head, base = os.path.split(path)
-    root, ext = os.path.splitext(base)
-    return os.path.join(head, f"{root}-counted{ext or '.jsonl'}")
+# Imported, not re-implemented. This file had its own `_counted_path` and
+# `sweep_report.py` had its own `counted`, and the fix that landed here never
+# reached the copy one file over -- so a sweep directory named `a.jsonl` still
+# had every capture in it written to a directory that does not exist. One
+# implementation, in the script that owns the counted export.
+sys.path.insert(0, HERE)
+from count_tokens import counted_path                            # noqa: E402
 
 
 def main() -> int:
@@ -70,21 +66,40 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true",
                    help="report what counting would send, and send nothing")
     p.add_argument("--endpoint", help="send counting calls to your own gateway")
-    p.add_argument("--model", default="claude-haiku-4-5")
+    # There is no --model. The tokenizer is whichever model the analyzer will
+    # say the row used, resolved by the analyzer's own function; a flag here
+    # could only disagree with it. `--target-id` is the exception, because it is
+    # an *input* to that resolution -- a surface's id prefix is stripped before
+    # the model is looked up -- so counting and analysis have to be given the
+    # same one. It is declared here and passed on to both rather than left in
+    # the passthrough, where only `analyze` would have seen it.
+    p.add_argument("--target-id",
+                   help="the provider surface this traffic went to. Passed to "
+                        "counting and to analysis, which must agree on it")
+    # Declared here so it never reaches the analyzer. An unrecognised flag falls
+    # into `passthrough`, which is handed to `cacheeconomics analyze` -- so
+    # without this the one-command path could not turn the override on at all,
+    # and the attempt would have sent `--assume-endpoint-serves` to a command
+    # that has no such option.
+    p.add_argument("--assume-endpoint-serves", action="store_true",
+                   help="count rows whose model id cannot be vouched for "
+                        "locally -- dated, retired, or a gateway's own names -- "
+                        "asserting that --endpoint serves them. Passed to "
+                        "counting only; the analyzer has no such option")
+    p.add_argument("--tokenizer-id",
+                   help="identifier for the tokenizer deployment behind "
+                        "--endpoint; without it counting does not resume from a "
+                        "cache, because nothing shows the tokenizer is the same")
     args, passthrough = p.parse_known_args()
+    if args.target_id:
+        passthrough += ["--target-id", args.target_id]
 
-    # A sibling path, derived from the basename only. This was
-    # `args.path.replace(".jsonl", "-counted.jsonl")`, which is wrong in three
-    # ways an operator can hit: an input with no `.jsonl` produced a path equal
-    # to the input, so `count_tokens.py` overwrote the source it was reading;
-    # a directory component containing `.jsonl` was rewritten too, sending the
-    # output somewhere else entirely; and a name containing `.jsonl` twice had
-    # both occurrences replaced.
-    #
+    # A sibling path, derived from the basename only -- see `counted_path`.
     # This is the one command that produces client evidence. Destroying the
-    # capture it was handed is the worst thing in its reach.
-    counted_path = _counted_path(args.path)
-    if os.path.abspath(counted_path) == os.path.abspath(args.path):
+    # capture it was handed is the worst thing in its reach, so the collision is
+    # still checked here even though the helper cannot produce one.
+    out_path = counted_path(args.path)
+    if os.path.abspath(out_path) == os.path.abspath(args.path):
         print(f"  refusing to run: the counted output would be written over "
               f"the input at {args.path}. Rename the input, or pass "
               f"--estimate-only to skip counting.", file=sys.stderr)
@@ -96,8 +111,13 @@ def main() -> int:
               "carry no dollar figures.", file=sys.stderr)
     else:
         cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), args.path,
-               "-o", counted_path,
-               "--model", args.model]
+               "-o", out_path]
+        if args.target_id:
+            cmd += ["--target-id", args.target_id]
+        if args.tokenizer_id:
+            cmd += ["--tokenizer-id", args.tokenizer_id]
+        if args.assume_endpoint_serves:
+            cmd += ["--assume-endpoint-serves"]
         if args.endpoint:
             cmd += ["--endpoint", args.endpoint]
         if args.dry_run:
@@ -114,7 +134,7 @@ def main() -> int:
             print("  counting failed; continuing with estimates. Structural "
                   "figures will be withheld.", file=sys.stderr)
         else:
-            counted = counted_path
+            counted = out_path
 
     env = dict(os.environ, PYTHONPATH=os.path.join(ROOT, "harness"))
     return subprocess.run(
