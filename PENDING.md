@@ -330,34 +330,35 @@ per-track reviews structurally cannot.
 
 ---
 
-## 12. `registry._load` accepts NaN and Infinity from disk
+## 12. ~~`registry._load` accepts NaN and Infinity from disk~~ — CLOSED, and my
+## assessment of it was wrong
 
-Python's JSON parser accepts the non-standard `NaN`, `Infinity` and `-Infinity`
-literals by default. **Verified through `registry._load` itself**, not merely
-`json.loads`: a registry file containing them returns
-`{'read': nan, 'write_5m': inf, 'write_1h': -1}`.
+**What I recorded was false.** This entry said *"Every consumer is now guarded…
+so this is defence in depth rather than a live hole."* It was a live hole, and
+the external review found it. Measured at the merged tip:
 
-**Downstream, measured before the consumers were guarded:**
+    registry._load uses plain json.load  -> True
+    base_rate validates finiteness       -> False
+    min_cacheable_tokens validates       -> False
+    base_rate('claude-opus-5', ...)      -> nan
 
-    NaN       ->  usd = nan   rendered "$nan"; --format json emits a bare NaN,
-                              which is INVALID JSON and breaks any consumer
-    Infinity  ->  usd = inf
-    -1.0      ->  usd = -5.00  a negative bill
-    0.0       ->  usd = 0.00   writes priced free
+Track B guarded the **multiplier** consumers. `base_rate` (the list-rate path)
+and `min_cacheable_tokens` were never guarded, and I wrote "every consumer"
+having checked the ones Track B named. That is the third time this round that
+"every X is guarded" meant "every X I looked at".
 
-**Every consumer is now guarded** — `cost.is_multiplier` requires finite and
-`> 0`, and `tiers._surface` refuses a present-but-invalid multiplier — so this
-is defence in depth rather than a live hole. It is still the stronger fix,
-because it stops the value entering the process rather than catching it at each
-use, and "each use" is a set that has already been wrong twice this round.
+Closed at `4f71713` in two places, because one was not enough:
 
-**The change:** `json.load(f, parse_constant=...)` raising on the three
-constants. Verified that `parse_constant` closes it.
+- `_load` refuses the JSON literals, which is the review's fix and the best
+  error message — it names the file at the door.
+- `_finite_number` guards `base_rate` and `min_cacheable_tokens`, because the
+  literal route is not the only one. **`1e999` is valid JSON**, `parse_constant`
+  never sees it, and it overflows to `inf`. Reproduced against the review's own
+  fix: `base_rate -> inf`, `price().usd -> nan`, rendered `$nan`.
 
-**Why unowned:** `registry.py` was assigned to Track C for one additive change
-(`allow_contested`), and this is a different concern in the same file. Track B
-found it, guarded every consumer it owns, and correctly declined to edit a file
-outside its remit.
+Four tests, all planting the overflow token rather than the literal — a test
+that plants `NaN` passes on the parser alone and proves nothing about the
+readers.
 
 ---
 
@@ -414,3 +415,51 @@ external adversarial review, and the merged result has had none at all.**
 Run the final merged review specified in item 11. Treat this entry as open until
 it comes back and its findings are closed. `pre-merge-baseline` tags the last
 externally-sane state if a clean revert is ever wanted.
+
+---
+
+## 14. The post-merge review, audited
+
+The external review `PENDING.md` item 11 required was run against the merged
+tip `1f6699d`. Six findings, all fixed at `c5c5b5c`. I then audited both the
+findings and the fixes, because a fix is a claim like any other.
+
+**All six findings reproduce at the reviewed tip.** Each was checked by running
+the pre-fix code, not by reading it:
+
+| finding | reproduction |
+|---|---|
+| NaN/Infinity via the registry | `base_rate -> nan` |
+| retired models vouched serveable | `claude-sonnet-4`, `claude-haiku-3-5`, `claude-opus-4-1` all `True` |
+| tier-b spends egress for untrusted counts | `if args.tokenizer_id:` — passed only when supplied |
+| sweep reports "figures released" regardless | `return {"unreconciled": True, ...}` hardcoded |
+| stale "no invoice was supplied" | said exactly that with `--allow-unreconciled` already passed |
+| contested rows read as missing data | `"no minimum recorded for claude-opus-5 on openai/bedrock"` |
+
+**All six fixes bite**, verified by reverting each and watching a test fail —
+`cp` backups and surgical edits, never regex surgery on Python source. Counts:
+F1 7 tests, F4 1, F5 1, F6 2, and the two high ones covered below.
+
+**Three gaps in the fixes, now closed:**
+
+- the NaN fix closed the literal route and not the overflow route (item 12)
+- the two consumers the finding named were still unguarded (item 12)
+- serveability failed open on omission — 12 of 14 models relied on a default
+  that vouches, and adding a rate silently vouched a model for egress. Closed at
+  `275a92e` with a completeness guard; every priced model now carries an
+  explicit decision and adding one fails a test until somebody makes it.
+
+**Two defects in my own new tests**, both caught by running rather than reading,
+and both worth recording because they are the kind that look fine:
+
+- a helper cleared `_CACHE`/`_cache`, names this module does not have, while the
+  real memoisation is `_PROVIDERS`/`_PRICING`. The tests passed **in isolation**
+  and failed in the suite. Green alone and red together is worse than plainly
+  red: you run it by itself to check your work and it tells you the fix is fine.
+- a poison matched a whole serialised row, so adding a field to that row stopped
+  the poison applying and the test failed for having nothing to detect rather
+  than for detecting nothing.
+
+**Still unreviewed:** this audit is mine. Codex resets 2026-08-11, and the final
+merged review in item 11 remains outstanding — it is the one check that looks at
+the seams between all of this, and nothing here replaces it.
