@@ -1466,3 +1466,110 @@ class TestTheEstimateBandIsTheMeasuredErrorNotATidyTenPercent(unittest.TestCase)
         floor = minimum * (1 + p.minimum_margin)
         self.assertIs(self._est(int(floor) + 1).status, Status.PASS)
         self.assertIs(self._est(int(floor) - 1).status, Status.ABSTAIN)
+
+
+class TestARegistryNumberCannotBeNonFinite(unittest.TestCase):
+    """The finiteness rule, enforced where the numbers are READ.
+
+    `_load` refuses the JSON literals `NaN`, `Infinity` and `-Infinity`. That
+    closes the route a hand-edit takes and leaves the arithmetic one open:
+    `1e999` is valid JSON, `parse_constant` never sees it, and it overflows to
+    `inf` on the way in.
+
+    Measured after the literal route was closed, which is why these tests exist
+    rather than trusting the parser: a `1e999` rate gave `base_rate -> inf`,
+    then `price().usd -> nan`, rendered `$nan` in a client-facing report.
+
+    Every case below uses the OVERFLOW token, never the literal -- a test that
+    plants `NaN` passes on the parser alone and proves nothing about the
+    readers.
+    """
+
+    def _with(self, path_name, mutate):
+        """A registry directory whose one named file has been mutated."""
+        import shutil
+        import tempfile
+        d = tempfile.mkdtemp()
+        shutil.copytree(registry.REGISTRY_DIR, os.path.join(d, "data"))
+        p = os.path.join(d, "data", path_name)
+        text = mutate(open(p).read())
+        with open(p, "w") as f:
+            f.write(text)
+        return os.path.join(d, "data")
+
+    def _reload(self, data_dir):
+        """Point the registry at `data_dir` and drop what it already loaded.
+
+        The globals are the whole point. `providers()` and `pricing()` memoise
+        into module-level `_PROVIDERS` / `_PRICING`, so moving `REGISTRY_DIR`
+        alone changes nothing once anything has read the registry.
+
+        The first version of this helper cleared `_CACHE`/`_cache`, names this
+        module does not have. It passed when the class ran alone -- nothing had
+        populated the globals yet -- and failed inside the full suite, where
+        something had. A test that is green in isolation and red in the suite
+        is worse than one that is simply red: run it by itself to check your
+        work and it tells you the fix is fine.
+        """
+        old = (registry.REGISTRY_DIR, registry._PROVIDERS, registry._PRICING)
+        registry.REGISTRY_DIR = data_dir
+        registry._PROVIDERS = None
+        registry._PRICING = None
+        return old
+
+    def _restore(self, saved):
+        registry.REGISTRY_DIR, registry._PROVIDERS, registry._PRICING = saved
+
+    def test_an_overflowing_rate_is_refused_rather_than_priced(self):
+        import json
+        d = json.loads(open(os.path.join(registry.REGISTRY_DIR,
+                                         "pricing.json")).read())
+        d["models"]["claude-opus-5"]["rates"] = [["1970-01-01", 5.0]]
+        text = json.dumps(d).replace(
+            '"claude-opus-5": {"rates": [["1970-01-01", 5.0]]}',
+            '"claude-opus-5": {"rates": [["1970-01-01", 1e999]]}', 1)
+        data = self._with("pricing.json", lambda _: text)
+        old = self._reload(data)
+        try:
+            with self.assertRaises(registry.RegistryError) as caught:
+                registry.base_rate("claude-opus-5", "2026-08-01",
+                                   "anthropic/direct")
+            self.assertIn("finite", str(caught.exception))
+        finally:
+            self._restore(old)
+
+    def test_an_overflowing_minimum_is_refused(self):
+        import json
+        d = json.loads(open(os.path.join(registry.REGISTRY_DIR,
+                                         "providers.json")).read())
+        for row in d["targets"]:
+            if row.get("id") == "anthropic/direct":
+                row.setdefault("min_cacheable_tokens", {})["claude-opus-5"] = 1.0
+        text = json.dumps(d).replace('"claude-opus-5": 1.0',
+                                     '"claude-opus-5": 1e999', 1)
+        data = self._with("providers.json", lambda _: text)
+        old = self._reload(data)
+        try:
+            with self.assertRaises(registry.RegistryError) as caught:
+                registry.min_cacheable_tokens("anthropic/direct",
+                                              "claude-opus-5")
+            self.assertIn("finite", str(caught.exception))
+        finally:
+            self._restore(old)
+
+    def test_zero_is_a_legitimate_number_and_is_not_refused(self):
+        """Guard against over-blocking, which is the other way to be wrong.
+
+        `cost.is_multiplier` requires `> 0` and is right to: a zero multiplier
+        prices a token class free. A zero *rate* is a free tier and a zero
+        *minimum* means everything is cacheable, so the positivity rule stays
+        where it belongs rather than being copied here for symmetry.
+        """
+        self.assertEqual(0, registry._finite_number(0, "a rate"))
+        self.assertEqual(0.0, registry._finite_number(0.0, "a minimum"))
+
+    def test_bool_and_negative_are_refused(self):
+        for bad in (True, False, -1, -0.5):
+            with self.subTest(value=bad):
+                with self.assertRaises(registry.RegistryError):
+                    registry._finite_number(bad, "a rate")

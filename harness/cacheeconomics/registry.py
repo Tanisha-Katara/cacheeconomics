@@ -166,9 +166,11 @@ def min_cacheable_tokens(target_id, model, allow_contested=False):
         src = target(nxt, allow_contested)
     mins = src.get("min_cacheable_tokens", {})
     if model in mins:
-        return mins[model]
+        return _finite_number(mins[model],
+                              f"the cache minimum for {model!r} on {target_id}")
     if "_default" in mins:
-        return mins["_default"]
+        return _finite_number(mins["_default"],
+                              f"the default cache minimum on {target_id}")
     raise RegistryError(
         f"no minimum recorded for {model!r} on {target_id}. The registry does "
         f"not guess: minimums are non-monotonic across model generations "
@@ -344,6 +346,47 @@ def _as_date(value, what="date"):
             f"picked the wrong rate tier without failing.") from None
 
 
+def _finite_number(value, what):
+    """A registry number, or a refusal naming what was wrong with it.
+
+    `_load` refuses the JSON literals `NaN`, `Infinity` and `-Infinity`, which
+    closes the route somebody hand-editing a row would take. It does not close
+    the arithmetic one: `1e999` is **valid JSON**, `parse_constant` never sees
+    it, and it overflows to `inf` on the way in. Measured after the literal
+    route was closed -- a `1e999` rate produced `base_rate -> inf`, then
+    `price().usd -> nan`, rendered as `$nan`.
+
+    So the rule "registry numbers are finite" is enforced where the numbers are
+    READ, not only where the file is parsed. The door and the rooms, because a
+    door only stops what walks through it.
+
+    Deliberately not `cost.is_multiplier`, which additionally requires `> 0`:
+    that is right for a multiplier and wrong here, since `0` is a legitimate
+    rate for a free tier and a legitimate cache minimum. Same three exclusions
+    -- bool, non-finite, negative -- and the positivity rule stays where it
+    belongs. `bool` is excluded for the reason `is_multiplier` records: it
+    subclasses `int` and slips past every numeric check.
+    """
+    import math
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RegistryError(
+            f"{what} is {value!r}, which is not a number. Registry numbers are "
+            f"multiplied into published dollar figures, and a non-number here "
+            f"becomes a wrong figure rather than an error.")
+    if not math.isfinite(value):
+        raise RegistryError(
+            f"{what} is {value!r}. Registry numbers must be finite: a "
+            f"non-finite one propagates through pricing as `nan` and renders "
+            f"as `$nan` in "
+            f"a client-facing report. Note `1e999` is valid JSON and overflows "
+            f"to infinity, so this is not caught by refusing the NaN literal.")
+    if value < 0:
+        raise RegistryError(
+            f"{what} is {value!r}. A negative registry number produces a "
+            f"negative bill, which is never the honest reading of a trace.")
+    return value
+
+
 def _base_rate_unscoped(model, on_date):
     """Base input USD/Mtok effective on `on_date` (ISO yyyy-mm-dd or date)."""
     when = _as_date(on_date, "on_date")
@@ -354,7 +397,7 @@ def _base_rate_unscoped(model, on_date):
                   if _as_date(start, "rate effective date") <= when]
     if not applicable:
         raise RegistryError(f"no rate for {model!r} effective on {when}")
-    return applicable[-1]
+    return _finite_number(applicable[-1], f"the rate for {model!r} on {when}")
 
 
 # The surface an ingest reports when a row states no provider at all. Registered
