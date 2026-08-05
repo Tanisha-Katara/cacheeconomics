@@ -1524,10 +1524,14 @@ class TestARegistryNumberCannotBeNonFinite(unittest.TestCase):
         import json
         d = json.loads(open(os.path.join(registry.REGISTRY_DIR,
                                          "pricing.json")).read())
-        d["models"]["claude-opus-5"]["rates"] = [["1970-01-01", 5.0]]
-        text = json.dumps(d).replace(
-            '"claude-opus-5": {"rates": [["1970-01-01", 5.0]]}',
-            '"claude-opus-5": {"rates": [["1970-01-01", 1e999]]}', 1)
+        # A unique sentinel, then a plain substitution on the serialised text.
+        # The first version matched the whole row -- `{"rates": [[...]]}` --
+        # which pinned the exact shape of a row in the data file: adding
+        # `first_party_served` to it silently stopped the poison applying, so
+        # the test failed for having nothing to detect rather than for
+        # detecting nothing. Match the value, not its surroundings.
+        d["models"]["claude-opus-5"]["rates"] = [["1970-01-01", 123456.789]]
+        text = json.dumps(d).replace("123456.789", "1e999", 1)
         data = self._with("pricing.json", lambda _: text)
         old = self._reload(data)
         try:
@@ -1544,9 +1548,8 @@ class TestARegistryNumberCannotBeNonFinite(unittest.TestCase):
                                          "providers.json")).read())
         for row in d["targets"]:
             if row.get("id") == "anthropic/direct":
-                row.setdefault("min_cacheable_tokens", {})["claude-opus-5"] = 1.0
-        text = json.dumps(d).replace('"claude-opus-5": 1.0',
-                                     '"claude-opus-5": 1e999', 1)
+                row.setdefault("min_cacheable_tokens", {})["claude-opus-5"] = 123456.789
+        text = json.dumps(d).replace("123456.789", "1e999", 1)
         data = self._with("providers.json", lambda _: text)
         old = self._reload(data)
         try:
@@ -1573,3 +1576,80 @@ class TestARegistryNumberCannotBeNonFinite(unittest.TestCase):
             with self.subTest(value=bad):
                 with self.assertRaises(registry.RegistryError):
                     registry._finite_number(bad, "a rate")
+
+
+class TestEveryPricedModelIsClassifiedAsServedOrNot(unittest.TestCase):
+    """`first_party_served` decides whether prompt bodies may be sent to the
+    first-party count endpoint without an operator assertion. Its default is
+    `True`, so a model that carries no classification is vouched by omission.
+
+    That default is the right one -- a newly launched model is served far more
+    often than not, and refusing by default would silently degrade counting to
+    estimation on every launch, with no test firing and the operator told
+    nothing. But it is only safe if omission cannot happen QUIETLY.
+
+    Measured before this class existed: 12 of the 14 priced models relied on
+    the default, and a planted `claude-retired-tomorrow` was vouched as
+    serveable. The only test that noticed was `test_bundle`, whose remedy --
+    rebuild the bundle -- makes it pass with the model still unclassified. That
+    is an incidental staleness check standing in for a judgement.
+
+    So the rule is the one Track C established for per-model lifetime
+    narrowing, in the class above: naming a model in the registry is a
+    judgement, and it has to be met by a judgement here. Adding a rate cannot
+    silently vouch a model for egress; it fails this test until somebody
+    decides.
+
+    The list is the DECISION, not a mirror of the data. Deriving it from
+    `pricing.json` would make both sides move together and assert nothing --
+    the failure Track C hit when both sides of its equality drew from the same
+    derived universe.
+    """
+
+    # Every priced model, and whether the first-party count endpoint serves it.
+    # Source: the `models_added` provenance notes in pricing.json, which quote
+    # Anthropic's own table. "retired" there means retired on the first-party
+    # API specifically -- both rows remain available on Bedrock and Vertex, and
+    # are priced here because a trace is history: the workload already ran.
+    #
+    # Deprecated is NOT retired. Opus 4.1 is marked deprecated in the same
+    # quote and is still served, so it stays True.
+    SERVED = {
+        "claude-opus-4-1": True,      # deprecated, still served
+        "claude-sonnet-4": False,     # "retired, except on Bedrock and Google Cloud"
+        "claude-haiku-3-5": False,    # "retired, except on Bedrock and Google Cloud"
+    }
+
+    def test_every_priced_model_carries_a_decision(self):
+        """The forcing function. A model added to the rate card fails here.
+
+        The key must be PRESENT, not merely truthy. `.get(...)` with a default
+        would read an absent key as a decision, which is the omission this
+        class exists to make impossible.
+        """
+        models = registry.pricing()["models"]
+        unclassified = sorted(m for m, row in models.items()
+                              if "first_party_served" not in row)
+        self.assertEqual(
+            [], unclassified,
+            f"these models are priced but nobody has said whether the "
+            f"first-party count endpoint serves them: {unclassified}. Until "
+            f"someone decides, `locally_vouched_serveable` vouches them by "
+            f"omission and prompt bodies go out for a model that may 400. Add "
+            f"`first_party_served` to the row, or an entry to SERVED here.")
+
+    def test_the_decisions_match_what_the_gate_actually_does(self):
+        """The table is only worth having if it describes the shipped gate."""
+        from cacheeconomics import tokenizer
+        endpoint = tokenizer.FIRST_PARTY_COUNT_ENDPOINT
+        wrong = {m: tokenizer.locally_vouched_serveable(m, endpoint)
+                 for m, expected in self.SERVED.items()
+                 if tokenizer.locally_vouched_serveable(m, endpoint) != expected}
+        self.assertEqual({}, wrong,
+                         f"the gate disagrees with the recorded decision: {wrong}")
+
+    def test_a_retired_model_is_not_vouched(self):
+        """Guard the guard: if nothing were refused this class would be vacuous."""
+        refused = [m for m, served in self.SERVED.items() if not served]
+        self.assertTrue(refused, "no model is recorded as unserved, so the "
+                                 "checks above assert nothing")
