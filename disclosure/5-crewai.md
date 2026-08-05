@@ -6,6 +6,7 @@
 **Reproduction:** `python3 disclosure/verify_crewai_tokens.py` — no key, no
 network, no crewAI install
 **Status:** filed 2026-08-03 as https://github.com/crewAIInc/crewAI/issues/6788
+· **contested 2026-08-04** — see "The response" below
 
 ---
 
@@ -160,3 +161,38 @@ https://github.com/crewAIInc/crewAI/issues/6788#issuecomment-5168933668.
 three LiteLLM calls, so it demonstrates reads rather than both cache classes.
 The write case is in `litellm-marker-survival.json`, which the issue did not
 link. The claim holds; the citation did not support it.
+
+---
+
+## The response, 2026-08-04
+
+A crewAI contributor (`Vidit-Ostwal`, CONTRIBUTOR) replied and **did not accept
+the proposed change**, cc'ing a maintainer for a decision:
+
+> I believe the break up […] would be exact if anyone wants to calculate the
+> cost. On the total token counted as (prompt tokens + output tokens), I feel it
+> would be better to keep it like this. What we can do is add a singular
+> documentation change, which will help if anyone wants to double check.
+
+**Their argument, stated fairly:** the result dict already exposes
+`cached_prompt_tokens` and `cache_creation_tokens` as separate fields, so anyone
+computing cost has exact numbers without changing `total_tokens`. Documenting
+the semantics is preferable to redefining a field other code may depend on.
+
+**That is a reasonable position and it is not a refutation of the measurement.**
+The arithmetic in `verify_crewai_tokens.py` is unaffected: `total_tokens` still
+omits every cached token, and on the evidence in
+`tier-b/evidence/prompt-tokens-semantics.json` that is ~3% of what a fully
+cached request actually paid for. What is contested is whether that is a *bug*
+or a documented convention.
+
+**What the response does not address**, and what this disclosure rests on more
+than on the arithmetic: the **LiteLLM route for the same model reports the
+totals differently**, so two paths through the same framework disagree about
+identical traffic. A documentation change explains one route's convention; it
+does not make the two agree, and a caller who switches routes still sees the
+number move without the workload changing.
+
+**No claim of acceptance is made anywhere in this repository, and none should
+be.** This entry exists because a reader who found the issue link would
+otherwise assume it stands unanswered.
