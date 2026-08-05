@@ -42,7 +42,7 @@ def warm(plugin, n=40, maker=body, gap=90, model="claude-opus-5", **kw):
     last = None
     for i in range(n):
         last = plugin.on_request(maker(i), model=model,
-                                 at=T0 + timedelta(seconds=gap * i), **kw)
+                                 at=T0 + timedelta(seconds=gap * i), **kw, target_id="anthropic/direct", apply=True)
     return last
 
 
@@ -50,13 +50,13 @@ class TestItWaitsForEvidence(unittest.TestCase):
 
     def test_a_cold_plugin_changes_nothing(self):
         p = CachePlugin(key=KEY, warmup=32)
-        out, d = p.on_request(body(0), model="claude-opus-5", at=T0)
+        out, d = p.on_request(body(0), model="claude-opus-5", at=T0, target_id="anthropic/direct", apply=True)
         self.assertFalse(d.applied)
         self.assertEqual(out, body(0))
 
     def test_it_says_how_far_through_warmup_it_is(self):
         p = CachePlugin(key=KEY, warmup=32)
-        _, d = p.on_request(body(0), model="claude-opus-5", at=T0)
+        _, d = p.on_request(body(0), model="claude-opus-5", at=T0, target_id="anthropic/direct", apply=True)
         self.assertIn("1/32", d.reason)
 
     def test_it_learns_from_requests_it_declined_to_touch(self):
@@ -70,7 +70,7 @@ class TestItWaitsForEvidence(unittest.TestCase):
         to the next one, because there is no next one to survive to."""
         p = CachePlugin(key=KEY, warmup=4)
         for i in range(20):
-            out, d = p.on_request(body(i), model="claude-opus-5", at=T0)
+            out, d = p.on_request(body(i), model="claude-opus-5", at=T0, target_id="anthropic/direct", apply=True)
         self.assertFalse(d.applied)
 
 
@@ -84,7 +84,7 @@ class TestItStandsDownWhenSomebodyElseHasDecided(unittest.TestCase):
             b = body(i)
             b["system"][0]["cache_control"] = {"type": "ephemeral"}
             out, d = p.on_request(b, model="claude-opus-5",
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertFalse(d.applied)
         self.assertIn("already placed cache markers", d.reason)
 
@@ -94,7 +94,7 @@ class TestItStandsDownWhenSomebodyElseHasDecided(unittest.TestCase):
             b = body(i)
             b["system"][0]["cache_control"] = {"type": "ephemeral"}
             out, d = p.on_request(b, model="claude-opus-5",
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertTrue(d.applied)
 
 
@@ -152,7 +152,7 @@ class TestItPlacesMarkersOnTheWire(unittest.TestCase):
         original = body(99)
         snapshot = repr(original)
         out, d = p.on_request(original, model="claude-opus-5",
-                              at=T0 + timedelta(seconds=9000))
+                              at=T0 + timedelta(seconds=9000), target_id="anthropic/direct", apply=True)
         self.assertTrue(d.applied)
         self.assertEqual(repr(original), snapshot)
         self.assertIsNot(out, original)
@@ -332,7 +332,7 @@ class TestItModelsTheWholePromptItMutates(unittest.TestCase):
             body = self._volatile_tools(i)
             _, last = p.on_request(body, model="claude-opus-5",
                                    markable=markable_positions(body),
-                                   at=T0 + timedelta(seconds=90 * i))
+                                   at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         scope = (None, "anthropic/direct", "claude-opus-5")
         self.assertEqual(p.monitor.change_rates(scope)[0], 1.0,
                          "the tool definition changes every request")
@@ -344,7 +344,7 @@ class TestItModelsTheWholePromptItMutates(unittest.TestCase):
             body = self._volatile_tools(i)
             _, last = p.on_request(body, model="claude-opus-5",
                                    markable=markable_positions(body),
-                                   at=T0 + timedelta(seconds=90 * i))
+                                   at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertFalse(last.applied)
 
     def test_an_unmarkable_position_abstains_and_says_it_is_still_cached(self):
@@ -359,7 +359,7 @@ class TestItModelsTheWholePromptItMutates(unittest.TestCase):
             body = stable(i)
             _, last = p.on_request(body, model="claude-opus-5",
                                    markable=markable_positions(body),
-                                   at=T0 + timedelta(seconds=90 * i))
+                                   at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         for pos in last.placements:
             self.assertNotEqual(pos, 0, "position 0 is the tool definition")
         if any("cannot carry a marker" in n for n in last.notes):
@@ -373,7 +373,7 @@ class TestItModelsTheWholePromptItMutates(unittest.TestCase):
             last = p.on_request(
                 {"tools": [{"name": "read", "description": "x" * 30000}],
                  "messages": [{"role": "user", "content": f"turn {i}"}]},
-                model="claude-opus-5", at=T0 + timedelta(seconds=90 * i))[1]
+                model="claude-opus-5", at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)[1]
         self.assertTrue(last.applied)
         self.assertIn(0, last.placements)
 
@@ -395,7 +395,7 @@ class TestASectionThatComesAndGoes(unittest.TestCase):
         last = None
         for i in range(40):
             _, last = p.on_request(self.optional(i), model="claude-opus-5",
-                                   session="s", at=T0 + timedelta(seconds=gap * i))
+                                   session="s", at=T0 + timedelta(seconds=gap * i), target_id="anthropic/direct", apply=True)
         return p, last
 
     def test_no_marker_lands_on_the_block_that_vanishes(self):
@@ -599,34 +599,34 @@ class TestEvidenceIsAboutThisPromptNotThisPosition(unittest.TestCase):
         p = CachePlugin(key=KEY, warmup=8)
         for i in range(20):
             p.on_request(self.trained(i), model="claude-opus-5", session="s",
-                         at=T0 + timedelta(seconds=90 * i))
+                         at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         return p
 
     def test_a_block_never_seen_before_is_not_marked(self):
         p = self._warm()
         _, d = p.on_request(self.inserted(99), model="claude-opus-5", session="s",
-                            at=T0 + timedelta(seconds=1800))
+                            at=T0 + timedelta(seconds=1800), target_id="anthropic/direct", apply=True)
         self.assertNotIn(1, d.placements)
 
     def test_no_marker_sits_below_it_either(self):
         """A marker deeper than the new block caches a prefix containing it."""
         p = self._warm()
         _, d = p.on_request(self.inserted(99), model="claude-opus-5", session="s",
-                            at=T0 + timedelta(seconds=1800))
+                            at=T0 + timedelta(seconds=1800), target_id="anthropic/direct", apply=True)
         self.assertTrue(all(pos < 1 for pos in d.placements),
                         f"placed at {sorted(d.placements)} with unseen content at 1")
 
     def test_the_stable_prefix_above_it_is_still_cached(self):
         p = self._warm()
         _, d = p.on_request(self.inserted(99), model="claude-opus-5", session="s",
-                            at=T0 + timedelta(seconds=1800))
+                            at=T0 + timedelta(seconds=1800), target_id="anthropic/direct", apply=True)
         self.assertTrue(d.applied)
         self.assertIn(0, d.placements)
 
     def test_it_says_which_positions_it_could_not_vouch_for(self):
         p = self._warm()
         _, d = p.on_request(self.inserted(99), model="claude-opus-5", session="s",
-                            at=T0 + timedelta(seconds=1800))
+                            at=T0 + timedelta(seconds=1800), target_id="anthropic/direct", apply=True)
         self.assertTrue(any("has not seen before" in n for n in d.notes))
 
     def test_the_familiar_shape_is_unaffected(self):
@@ -635,7 +635,7 @@ class TestEvidenceIsAboutThisPromptNotThisPosition(unittest.TestCase):
         stable boundary rather than stopping short of it."""
         p = self._warm()
         _, d = p.on_request(self.trained(100), model="claude-opus-5", session="s",
-                            at=T0 + timedelta(seconds=1800))
+                            at=T0 + timedelta(seconds=1800), target_id="anthropic/direct", apply=True)
         self.assertTrue(d.applied)
         self.assertIn(1, d.placements)
 
@@ -645,7 +645,7 @@ class TestEvidenceIsAboutThisPromptNotThisPosition(unittest.TestCase):
         last = None
         for i in range(20):
             _, last = p.on_request(self.inserted(0), model="claude-opus-5", session="s",
-                                   at=T0 + timedelta(seconds=1800 + 90 * i))
+                                   at=T0 + timedelta(seconds=1800 + 90 * i), target_id="anthropic/direct", apply=True)
         self.assertIn(1, last.placements)
 
     def test_the_monitor_answers_the_question_directly(self):
@@ -741,7 +741,7 @@ class TestOverrideReplacesRatherThanCombines(unittest.TestCase):
         out = d = None
         for i in range(20):
             out, d = p.on_request(self._full_budget(i), model="claude-opus-5",
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         return out, d
 
     def _markers(self, body):
@@ -793,7 +793,7 @@ class TestWhatIsRecordedIsWhatWasSent(unittest.TestCase):
         out = d = None
         for i in range(20):
             out, d = p.on_request(self._override_body(i), model="claude-opus-5",
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertTrue(d.applied)
         self.assertEqual(self._wire(out),
                          {s.index for s in d.segments if s.cache_marked})
@@ -803,7 +803,7 @@ class TestWhatIsRecordedIsWhatWasSent(unittest.TestCase):
         out = d = None
         for i in range(20):
             out, d = p.on_request(self._override_body(i), model="claude-opus-5",
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertFalse(d.applied)
         self.assertEqual(self._wire(out),
                          {s.index for s in d.segments if s.cache_marked})
@@ -813,7 +813,7 @@ class TestWhatIsRecordedIsWhatWasSent(unittest.TestCase):
         out = d = None
         for i in range(20):
             out, d = p.on_request(body(i), model="claude-opus-5", apply=False,
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct")
         self.assertFalse(d.applied)
         self.assertEqual(d.placements, {})
         self.assertEqual(self._wire(out), set())
@@ -825,7 +825,7 @@ class TestWhatIsRecordedIsWhatWasSent(unittest.TestCase):
         d = None
         for i in range(20):
             _, d = p.on_request(body(i), model="claude-opus-5", apply=False,
-                                at=T0 + timedelta(seconds=90 * i))
+                                at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct")
         self.assertTrue(d.proposed)
 
     def test_effectiveness_never_credits_an_unsent_marker(self):
@@ -839,7 +839,7 @@ class TestWhatIsRecordedIsWhatWasSent(unittest.TestCase):
         d = None
         for i in range(20):
             _, d = p.on_request(body(i), model="claude-opus-5", apply=False,
-                                at=T0 + timedelta(seconds=90 * i))
+                                at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct")
         p.on_response(d, _Resp(), model="claude-opus-5")
         self.assertIsNone(p.effectiveness(d.scope))
 
@@ -865,7 +865,7 @@ class TestNotesDescribeWhatHappened(unittest.TestCase):
         out = d = None
         for i in range(20):
             out, d = p.on_request(maker(i), model="claude-opus-5", apply=apply,
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct")
         return out, d
 
     def test_a_dry_run_says_it_would_replace_not_that_it_did(self):
@@ -907,7 +907,7 @@ class TestADryRunThatWouldHaveOverridden(unittest.TestCase):
         out = d = None
         for i in range(20):
             out, d = p.on_request(self._body(i), model="claude-opus-5", apply=False,
-                                  at=T0 + timedelta(seconds=90 * i))
+                                  at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct")
         return p, out, d
 
     def test_the_callers_markers_are_still_on_the_wire(self):
@@ -1017,7 +1017,7 @@ class TestUsageReachesTheMonitor(unittest.TestCase):
         prefix = 60_000
         for i in range(turns):
             _, d = p.on_request(body(i), model="claude-opus-5", session="s1",
-                                at=T0 + timedelta(seconds=60 * i))
+                                at=T0 + timedelta(seconds=60 * i), target_id="anthropic/direct", apply=True)
             cold = i == 0 or (rebuild_every and i % rebuild_every == 0)
             p.on_response(d, self._Resp(0 if cold else prefix,
                                         prefix if cold else 2_000),
@@ -1037,11 +1037,11 @@ class TestUsageReachesTheMonitor(unittest.TestCase):
         alerts = []
         for i in range(6):
             _, d = p.on_request(body(0), model="claude-opus-5", session="s1",
-                                at=T0 + timedelta(seconds=i * 90))
+                                at=T0 + timedelta(seconds=i * 90), target_id="anthropic/direct", apply=True)
             p.on_response(d, self._Resp(0, 60_000), model="claude-opus-5")
         for i in range(3):
             _, d = p.on_request(body(0), model="claude-opus-5", session="s1",
-                                at=T0 + timedelta(seconds=600 + i))
+                                at=T0 + timedelta(seconds=600 + i), target_id="anthropic/direct", apply=True)
             alerts += p.on_response(d, self._Resp(0, 60_000), model="claude-opus-5")
         self.assertIn("RT-FANOUT", {a.code for a in alerts})
 
@@ -1055,7 +1055,7 @@ class TestUsageReachesTheMonitor(unittest.TestCase):
         last = None
         for i in range(30):
             _, last = p.on_request(body(i), model="claude-opus-5",
-                                   at=T0 + timedelta(seconds=60 * i))
+                                   at=T0 + timedelta(seconds=60 * i), target_id="anthropic/direct", apply=True)
         self.assertTrue(last.applied)
         self.assertNotIn("RT-REBUILD", {a.code for a in p.alerts})
 
@@ -1068,6 +1068,7 @@ class TestUsageReachesTheMonitor(unittest.TestCase):
         def make(i):
             return R(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
                      model="claude-opus-5", usage=dict(u), session="s",
+                     target_id="anthropic/direct",
                      segments=[sg(0, "system", 9000, "sys", marked=True, ttl="5m")])
         whole, split = Monitor(), Monitor()
         for i in range(40):
@@ -1107,7 +1108,7 @@ class TestPluginStateIsBounded(unittest.TestCase):
             for j in range(12):
                 p.on_request(self.blocked(j), model="claude-opus-5",
                              tenant=f"ten{tenant}", session=f"s{tenant}",
-                             at=T0 + timedelta(seconds=60 * t))
+                             at=T0 + timedelta(seconds=60 * t), target_id="anthropic/direct", apply=True)
                 t += 1
         self.assertLessEqual(len(p.alerts), MAX_ALERTS)
 
@@ -1118,7 +1119,7 @@ class TestPluginStateIsBounded(unittest.TestCase):
             for j in range(12):
                 _, d = p.on_request(body(j), model="claude-opus-5",
                                     tenant=f"ten{tenant}", session=f"s{tenant}",
-                                    at=T0 + timedelta(seconds=60 * t))
+                                    at=T0 + timedelta(seconds=60 * t), target_id="anthropic/direct", apply=True)
                 p.on_response(d, self._Resp(), model="claude-opus-5")
                 t += 1
         self.assertLessEqual(len(p._effect), 32)
@@ -1128,7 +1129,7 @@ class TestPluginStateIsBounded(unittest.TestCase):
         p = CachePlugin(key=KEY, warmup=8)
         for i in range(20):
             p.on_request(self.blocked(i), model="claude-opus-5", session="s",
-                         at=T0 + timedelta(seconds=90 * i))
+                         at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         from cacheeconomics.allocate import reuse_chain
         scope = reuse_chain((None, "anthropic/direct", "claude-opus-5"), "unknown", "s")
         self.assertTrue(p.recommendations(scope))
@@ -1148,7 +1149,7 @@ class TestTheWireReshapeIsDisclosed(unittest.TestCase):
         last = None
         for i in range(20):
             _, last = p.on_request(self.bare(i), model="claude-opus-5", session="s",
-                                   at=T0 + timedelta(seconds=90 * i))
+                                   at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertTrue(last.applied)
         self.assertTrue(any("bare strings" in n for n in last.notes))
 
@@ -1157,7 +1158,7 @@ class TestTheWireReshapeIsDisclosed(unittest.TestCase):
         last = None
         for i in range(20):
             _, last = p.on_request(body(i), model="claude-opus-5", session="s",
-                                   at=T0 + timedelta(seconds=90 * i))
+                                   at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertFalse(any("bare strings" in n for n in last.notes))
 
     def test_the_plugin_never_reacts_to_its_own_reshape(self):
@@ -1166,7 +1167,7 @@ class TestTheWireReshapeIsDisclosed(unittest.TestCase):
         p = CachePlugin(key=KEY, warmup=8)
         for i in range(60):
             p.on_request(self.bare(i), model="claude-opus-5", session="s",
-                         at=T0 + timedelta(seconds=90 * i))
+                         at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         from cacheeconomics.allocate import reuse_chain
         scope = reuse_chain((None, "anthropic/direct", "claude-opus-5"), "unknown", "s")
         self.assertEqual(p.monitor.change_rates(scope)[0], 0.0)
@@ -1216,7 +1217,7 @@ class TestTheBakeOffFailsClosedOnAnUnknownSurface(unittest.TestCase):
                          usage={"input_tokens": 9000, "cache_read_input_tokens": 0,
                                 "cache_creation_input_tokens": 0},
                          segments=[sg(0, "system", 9000, "a"), sg(1, "user", 100, f"t{i}")],
-                         session="s"))
+                         session="s", target_id="anthropic/direct"))
         for j in range(unknown):
             out.append(R(request_id=f"u{j}", sent_at=T0 + timedelta(seconds=9999),
                          model="claude-opus-5",
@@ -1321,7 +1322,7 @@ class TestTheAdapterModelsEveryPromptField(unittest.IsolatedAsyncioTestCase):
             _, last = p.on_request(
                 body, model="claude-opus-5", session="s",
                 markable=markable_positions(body),
-                at=T0 + timedelta(seconds=90 * i))
+                at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         # Any marker covers the header, because a marker caches the prefix that
         # precedes it. Demanding one at position 0 specifically would assert a
         # shape rather than the property -- marking at 1 covers both blocks and
@@ -1339,7 +1340,7 @@ class TestTheAdapterModelsEveryPromptField(unittest.IsolatedAsyncioTestCase):
             _, last = p.on_request(
                 body, model="claude-opus-5", session="s",
                 markable=markable_positions(body),
-                at=T0 + timedelta(seconds=90 * i))
+                at=T0 + timedelta(seconds=90 * i), target_id="anthropic/direct", apply=True)
         self.assertEqual(last.placements, {})
 
     async def test_the_system_field_survives_the_round_trip(self):
@@ -1373,7 +1374,7 @@ class TestAgentReachesTheRuntimeRebuildCheck(unittest.TestCase):
         p = CachePlugin(key=KEY, warmup=4)
         _, d = p.on_request({"system": [{"type": "text", "text": "p" * 40000}],
                              "messages": [{"role": "user", "content": "x"}]},
-                            model="claude-opus-5", session="s", agent=agent, at=T0)
+                            model="claude-opus-5", session="s", agent=agent, at=T0, target_id="anthropic/direct", apply=True)
         p.on_response(d, self._Resp(), model="claude-opus-5")
         return p, d
 
@@ -1398,7 +1399,7 @@ class TestAgentReachesTheRuntimeRebuildCheck(unittest.TestCase):
         for agent in ("main-loop", "subagent:explore"):
             _, d = p.on_request({"system": [{"type": "text", "text": "p" * 40000}],
                                  "messages": [{"role": "user", "content": "x"}]},
-                                model="claude-opus-5", session="s", agent=agent, at=T0)
+                                model="claude-opus-5", session="s", agent=agent, at=T0, target_id="anthropic/direct", apply=True)
             p.on_response(d, self._Resp(), model="claude-opus-5")
         st = p.monitor._scopes[self.REBUILD_SCOPE]
         self.assertEqual(len(st.established), 2)
@@ -1453,7 +1454,7 @@ class TestMessageLevelMarkersAreCounted(unittest.TestCase):
             out, d = p.on_request(self._body(i, caller_markers),
                                   model="claude-opus-5", tenant="t",
                                   session="s", agent="main",
-                                  at=T0 + timedelta(seconds=60 * i), apply=True)
+                                  at=T0 + timedelta(seconds=60 * i), apply=True, target_id="anthropic/direct")
         return out, d
 
     def test_marker_count_sees_what_walk_cannot(self):
@@ -1617,7 +1618,7 @@ class TestEffectivenessNeedsRealCounters(unittest.TestCase):
         d = None
         for i in range(8):
             _, d = p.on_request(dict(body), model="claude-opus-5", session="s",
-                                agent="a", at=T0 + timedelta(seconds=120 * i))
+                                agent="a", at=T0 + timedelta(seconds=120 * i), target_id="anthropic/direct", apply=True)
         return p, d
 
     def test_a_response_with_no_usage_moves_no_counter(self):
@@ -1698,7 +1699,7 @@ class TestTheWireTtlReachesTheMonitor(unittest.TestCase):
                              "cache_control": {"type": "ephemeral"}}],
                  "messages": [{"role": "user", "content": f"turn {i}"}]},
                 model="claude-opus-5", session="s", agent="main",
-                at=T0 + timedelta(seconds=900 * i))
+                at=T0 + timedelta(seconds=900 * i), target_id="anthropic/direct", apply=True)
         self.assertIn("RT-TTL", {a.code for a in list(p.alerts)})
 
 

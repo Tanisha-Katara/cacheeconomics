@@ -46,7 +46,8 @@ from datetime import datetime
 from glob import glob
 
 from ..registry import normalize_model
-from ..trace import Request, Tier, TraceSet, _parse_ts
+from ..trace import (ASSUMED_PROVIDER_SURFACE, UNATTRIBUTED, Request, Tier,
+                     TraceSet, _parse_ts)
 
 DEFAULT_ROOT = os.path.expanduser("~/.claude/projects")
 
@@ -80,11 +81,36 @@ def _usage_only(u: dict) -> dict:
 
 def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
                   limit: int | None = None,
-                  target_id: str = "anthropic/direct") -> TraceSet:
+                  target_id: str = UNATTRIBUTED,
+                  surface_assumed: bool = False) -> TraceSet:
     """Every assistant turn across the transcripts under `root`.
 
     One assistant record is one billed request. User records, attachments,
     file-history snapshots and the rest carry no usage and are skipped.
+
+    `target_id` is not read from the data and cannot be: a transcript records
+    the conversation, not the wire request, and carries no provider field
+    anywhere -- checked across 190 of them. It used to default to
+    `anthropic/direct` with a blocking note attached, on the reasoning that
+    Claude Code talks to Anthropic directly unless CLAUDE_CODE_USE_BEDROCK or
+    CLAUDE_CODE_USE_VERTEX is set.
+
+    That reasoning is still true and is still how the CLI is configured -- `ce
+    claude-code` passes the surface explicitly, and its `--target-id` help says
+    so. What changed is that a *library* caller who never chose a surface no
+    longer has one chosen for them: the default is now the absence of a surface,
+    which is registered unpriceable, so the report withholds dollars and says
+    why instead of quoting Anthropic's rate table at somebody on Bedrock.
+
+    `surface_assumed` says *how* `target_id` was arrived at, and it is a separate
+    argument because it cannot be recovered from the value. The note below used
+    to fire on `target_id == "anthropic/direct"`, which is the same string
+    whether somebody assumed it or knew it -- so a user who passed `--target-id
+    anthropic/direct` from knowledge was told their surface was an assumption,
+    on a report whose figures were correctly reconciled. Guessing a fact about
+    provenance out of the value is the defect this whole round is about; doing it
+    to the *disclosure* while the figures got it right is the same mistake in the
+    half nobody was looking at.
     """
     # Recursive: subagent transcripts live in per-session subdirectories, and a
     # flat glob silently missed 73 of 122 files here — which would have dropped
@@ -194,21 +220,30 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
             ))
 
     blocking: list[str] = []
-    if requests and target_id == "anthropic/direct":
-        # A transcript records the conversation, not the wire request, and
-        # carries no provider field anywhere -- checked across 190 of them.
-        # So this surface is an assumption, not something read. Left as the
-        # default because Claude Code talks to Anthropic directly unless
-        # CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set, and failing
-        # closed for everyone to catch that minority would cost more than it
-        # saves. But an assumption that decides which rate table applies has to
-        # be visible, not buried in a constructor argument.
-        #
-        # Both backstops still hold if it is wrong: with an invoice the rates
-        # disagree and reconciliation fails, and without one the report is
-        # stamped DRAFT.
+    if requests and target_id == UNATTRIBUTED:
+        # Not an assumption -- the absence of one. The analyzer will exclude
+        # every request from every dollar figure and say so; this states the
+        # same fact at the point it becomes true, and blocks release for it.
         blocking.append(
-            "Provider surface assumed to be anthropic/direct. Claude Code "
+            "No provider surface was stated for these transcripts. A transcript "
+            "records the conversation rather than the wire request and carries "
+            "no provider field, so it cannot be read from the data either -- and "
+            "the surface decides which rate table applies. Every dollar figure "
+            "is withheld until one is named. Pass --target-id (most likely "
+            "anthropic/direct, unless CLAUDE_CODE_USE_BEDROCK or "
+            "CLAUDE_CODE_USE_VERTEX is set on the machine that produced these).")
+    if requests and surface_assumed:
+        # Keyed on how the caller got here, not on where they ended up. A
+        # transcript carries no provider field, so `anthropic/direct` is a
+        # perfectly good thing to *know* and an assumption only when nobody
+        # checked -- and the string is identical either way.
+        #
+        # Both backstops still hold if the assumption is wrong: with an invoice
+        # the rates disagree and reconciliation fails, and the CLI holds these
+        # figures to DRAFT whatever the invoice says, because reconciling a
+        # total cannot check the rate table it was computed from.
+        blocking.append(
+            f"Provider surface assumed to be {target_id}. Claude Code "
             "transcripts record the conversation rather than the wire request "
             "and carry no provider field, so this was not read from the data. "
             "If this deployment routes through Bedrock or Vertex, pass "
@@ -246,7 +281,14 @@ def load_sessions(root: str = DEFAULT_ROOT, project: str | None = None,
     return TraceSet(requests=requests, tier=Tier.USAGE_ONLY,
                     source=pattern, notes=notes + blocking,
                     blocking_notes=blocking,
-                    skipped_rows=skipped + corrupt)
+                    skipped_rows=skipped + corrupt,
+                    # The structured half of the note above. `analyze` reads
+                    # this to cap the release at DRAFT, so the disclosure and
+                    # the release label come from one fact rather than from a
+                    # renderer re-reading prose. Named, not a flag, so the note
+                    # downstream can say *which* input was assumed.
+                    assumed_inputs=((ASSUMED_PROVIDER_SURFACE,)
+                                    if surface_assumed else ()))
 
 
 def _agent_of(rec: dict) -> str:

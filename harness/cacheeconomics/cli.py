@@ -280,19 +280,209 @@ def cmd_checks(args) -> int:
     return 0
 
 
+def _claude_code_target(args) -> str:
+    """The surface for a Claude Code run: stated, assumed on purpose, or refused.
+
+    A transcript records the conversation rather than the wire request and
+    carries no provider field anywhere -- checked across 190 of them -- so this
+    surface can never be read from the data. It used to be *fabricated* instead:
+    `args.target_id or "anthropic/direct"`, which is the default path of the
+    command, so the ordinary invocation priced transcripts at Anthropic
+    first-party rates whatever they actually ran against. Measured on a
+    40-request fixture with `--allow-unreconciled`: $6.66 input spend, $38.46
+    uncached, $31.80 saved, $123/mo, all released as DRAFT under a rate table
+    nobody had chosen. On a Bedrock- or Vertex-routed deployment every one of
+    those is against the wrong table, and the only thing standing in the way was
+    a prose caveat further down the report.
+
+    Defaulting to UNATTRIBUTED instead was measured before it was rejected, and
+    it does not merely withhold the dollars -- it empties the report. `analyze`
+    recomputes its ratios over the *priced* requests, so with none priceable the
+    same fixture reports 0 requests, `input_from_cache` None, `prefix_efficiency`
+    None and no findings at all, in place of 40 requests at 94% and 94%. Those
+    two ratios are computed from the provider's own usage counters and do not
+    depend on the rate table in any way, so silently trading them away to avoid
+    naming a surface would be an over-block: a command that answers nothing gets
+    switched off, and then it catches nothing.
+
+    So the choice is made explicit rather than either fabricated or removed.
+    Anthropic direct is still very likely correct -- Claude Code talks to
+    Anthropic unless CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set --
+    and `--assume-anthropic-direct` is how you say so. It stays an assumption:
+    the adapter's blocking note still fires and still holds release.
+
+    Refusing is louder and cheaper than the alternatives: one flag, at start-up,
+    instead of a wrong rate table discovered from a bill. Same shape as
+    `litellm_handler(mutate=True)`, which refuses at construction for the same
+    reason.
+    """
+    if args.target_id and args.assume_anthropic_direct:
+        raise Fail(
+            "pass either --target-id or --assume-anthropic-direct, not both: "
+            f"--target-id says the surface is {args.target_id!r} and "
+            f"--assume-anthropic-direct says to assume anthropic/direct.")
+    if args.target_id:
+        return args.target_id
+    if args.assume_anthropic_direct:
+        return "anthropic/direct"
+    raise Fail(
+        "this command needs to be told which provider surface these sessions "
+        "ran against, because a Claude Code transcript records the conversation "
+        "rather than the wire request and carries no provider field to read it "
+        "from. The surface decides which rate table applies, and Bedrock and "
+        "Vertex rates are not Anthropic's.\n"
+        "  --assume-anthropic-direct   Claude Code talks to Anthropic directly "
+        "unless CLAUDE_CODE_USE_BEDROCK or CLAUDE_CODE_USE_VERTEX is set on the "
+        "machine that produced these transcripts. This is usually the right "
+        "answer; the report still states it as an assumption and still withholds "
+        "figures until they reconcile.\n"
+        "  --target-id <surface>       name it exactly, e.g. "
+        "amazon-bedrock/converse or google-cloud/vertex.")
+
+
+# The surface half of a DRAFT reason, written to be *appended* to whatever else
+# already made this a draft rather than to stand alone. It deliberately does not
+# open with "DRAFT" or promise that naming the surface reconciles anything: with
+# no invoice supplied it would not, and an earlier version of this string said so
+# anyway while sitting in front of the analyzer's true "no invoice was supplied".
+ASSUMED_SURFACE_CLAUSE = (
+    "The provider surface was assumed rather than measured: "
+    "--assume-anthropic-direct supplied anthropic/direct, and every dollar "
+    "figure here is priced from that surface's rate table. An invoice can check "
+    "that the total adds up; it cannot check that the rate table it was added up "
+    "from is the right one, because a Claude Code transcript carries no provider "
+    "field to compare against. Pass --target-id to state the surface from "
+    "knowledge instead.")
+
+ASSUMED_SURFACE_DRAFT_NOTE = "DRAFT — " + ASSUMED_SURFACE_CLAUSE
+
+
+def _draft_because_the_surface_was_assumed(a):
+    """Re-release every figure in `a` as DRAFT rather than RECONCILED.
+
+    The floor under an assumed surface. Reconciliation checks a *total* against
+    an invoice; it cannot check the *rate table* that total was computed from,
+    and with `--assume-anthropic-direct` that table came from an assumption. So
+    a report could carry `released_as='reconciled'` -- the label meaning an
+    invoice verified this -- over dollars whose provenance was a guess.
+    Reproduced on a 40-request fixture: an invoice equal to computed spend
+    reconciled at 0.0% and released input_usd, if_uncached_usd,
+    caching_saved_usd and monthly_input_usd all as 'reconciled'.
+
+    That is this project's central failure in one place: an assumption
+    published with the provenance of a measurement. The assumption *was*
+    disclosed, but only as free text a renderer adds later -- in the text report
+    a costed finding and the total appear above the caveat, and in HTML the
+    Input spend KPI appears above the standing notes. Neither a reader skimming
+    nor a script reading the JSON `release_state` is reached by prose.
+
+    DRAFT is the existing vocabulary for "released, and not invoice-checked", so
+    this reuses it rather than inventing a third state that every renderer and
+    consumer would then have to learn. `report._is_draft` reads release state
+    off the figures rather than off the notes, so both renderers stamp this
+    without being told separately, and `Analysis.total_avoidable_month` derives
+    DRAFT from its parts on its own.
+
+    Deliberately a downgrade and never an upgrade: a figure that is withheld
+    stays withheld, and one already DRAFT stays DRAFT. `Figure.release` keeps an
+    explicit `as_`, so this cannot launder a withheld figure into a released one.
+
+    This is a floor, not the whole fix. It covers the surface *this flag*
+    assumed. The general form -- structured surface provenance on the figures
+    themselves, and `ts.blocking_notes` feeding the release decision so that any
+    assumed input blocks reconciled release whatever produced it -- belongs in
+    `analyzer.analyze` and is not done here.
+    """
+    import dataclasses
+
+    from . import money
+
+    def draft(v):
+        # Only touch what is actually published as invoice-checked. A withheld
+        # figure has no release state to downgrade and must keep its reason.
+        if not isinstance(v, money.Figure) or not v.released:
+            return v
+        return v.release(True, as_=money.DRAFT)
+
+    findings = [dataclasses.replace(f, avoidable_usd_month=draft(f.avoidable_usd_month))
+                if f.avoidable_usd_month is not None else f
+                for f in a.findings]
+    spend = {k: draft(v) for k, v in a.spend.items()}
+
+    # The banner is driven by the same evidence `report._is_draft` reads -- a
+    # figure actually released as DRAFT -- and not by the fact that this function
+    # ran. Two failures came out of prepending it unconditionally:
+    #
+    # A report whose reconciliation *failed* has every figure withheld, so there
+    # is no draft to announce. The note went in anyway, and because `render_text`
+    # looks for a note beginning "DRAFT" while `render_html` calls `_is_draft`,
+    # the text report stamped a draft banner and the HTML did not. Measured on a
+    # $999 invoice against $1.16 of spend: `_is_draft` False, HTML gate div
+    # absent, text banner present. Two renderers disagreeing about the same
+    # verdict is the defect this repo has the longest history with, and it had
+    # just been reintroduced by a fix written to close a provenance hole.
+    #
+    # So: derive from the figures, exactly as the renderers' own predicate does.
+    released_draft = any(isinstance(v, money.Figure) and v.released
+                         and v.released_as == money.DRAFT for v in spend.values())
+
+    notes = list(a.notes)
+    if released_draft:
+        # Composed with whatever else already made this a draft, rather than
+        # winning by being first. With `--allow-unreconciled` and no invoice the
+        # analyzer inserts its own "figures released without invoice
+        # reconciliation" at notes[0]; prepending in front of it made
+        # `_draft_reason` return the surface note instead -- which told the
+        # reader that passing --target-id would make these reconciled figures.
+        # With no invoice supplied that is simply false, and it had replaced a
+        # true explanation with it. Both reasons are real here and the reader
+        # needs both.
+        existing = next((n for n in notes if n.startswith("DRAFT")), None)
+        if existing is None:
+            notes.insert(0, ASSUMED_SURFACE_DRAFT_NOTE)
+        elif ASSUMED_SURFACE_CLAUSE not in existing:
+            notes[notes.index(existing)] = existing.rstrip() + " " + ASSUMED_SURFACE_CLAUSE
+    return dataclasses.replace(
+        a,
+        spend=spend,
+        reconciliation=({k: draft(v) for k, v in a.reconciliation.items()}
+                        if a.reconciliation else a.reconciliation),
+        findings=findings,
+        notes=notes,
+        # Unconditional, unlike the banner: the assumption qualifies these
+        # figures whether or not any of them cleared the gate, and that is what
+        # this list is for. The clause without the "DRAFT — " prefix, so the word
+        # never appears on a report where nothing was released as a draft.
+        blocking_notes=list(a.blocking_notes) + [ASSUMED_SURFACE_CLAUSE])
+
+
 def cmd_claude_code(args) -> int:
     """Analyse local Claude Code transcripts.
 
     Reads only usage counters and prompt *shape* from the session files. It
     still touches transcripts, so the output can carry counts and timings
     derived from real work -- worth knowing before piping it anywhere.
+
+    The surface has to be chosen, one way or the other. See `_claude_code_target`.
     """
     from .adapters.claude_code import load_sessions
+    target_id = _claude_code_target(args)
     ts = load_sessions(root=args.root, project=args.project, limit=args.limit,
-                       target_id=args.target_id or "anthropic/direct")
+                       target_id=target_id,
+                       # Passed, not re-derived from `target_id`. The adapter
+                       # cannot tell an assumed anthropic/direct from a stated
+                       # one -- it is the same string -- and it used to guess
+                       # from the value, so `--target-id anthropic/direct` was
+                       # told its own surface was an assumption.
+                       surface_assumed=bool(args.assume_anthropic_direct))
     a = analyze(ts, invoice_usd=args.invoice_usd,
                 effective_rate=args.effective_rate, on_date=args.on_date,
                 allow_unreconciled=args.allow_unreconciled)
+    # Keyed on the flag rather than on the resulting surface id: `--target-id
+    # anthropic/direct` is the same string arrived at by knowledge, and there is
+    # nothing assumed about it.
+    if args.assume_anthropic_direct:
+        a = _draft_because_the_surface_was_assumed(a)
     print(_coverage_line(ts), file=sys.stderr)
     print(report.render_text(a, detail=args.detail))
     return 0
@@ -445,7 +635,22 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--breakpoints", type=int, default=1)
     c.add_argument("--ttls", help="comma-separated lifetimes in wire order, "
                                   "e.g. 1h,5m")
-    c.add_argument("--target-id", default="anthropic/direct")
+    # No default surface. Minimums, breakpoint budgets and supported lifetimes
+    # are all per-surface -- 512 tokens on anthropic/direct is 1,024 on
+    # openai/direct -- so a default here answers for a provider the operator
+    # never chose. Measured: `checks --prefix-tokens 768 --model claude-opus-5
+    # --tokens-are-exact` with no surface exited 0 with three PASSes against
+    # Anthropic's 512 minimum, while the same prefix on openai/direct FAILs.
+    #
+    # The checks are tri-state, so nothing has to be refused here: all three
+    # abstain, and `cmd_checks` already maps abstention to exit 3 rather than 0
+    # precisely so that "I could not evaluate this" never reads as a pass.
+    c.add_argument("--target-id", default=DEFAULT_TARGET,
+                   help="the provider surface this configuration ships to "
+                        "(e.g. anthropic/direct, openai/direct, "
+                        "amazon-bedrock/converse). Without it every check "
+                        "abstains and the command exits 3, because these "
+                        "thresholds differ by surface")
     c.add_argument("--tokens-are-exact", action="store_true",
                    help="the prefix size is measured, not estimated")
     c.add_argument("--rolling-marker", action="store_true",
@@ -462,13 +667,21 @@ def build_parser() -> argparse.ArgumentParser:
                     help="transcript root (default: ~/.claude/projects)")
     cc.add_argument("--project", help="one project directory only")
     cc.add_argument("--limit", type=int, help="most recent N sessions only")
-    # A transcript carries no provider field, so the surface here is an
-    # assumption the report states out loud. This is how to correct it.
+    # A transcript carries no provider field, so the surface here can only be
+    # stated or assumed -- never read. One of these two is required; see
+    # `_claude_code_target` for why it is not simply defaulted either way.
     cc.add_argument("--target-id", default=None,
-                    help="the provider surface these sessions ran against "
-                         "(default anthropic/direct). Set it if Claude Code was "
-                         "routed through Bedrock or Vertex, whose rates are not "
-                         "Anthropic's")
+                    help="the provider surface these sessions ran against, "
+                         "e.g. amazon-bedrock/converse or google-cloud/vertex, "
+                         "whose rates are not Anthropic's")
+    cc.add_argument("--assume-anthropic-direct", action="store_true",
+                    help="assume these sessions ran against anthropic/direct, "
+                         "which is true unless CLAUDE_CODE_USE_BEDROCK or "
+                         "CLAUDE_CODE_USE_VERTEX was set. Required if "
+                         "--target-id is not given: the surface decides which "
+                         "rate table applies and cannot be read from a "
+                         "transcript. The report still states it as an "
+                         "assumption")
     _pricing_args(cc)
     _release_args(cc)
     _detail_arg(cc)

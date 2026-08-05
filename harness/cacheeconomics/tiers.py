@@ -58,7 +58,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from . import registry
+from . import cost, registry
 
 _TTL = re.compile(r"^(\d+)([smh])$")
 _UNIT = {"s": 1, "m": 60, "h": 3600}
@@ -178,15 +178,48 @@ def _surface(target_id: str, model: str | None = None):
         raise Unsupported(
             f"{target_id} records no supported cache lifetimes"
             + (f" for {model}" if model else ""))
-    if not isinstance(mult.get("read"), (int, float)):
+    # `cost.is_multiplier`, not a local isinstance. `bool` subclasses `int`, so
+    # `read: true` passed the old check and came back as a 1.0x read rate --
+    # which makes a cache read cost the same as fresh input, so every plan
+    # scores worse than uncached and the allocator places nothing at all. Same
+    # defect as the one that priced a `write_5m: true` at 1.0x in `cost.price`;
+    # one predicate now, because these two drifted while agreeing in words.
+    if not cost.is_multiplier(mult.get("read")):
         raise Unsupported(
             f"{target_id} does not record an Anthropic-shaped read multiplier, "
             f"so this cost model cannot compare plans on it.")
-    rates = {}
+    # Three cases, not two, and collapsing the last two is what went wrong.
+    #
+    #   absent              -- skip. A surface can advertise a lifetime the
+    #                          registry records no premium for; the plan simply
+    #                          cannot use that tier, and that is a gap in the
+    #                          registry rather than a fault in the row.
+    #   present and valid   -- use.
+    #   present and invalid -- refuse. This took the skip path, so `write_5m:
+    #                          true` beside a numeric `write_1h` returned a
+    #                          one-lifetime rate map and the allocator went on
+    #                          to recommend 1h-only plans, with nothing anywhere
+    #                          reporting that the 5m price input was corrupt.
+    #
+    # The difference matters because the two look identical downstream and mean
+    # opposite things: an absent premium is a fact about the surface, a corrupt
+    # one is a fact about the data, and only the second should stop the run.
+    rates, corrupt = {}, []
     for t in ttls:
         key = f"write_{t}"
-        if isinstance(mult.get(key), (int, float)):
-            rates[t] = mult[key]
+        if key not in mult or mult[key] is None:
+            continue
+        if not cost.is_multiplier(mult[key]):
+            corrupt.append(f"{key}={mult[key]!r}")
+            continue
+        rates[t] = mult[key]
+    if corrupt:
+        raise Unsupported(
+            f"{target_id} records unusable write multipliers "
+            f"({', '.join(corrupt)}), so a plan built on the remaining "
+            f"lifetimes would be priced against a table that is partly "
+            f"corrupt. A multiplier must be a finite positive number; an "
+            f"absent one is a different thing and is skipped.")
     if not rates:
         raise Unsupported(
             f"{target_id} records lifetimes {ttls} but no matching write "
@@ -229,13 +262,29 @@ def expected_cost(blocks, ttls, read_rate, write_rates, gaps, survivals) -> floa
 
 
 def allocate(segments, change_rates, *, target_id: str, model: str,
-             gaps=None, budget=None) -> Allocation:
+             gaps=None, budget=None, for_mutation: bool = False) -> Allocation:
     """Best marker placement for one prompt shape under the surface's budget.
 
     `segments` are in wire order. `change_rates` maps segment index to the share
     of requests on which that segment changed -- a rate, not a count of distinct
     values, because a field alternating between two states changes the prefix on
     every single request and only ever shows two values.
+
+    `for_mutation` says whether this plan is about to be written onto a live
+    request. It splits by intent, not by caller: the same function serves the
+    report path and the request path, and only one of them can be wrong in a way
+    the provider will not report.
+
+    It exists for surfaces whose `control_model` is not `explicit_breakpoint`.
+    This whole model -- markers at wire positions cutting a prefix into blocks --
+    is explicit-breakpoint semantics. On a surface that reaches its cache some
+    other way (Bedrock searches backward from a checkpoint; Gemini caches a named
+    resource; DeepSeek matches an implicit prefix) the arithmetic above describes
+    something the provider does not do. A *report* may still model it and say so,
+    which is what the note below is for. Writing those positions onto somebody's
+    request cannot be caveated in the same way -- nobody reads a note at request
+    time, and a marker the surface does not honour is billed and silent -- so
+    mutation fails closed instead.
     """
     surf_budget, write_rates, read_rate = _surface(target_id, model)
     # `budget or surf_budget` made 0 indistinguishable from None, so a caller
@@ -279,10 +328,33 @@ def allocate(segments, change_rates, *, target_id: str, model: str,
             f"provider caches nothing and returns no error. ({e})") from e
 
     control = registry.target(target_id).get("control_model")
-    if control and control != "explicit_breakpoint":
+    if control != "explicit_breakpoint":
+        # Reported as indicative; refused when it is about to be written.
+        #
+        # This branch used to append the note and carry straight on, so the live
+        # plugin put `cache_control` on a Bedrock request -- measured, markers
+        # {1: '5m'} on the wire -- with the words "treat the placement as
+        # indicative" going nowhere near the request. A caveat attached to a
+        # mutation is not a caveat, it is a mutation.
+        #
+        # A missing `control_model` fails closed with the rest. It is not
+        # evidence of explicit-breakpoint semantics; it is the absence of
+        # evidence, and this is the branch that decides whether to rewrite
+        # somebody's traffic.
+        if for_mutation:
+            raise Unsupported(
+                f"{target_id} controls caching by "
+                f"{control or 'a control model the registry does not record'}, "
+                f"not by an explicit breakpoint over a prefix, so a marker plan "
+                f"computed from explicit-breakpoint semantics must not be "
+                f"written onto a live request here. The plan is still modelled "
+                f"for reporting: run without mutation to see it, marked "
+                f"indicative. Confirm the placement against this surface before "
+                f"acting on it.")
         notes.append(
-            f"{target_id} controls caching by {control}, not by an explicit "
-            f"breakpoint over a prefix. This plan is modelled on "
+            f"{target_id} controls caching by "
+            f"{control or 'a control model the registry does not record'}, not "
+            f"by an explicit breakpoint over a prefix. This plan is modelled on "
             f"explicit-breakpoint semantics, so treat the placement as "
             f"indicative on this surface until it is confirmed against it")
 

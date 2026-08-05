@@ -164,7 +164,7 @@ class TestRatesAreNotCounts(unittest.TestCase):
         reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
                         model="claude-opus-5", usage={},
                         segments=[sg(0, "system", 5000, "A" if i % 2 else "B"),
-                                  sg(1, "system", 5000, "stable")])
+                                  sg(1, "system", 5000, "stable")], target_id="anthropic/direct")
                 for i in range(20)]
         rates = observed_change_rates(reqs)
         self.assertEqual(rates[0], 1.0)
@@ -179,7 +179,7 @@ class TestRatesAreNotCounts(unittest.TestCase):
             if i % 2:
                 segs.append(sg(1, "system", 100, "sometimes"))
             reqs.append(Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
-                                model="claude-opus-5", usage={}, segments=segs))
+                                model="claude-opus-5", usage={}, segments=segs, target_id="anthropic/direct"))
         self.assertGreater(observed_change_rates(reqs)[1], 0.5)
 
     def test_the_fail_closed_reduction_takes_the_worst_pool(self):
@@ -189,7 +189,7 @@ class TestRatesAreNotCounts(unittest.TestCase):
                 reqs.append(Request(request_id=f"{tenant}{i}",
                                     sent_at=T0 + timedelta(seconds=60 * i),
                                     model="claude-opus-5", usage={}, tenant=tenant,
-                                    segments=[sg(0, "system", 5000, sid)]))
+                                    segments=[sg(0, "system", 5000, sid)], target_id="anthropic/direct"))
         self.assertEqual(observed_change_rates(reqs)[0], 1.0)
 
     def test_per_session_headers_are_not_pool_level_volatility(self):
@@ -200,7 +200,7 @@ class TestRatesAreNotCounts(unittest.TestCase):
                     request_id=f"{sess}{i}", sent_at=T0 + timedelta(seconds=60 * i),
                     model="claude-opus-5", usage={}, tenant="tenant", session=sess,
                     segments=[sg(0, "system", 5000, f"session-{sess}"),
-                              sg(1, "system", 5000, "body")]))
+                              sg(1, "system", 5000, "body")], target_id="anthropic/direct"))
         self.assertEqual(observed_change_rates(reqs)[0], 0.0)
 
     def test_a_changing_reuse_chain_still_fails_closed(self):
@@ -210,12 +210,12 @@ class TestRatesAreNotCounts(unittest.TestCase):
                                 sent_at=T0 + timedelta(seconds=60 * i),
                                 model="claude-opus-5", usage={}, tenant="tenant",
                                 session="stable",
-                                segments=[sg(0, "system", 5000, "fixed")]))
+                                segments=[sg(0, "system", 5000, "fixed")], target_id="anthropic/direct"))
             reqs.append(Request(request_id=f"changing{i}",
                                 sent_at=T0 + timedelta(seconds=60 * i),
                                 model="claude-opus-5", usage={}, tenant="tenant",
                                 session="changing",
-                                segments=[sg(0, "system", 5000, f"v{i}")]))
+                                segments=[sg(0, "system", 5000, f"v{i}")], target_id="anthropic/direct"))
         self.assertEqual(observed_change_rates(reqs)[0], 1.0)
 
 
@@ -224,6 +224,7 @@ class TestItRefusesRatherThanGuesses(unittest.TestCase):
     def _one(self, **kw):
         segs = [sg(0, "system", 6000, "a"), sg(1, "system", 3000, "b"),
                 sg(2, "user", 400, "c")]
+        kw.setdefault("target_id", "anthropic/direct")
         r = Request(request_id="r", sent_at=T0, model="claude-opus-5",
                     usage={}, segments=segs, **kw)
         return r
@@ -264,14 +265,14 @@ class TestItRefusesRatherThanGuesses(unittest.TestCase):
 
     def test_a_prompt_below_the_minimum_says_so(self):
         r = Request(request_id="r", sent_at=T0, model="claude-haiku-4-5", usage={},
-                    segments=[sg(0, "system", 200, "a"), sg(1, "user", 50, "b")])
+                    segments=[sg(0, "system", 200, "a"), sg(1, "user", 50, "b")], target_id="anthropic/direct")
         p = allocator_full(r, rates={0: 0.0, 1: 1.0}, gaps=[120.0] * 20)
         self.assertEqual(p.marker_indices, [])
         self.assertTrue(any("4,096-token minimum" in n for n in p.notes))
 
     def test_an_infeasible_candidate_is_not_reported_as_costing_nothing(self):
         r = Request(request_id="r", sent_at=T0, model="claude-haiku-4-5", usage={},
-                    segments=[sg(0, "system", 200, "a"), sg(1, "user", 50, "b")])
+                    segments=[sg(0, "system", 200, "a"), sg(1, "user", 50, "b")], target_id="anthropic/direct")
         scored = next(n for n in allocator_full(r, rates={0: 0.0}, gaps=[120.0] * 20).notes
                       if n.startswith("candidates scored"))
         self.assertIn("not feasible", scored)
@@ -296,7 +297,7 @@ class TestCountsAndRatesAreNotInterchangeable(unittest.TestCase):
     def test_propose_refuses_a_rate_map(self):
         from cacheeconomics.relocate import propose
         reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
-                        model="claude-opus-5", usage={}, segments=buried(i))
+                        model="claude-opus-5", usage={}, segments=buried(i), target_id="anthropic/direct")
                 for i in range(20)]
         with self.assertRaises(TypeError) as e:
             propose(reqs, observed_change_rates(reqs))
@@ -305,14 +306,14 @@ class TestCountsAndRatesAreNotInterchangeable(unittest.TestCase):
     def test_it_catches_the_all_or_nothing_rate_map_that_passes_for_counts(self):
         from cacheeconomics.relocate import propose
         reqs = [Request(request_id="r", sent_at=T0, model="claude-opus-5",
-                        usage={}, segments=buried(0))]
+                        usage={}, segments=buried(0), target_id="anthropic/direct")]
         with self.assertRaises(TypeError):
             propose(reqs, {0: 0.0, 1: 1.0, 2: 0.0})
 
     def test_counts_are_still_accepted(self):
         from cacheeconomics.relocate import propose
         reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
-                        model="claude-opus-5", usage={}, segments=buried(i))
+                        model="claude-opus-5", usage={}, segments=buried(i), target_id="anthropic/direct")
                 for i in range(20)]
         moves, _ = propose(reqs, observed_volatility_by_pool(reqs)[pool_of(reqs[0])])
         self.assertTrue(moves, "the buried timestamp is exactly what propose is for")
@@ -323,7 +324,7 @@ class TestRelocationComposes(unittest.TestCase):
     def _buried(self, n=40):
         return [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=120 * i),
                         model="claude-opus-5", usage={"input_tokens": 100},
-                        segments=buried(i)) for i in range(n)]
+                        segments=buried(i), target_id="anthropic/direct") for i in range(n)]
 
     def test_moving_the_buried_segment_unlocks_the_prefix_behind_it(self):
         from cacheeconomics.relocate import propose

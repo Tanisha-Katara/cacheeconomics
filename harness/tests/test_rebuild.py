@@ -32,7 +32,7 @@ def req(i, *, read, write, session="s1", model="claude-opus-5", gap=60):
                           # Real responses report the lifetime split; without it
                           # the cost model refuses to price the row at all.
                           "cache_creation": {"ephemeral_5m_input_tokens": write,
-                                             "ephemeral_1h_input_tokens": 0}})
+                                             "ephemeral_1h_input_tokens": 0}}, target_id="anthropic/direct")
 
 
 def session(turns=60, prefix=100_000, grow=2_000, rebuild_every=None,
@@ -142,7 +142,7 @@ class TestRebuildNeedsSessionIdentity(unittest.TestCase):
                         usage={"input_tokens": 0, "cache_read_input_tokens": 0,
                                "cache_creation_input_tokens": 50_000,
                                "cache_creation": {"ephemeral_5m_input_tokens": 50_000,
-                                                  "ephemeral_1h_input_tokens": 0}})
+                                                  "ephemeral_1h_input_tokens": 0}}, target_id="anthropic/direct")
                 for i in range(n)]
 
     def test_the_runtime_does_not_report_a_conversation_that_does_not_exist(self):
@@ -379,7 +379,7 @@ class TestContradictoryLifetimesAreUnprovable(unittest.TestCase):
                        usage={"cache_creation_input_tokens": 10000},
                        segments=[Segment(id="a", role="system", tokens=9000, index=0,
                                          cache_marked=True, ttl=marker_ttl)],
-                       ttl_requested=row_ttl)
+                       ttl_requested=row_ttl, target_id="anthropic/direct")
 
     def test_a_contradiction_is_refused(self):
         self.assertIsNone(analyzer._declared_ttl(self._req("1h", "5m")))
@@ -416,7 +416,7 @@ class TestSubagentsAreTheirOwnContext(unittest.TestCase):
                        usage={"input_tokens": 0, "cache_read_input_tokens": read,
                               "cache_creation_input_tokens": write,
                               "cache_creation": {"ephemeral_5m_input_tokens": write,
-                                                 "ephemeral_1h_input_tokens": 0}})
+                                                 "ephemeral_1h_input_tokens": 0}}, target_id="anthropic/direct")
 
     def _mixed(self):
         """A main loop that only extends, and subagents that respawn cold."""
@@ -470,7 +470,7 @@ class TestOnePairIsEnoughForFanOut(unittest.TestCase):
                               "cache_creation": {"ephemeral_5m_input_tokens": 80_000,
                                                  "ephemeral_1h_input_tokens": 0}},
                        segments=[Segment(id="sys", role="system", tokens=80_000,
-                                         index=0, cache_marked=True, ttl="5m")])
+                                         index=0, cache_marked=True, ttl="5m")], target_id="anthropic/direct")
 
     def _f(self, n):
         reqs = [self._w(i, i) for i in range(n)]
@@ -516,7 +516,7 @@ class TestASubagentIsNotAModelSwitch(unittest.TestCase):
                     request_id=f"{agent}{i}", sent_at=T0 + timedelta(seconds=60 * i),
                     model=model, session="shared", agent=agent,
                     usage={"input_tokens": 10, "cache_read_input_tokens": 5_000,
-                           "cache_creation_input_tokens": 0}))
+                           "cache_creation_input_tokens": 0}, target_id="anthropic/direct"))
         return out
 
     def test_two_agents_on_different_models_are_not_a_split_session(self):
@@ -531,7 +531,7 @@ class TestASubagentIsNotAModelSwitch(unittest.TestCase):
                 model="claude-opus-5" if i % 2 else "claude-fable-5",
                 session="s", agent="main",
                 usage={"input_tokens": 10, "cache_read_input_tokens": 5_000,
-                       "cache_creation_input_tokens": 0}))
+                       "cache_creation_input_tokens": 0}, target_id="anthropic/direct"))
         self.assertIn("SPL-1", findings(reqs))
 
     def test_the_two_rules_key_sessions_the_same_way(self):
@@ -560,7 +560,7 @@ class TestExpiryIsExcludedFromTheVeryFirstRepeat(unittest.TestCase):
                            usage={"input_tokens": 0, "cache_read_input_tokens": 0,
                                   "cache_creation_input_tokens": 50_000},
                            segments=[Segment(id="sys", role="system", tokens=50_000,
-                                             index=0, cache_marked=True, ttl="5m")])
+                                             index=0, cache_marked=True, ttl="5m")], target_id="anthropic/direct")
         out = [one(f"s{i}", T0 + timedelta(seconds=30 * i)) for i in range(n)]
         out += [one(f"s{i}", T0 + timedelta(seconds=gap + 30 * i)) for i in range(n)]
         return out
@@ -592,7 +592,7 @@ class TestExpiryIsExcludedFromTheVeryFirstRepeat(unittest.TestCase):
                 segments=[Segment(id="sys", role="system", tokens=40_000,
                                   index=0, cache_marked=True, ttl="1h"),
                           Segment(id="turn", role="user", tokens=10_000,
-                                  index=1, cache_marked=True)])
+                                  index=1, cache_marked=True)], target_id="anthropic/direct")
         out = [one(f"s{i}", T0 + timedelta(seconds=30 * i)) for i in range(n)]
         out += [one(f"s{i}", T0 + timedelta(seconds=gap + 30 * i)) for i in range(n)]
         return out

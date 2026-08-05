@@ -55,6 +55,24 @@ QUALIFIES_SPEND = "excluded from every dollar figure"
 # bill would match.
 UNATTRIBUTED = "unknown/unattributed"
 
+# The name a loader records in `TraceSet.assumed_inputs` when it supplied the
+# provider surface itself rather than reading it from the export or being told
+# it by the caller.
+#
+# A constant, not a literal, because three files have to agree on it and two of
+# them are other people's: the loader writes it, `analyze` reads it to cap the
+# release at DRAFT, and it is rendered verbatim into a user-visible sentence --
+# "the provider surface used to price this trace was assumed rather than read
+# from the export". Spelled out in each place, a rewording in one becomes a
+# silent divergence in the others: the loader keeps admitting an assumption the
+# analyzer no longer recognises, and the report goes back to reconciled.
+#
+# It lives here rather than in `registry` or `analyzer` because `trace.py`
+# imports nothing from the package -- which is what lets every loader and the
+# analyzer import it without a cycle -- and because the field it names is
+# defined a few dozen lines below.
+ASSUMED_PROVIDER_SURFACE = "provider surface"
+
 
 def note_blocks_spend(text: str) -> bool:
     """Does this note qualify a number that was published?
@@ -176,7 +194,17 @@ class Request:
     agent: str = "unknown"
     session: str | None = None
     tenant: str | None = None
-    target_id: str = "anthropic/direct"
+    # The surface this request was actually sent to. `UNATTRIBUTED` is the
+    # absence of one, not a surface, and it is the default because a Request
+    # that nobody told is a Request nobody told.
+    #
+    # It defaulted to `anthropic/direct`, which made "the caller stated the
+    # first-party surface" and "the caller stated nothing" the same value on the
+    # one field that decides which rate table applies and which capability
+    # limits are checked. Both loaders already default to `UNATTRIBUTED`
+    # (`load_jsonl(default_target=...)`), so the object they build disagreed
+    # with the object built directly beside it.
+    target_id: str = UNATTRIBUTED
     first_token_at: datetime | None = None
     status: int = 200
     ttl_requested: str | None = None
@@ -303,6 +331,33 @@ class TraceSet:
     # parsed, so a lossy export matching the invoice is a coincidence over an
     # unknown denominator rather than a reconciliation.
     skipped_rows: int = 0
+    # Which inputs to the pricing were assumed rather than read from the export,
+    # named individually: `(ASSUMED_PROVIDER_SURFACE,)`. Use the constants
+    # rather than literals -- the names are read by `analyze` and printed to a
+    # client, so a spelling that drifts between writer and reader silently
+    # restores the defect this field exists to close.
+    #
+    # Structured rather than recovered from `blocking_notes`, and the three
+    # reasons are measured rather than argued. A blocking note may equally mean
+    # "these rows were excluded" -- the litellm adapter raises exactly that from
+    # the QUALIFIES_SPEND phrase -- and a trace that then reconciles is
+    # *correctly* invoice-checked, because what remains does tie to the bill; so
+    # a rule keyed on any blocking note relabels reports that were right.
+    # Deciding a release label by matching prose is the failure this file
+    # already records as the reason QUALIFIES_SPEND stopped being the
+    # classifier. And the fact is per-input: an assumed surface and an assumed
+    # effective rate are different assumptions with different remedies, which a
+    # sentence cannot distinguish.
+    #
+    # A tuple of names, not a bool, so the note downstream can say which one and
+    # a second assumed input needs no new field.
+    #
+    # `analyze` reads this to cap the release at DRAFT: an invoice can reconcile
+    # a total without checking the rate table the total was computed from, so
+    # figures priced off an assumption are released and not forwardable rather
+    # than withheld. Empty means nothing was assumed, which is the safe reading
+    # for every loader that does not set it.
+    assumed_inputs: tuple = ()
 
     def __len__(self):
         return len(self.requests)

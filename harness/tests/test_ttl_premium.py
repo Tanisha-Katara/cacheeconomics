@@ -297,7 +297,7 @@ class TestThresholdsAreEconomicNotFrequency(unittest.TestCase):
         return TraceSet(requests=[
             Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
                     model="claude-opus-5", agent="a", session="s",
-                    ttl_requested=ttl, usage=self._usage(w, r, ttl))
+                    ttl_requested=ttl, usage=self._usage(w, r, ttl), target_id="anthropic/direct")
             for i in range(n)], tier=Tier.USAGE_ONLY, source="t")
 
     def _codes(self, ts):
@@ -334,14 +334,14 @@ class TestThresholdsAreEconomicNotFrequency(unittest.TestCase):
             reqs.append(Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=t),
                                 model="claude-opus-5", agent="a", session="s",
                                 ttl_requested="5m", segments=seg,
-                                usage=self._usage(1_000_000, 0, "5m")))
+                                usage=self._usage(1_000_000, 0, "5m"), target_id="anthropic/direct"))
             i += 1
             for _ in range(2):
                 t += 60
                 reqs.append(Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=t),
                                     model="claude-opus-5", agent="a", session="s",
                                     ttl_requested="5m", segments=seg,
-                                    usage=self._usage(0, 1_000_000, "5m")))
+                                    usage=self._usage(0, 1_000_000, "5m"), target_id="anthropic/direct"))
                 i += 1
         f = self._codes(TraceSet(requests=reqs, tier=Tier.INSTRUMENTED,
                                  source="t")).get("TTL-1")
@@ -359,7 +359,7 @@ class TestThresholdsAreEconomicNotFrequency(unittest.TestCase):
                     usage={"input_tokens": 50, "cache_read_input_tokens": 1000,
                            "cache_creation_input_tokens": 40000,
                            "cache_creation": {"ephemeral_5m_input_tokens": 20000,
-                                              "ephemeral_1h_input_tokens": 20000}})
+                                              "ephemeral_1h_input_tokens": 20000}}, target_id="anthropic/direct")
             for i in range(40)], tier=Tier.USAGE_ONLY, source="t")
         got = self._codes(ts)
         self.assertNotIn("TTL-1", got)
@@ -406,7 +406,7 @@ class TestTheOtherRulesStoppedGuessing(unittest.TestCase):
             return Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
                            model="claude-opus-5", agent="a", session="s",
                            ttl_requested="5m", segments=segs,
-                           usage=self._usage(30_000))
+                           usage=self._usage(30_000), target_id="anthropic/direct")
         got = self._codes([mk(i, i % 2 == 0) for i in range(30)])
         for code in ("EFF-1", "REB-1", "CAC-1"):
             self.assertIn(code, got)
@@ -423,7 +423,7 @@ class TestTheOtherRulesStoppedGuessing(unittest.TestCase):
         reqs = [Request(request_id=f"r{i}", sent_at=T0 + timedelta(seconds=60 * i),
                         model="claude-opus-5", agent="a", session="s",
                         ttl_requested="5m", segments=segs,
-                        usage=self._usage(30_200, r=0)) for i in range(20)]
+                        usage=self._usage(30_200, r=0), target_id="anthropic/direct") for i in range(20)]
         self.assertIn("MIN-1", self._codes(reqs))
 
     def test_reb0_reports_sessionless_writers_in_a_mixed_export(self):
@@ -433,9 +433,9 @@ class TestTheOtherRulesStoppedGuessing(unittest.TestCase):
         u = self._usage(50_000)
         reqs = [Request(request_id=f"s{i}", sent_at=T0 + timedelta(seconds=60 * i),
                         model="claude-opus-5", session="s",
-                        usage=self._usage(100)) for i in range(2)]
+                        usage=self._usage(100), target_id="anthropic/direct") for i in range(2)]
         reqs += [Request(request_id=f"n{i}", sent_at=T0 + timedelta(seconds=60 * i),
-                         model="claude-opus-5", usage=u) for i in range(50)]
+                         model="claude-opus-5", usage=u, target_id="anthropic/direct") for i in range(50)]
         f = self._codes(reqs, tier=Tier.USAGE_ONLY).get("REB-0")
         self.assertIsNotNone(f, "the sessionless writers vanished")
         self.assertIn("50 of 52", f.detail)
@@ -454,7 +454,7 @@ class TestTheOtherRulesStoppedGuessing(unittest.TestCase):
                     request_id=f"{tag}{k}", sent_at=T0 + timedelta(seconds=base + off),
                     first_token_at=T0 + timedelta(seconds=base + off + 20),
                     model="claude-opus-5", agent="a", session=f"{tag}{k}",
-                    ttl_requested="5m", segments=seg, usage=self._usage(30_000)))
+                    ttl_requested="5m", segments=seg, usage=self._usage(30_000), target_id="anthropic/direct"))
         f = self._codes(reqs).get("FAN-1")
         self.assertIsNotNone(f, "the flat window skipped an 8-second sibling")
         self.assertIn("observed first-token time", f.detail)
@@ -470,7 +470,7 @@ class TestTheOtherRulesStoppedGuessing(unittest.TestCase):
                 reqs.append(Request(
                     request_id=f"{tag}{k}", sent_at=T0 + timedelta(seconds=base + off),
                     model="claude-opus-5", agent="a", session=f"{tag}{k}",
-                    ttl_requested="5m", segments=seg, usage=self._usage(30_000)))
+                    ttl_requested="5m", segments=seg, usage=self._usage(30_000), target_id="anthropic/direct"))
         f = self._codes(reqs).get("FAN-1")
         self.assertIsNotNone(f)
         self.assertIn("five-second window", f.detail)
@@ -625,14 +625,14 @@ class TestTodaysFixesDidNotBreakSomethingElse(unittest.TestCase):
         grouped session -- while REB-0's detail told the reader REB-1 covered
         the rest. It never ran."""
         reqs = [Request(request_id="lone", sent_at=T0, model="claude-opus-5",
-                        usage=self._u(50_000))]
+                        usage=self._u(50_000), target_id="anthropic/direct")]
         p = 100_000
         for t in range(24):
             cold = t % 3 == 0
             reqs.append(Request(
                 request_id=f"s{t}", sent_at=T0 + timedelta(seconds=60 * (t + 1)),
                 model="claude-opus-5", session="s1",
-                usage=self._u(p if cold else 2_000, 0 if cold else p)))
+                usage=self._u(p if cold else 2_000, 0 if cold else p), target_id="anthropic/direct"))
             p += 2_000
         got = {f.code for f in analyze(
             TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="t"),
@@ -987,7 +987,7 @@ class TestREB0IsEmittedOnce(unittest.TestCase):
              "cache_creation": {"ephemeral_5m_input_tokens": 50_000,
                                 "ephemeral_1h_input_tokens": 0}}
         reqs = [Request(request_id=f"r{i}", sent_at=T0, model="claude-opus-5",
-                        usage=u) for i in range(2)]
+                        usage=u, target_id="anthropic/direct") for i in range(2)]
         codes = [f.code for f in analyze(
             TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="t"),
             allow_unreconciled=True).findings]

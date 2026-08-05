@@ -21,6 +21,12 @@ from dataclasses import dataclass
 from enum import Enum
 
 from . import registry
+# One constant, imported rather than copied. The live plugin already refuses to
+# place a marker unless the estimate clears the minimum by this factor
+# (`CachePlugin.minimum_margin` is `ESTIMATOR_WORST_OVERESTIMATE - 1`), and a
+# linter that blesses a prefix the plugin would refuse is the two-standards
+# failure this package exists to find in other people's tools.
+from .segment import ESTIMATOR_WORST_OVERESTIMATE
 
 
 class Status(Enum):
@@ -53,22 +59,79 @@ class Result:
         return s
 
 
-# Uncertainty band for estimated token counts. Inside this margin of a
-# threshold an estimate cannot decide the question, so the check abstains
-# rather than guessing in either direction.
+# The *underestimate* side of a byte-ratio token estimate: how far below the
+# truth it can land. Not measured. It is kept at 10% because being wrong in this
+# direction is cheap and visible -- the check refuses a prefix that would in fact
+# have cached, and somebody sees a marker they were told to skip.
+#
+# It used to be the whole story, applied symmetrically, and that put the
+# unmeasured number on the side where being wrong costs money. See
+# `ESTIMATOR_WORST_OVERESTIMATE` below.
 ESTIMATE_BAND = 0.10
+
+# The overestimate side is measured, and it is 2.81x, not 10%.
+#
+# `segment.ESTIMATOR_WORST_OVERESTIMATE` is the worst *cumulative* overestimate
+# of a byte-ratio estimate against the provider's own tokenizer: median 1.002,
+# p90 1.071, max 2.812, on prefixes rather than single segments because a prefix
+# is what a marker sits on. So an estimate of N tokens is consistent with a true
+# count as low as N / 2.81.
+#
+# Stated with its limits, because this is the number the check now leans on:
+# 2.81 rests on 26 prefixes over six bodies. It is a floor on the estimator's
+# error, not a proof of its bound, and it is used here only to decide when this
+# check may not answer at all -- never to produce a figure.
+#
+# Reproduced before it was changed: `check_minimum(600, 'claude-opus-5')`
+# returned PASS, "600 tokens clears the 512 minimum", while at the measured
+# worst those 600 estimated tokens are 213 real ones. The +-10% band spans
+# 540-660, never straddles 512, and so did not even abstain.
+
+
+def _no_surface_named(check: str, target_id) -> Result | None:
+    """ABSTAIN when the caller named no provider surface.
+
+    `target_id` selects the rate table *and* the capability limits, so a check
+    that answers without one answers for whichever surface a parameter default
+    happened to name. Measured: `check_minimum(768, 'claude-opus-5')` returned
+    PASS against anthropic/direct's 512 minimum and FAIL against openai/direct's
+    1,024 -- the same request, two verdicts, and the caller had chosen neither.
+
+    Default-deny is the package's stated rule: a surface earns first-party rates
+    and first-party limits by being *named*. `UNATTRIBUTED` is the absence of a
+    surface rather than a surface, so it must not satisfy a requirement to name
+    one, and it is checked by value rather than truthiness for exactly the reason
+    `litellm_handler` learned to: that string is truthy.
+    """
+    if target_id and target_id != registry.UNATTRIBUTED:
+        return None
+    return Result(
+        check, Status.ABSTAIN,
+        "no provider surface named, so there is nothing to check against",
+        "Minimums, breakpoint budgets and supported lifetimes are all "
+        "per-surface: the 512-token minimum on anthropic/direct is 1,024 on "
+        "openai/direct, so answering without a surface answers for whichever "
+        "one a default happened to pick.",
+        "pass target_id, for example 'anthropic/direct', 'openai/direct' or "
+        "'amazon-bedrock/converse'")
 
 
 def check_minimum(prefix_tokens: int, model: str,
-                  target_id: str = "anthropic/direct",
+                  target_id: str = registry.UNATTRIBUTED,
                   tokens_are_estimated: bool = True) -> Result:
     """Is the cacheable prefix long enough to cache at all?
 
     Minimums are non-monotonic across generations: 512 on Opus 5, 1024 on
     Opus 4.8, 2048 on Opus 4.7, 4096 on Opus 4.6 and Haiku 4.5. Newer is not
     always lower, so this cannot be reasoned about and has to be looked up.
+
+    They are also non-monotonic *across surfaces*, which is why `target_id` no
+    longer defaults to a named one.
     """
     name = "minimum-cacheable-tokens"
+    unnamed = _no_surface_named(name, target_id)
+    if unnamed is not None:
+        return unnamed
     try:
         minimum = registry.min_cacheable_tokens(target_id, model)
     except registry.RegistryError as e:
@@ -78,34 +141,56 @@ def check_minimum(prefix_tokens: int, model: str,
                       "add the model to the registry with a dated source before relying on this")
 
     if tokens_are_estimated:
-        lo, hi = prefix_tokens * (1 - ESTIMATE_BAND), prefix_tokens * (1 + ESTIMATE_BAND)
-        if lo < minimum < hi:
+        # Asymmetric, because the two directions of the estimator's error cost
+        # different things. Below the true count the check merely refuses a
+        # prefix that would have cached, and somebody sees the marker it told
+        # them to skip. Above it, a marker is placed on a prefix the provider
+        # silently declines to cache: no error, no cache write, and the write
+        # premium billed as usual.
+        lo = prefix_tokens / ESTIMATOR_WORST_OVERESTIMATE
+        hi = prefix_tokens * (1 + ESTIMATE_BAND)
+        if lo < minimum <= hi:
             return Result(
                 name, Status.ABSTAIN,
-                f"estimated {prefix_tokens:,} tokens sits within {int(ESTIMATE_BAND*100)}% of the {minimum:,} minimum",
-                f"estimate spans {int(lo):,}-{int(hi):,}, which straddles the threshold",
+                f"estimated {prefix_tokens:,} tokens cannot be shown to clear "
+                f"the {minimum:,} minimum for {model}",
+                f"the count is a bytes-per-token estimate, measured as much as "
+                f"{ESTIMATOR_WORST_OVERESTIMATE:.2f}x above the real count on a "
+                f"prefix of dense content, so {prefix_tokens:,} estimated tokens "
+                f"span {int(lo):,}-{int(hi):,} real ones and that straddles the "
+                f"threshold. (That factor comes from 26 prefixes over six "
+                f"bodies: a floor on the error, not a proof of its bound.)",
                 "count exactly with the provider's token counter before trusting either answer")
 
     if prefix_tokens < minimum:
         return Result(
             name, Status.FAIL,
-            f"{prefix_tokens:,} tokens is below the {minimum:,} minimum for {model}",
+            f"{prefix_tokens:,} tokens is below the {minimum:,} minimum for "
+            f"{model} on {target_id}",
             "The request will be processed without caching and no error is returned. "
             "cache_creation_input_tokens comes back as 0 and nothing else signals it.",
             f"lengthen the cached prefix past {minimum:,} tokens, or stop paying for a marker that does nothing")
 
     return Result(name, Status.PASS,
-                  f"{prefix_tokens:,} tokens clears the {minimum:,} minimum for {model}")
+                  f"{prefix_tokens:,} tokens clears the {minimum:,} minimum for "
+                  f"{model} on {target_id}")
 
 
-def check_breakpoint_budget(breakpoints: int, target_id: str = "anthropic/direct",
+def check_breakpoint_budget(breakpoints: int,
+                            target_id: str = registry.UNATTRIBUTED,
                             rolling_marker: bool = False) -> Result:
     """Are there more cache markers than the provider accepts?
 
     Exceeding the budget is a hard API error, not a silent degradation, and it
     surfaces in production on long tool-calling turns rather than in testing.
+
+    The budget is a per-surface fact -- four on anthropic/direct, unpublished on
+    openai/direct -- so this abstains rather than defaulting to a surface.
     """
     name = "breakpoint-budget"
+    unnamed = _no_surface_named(name, target_id)
+    if unnamed is not None:
+        return unnamed
     try:
         maximum = registry.capability(target_id, "max_breakpoints")
     except registry.RegistryError as e:
@@ -173,6 +258,9 @@ def check_ttl_ordering(ttls_in_order: list[str], target_id: str,
     remember.
     """
     name = "ttl-ordering"
+    unnamed = _no_surface_named(name, target_id)
+    if unnamed is not None:
+        return unnamed
     try:
         supported = registry.supported_ttls(target_id, model)
     except registry.RegistryError as e:
@@ -237,9 +325,16 @@ def check_ttl_ordering(ttls_in_order: list[str], target_id: str,
 
 def run_all(*, prefix_tokens: int, model: str, breakpoints: int,
             ttls_in_order: list[str] | None = None,
-            target_id: str = "anthropic/direct",
+            target_id: str = registry.UNATTRIBUTED,
             tokens_are_estimated: bool = True,
             rolling_marker: bool = False) -> list[Result]:
+    """All three checks against one surface.
+
+    No default surface, for the reason each check states individually: every
+    threshold below is per-surface, so a caller that named none would otherwise
+    receive three confident answers about a provider it never chose. All three
+    abstain instead, which is the tri-state contract doing its job.
+    """
     return [
         check_minimum(prefix_tokens, model, target_id, tokens_are_estimated),
         check_breakpoint_budget(breakpoints, target_id, rolling_marker),

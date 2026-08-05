@@ -658,7 +658,7 @@ class TestEveryAlertCanBeRendered(unittest.TestCase):
                 usage={"input_tokens": 100, "cache_read_input_tokens": 0,
                        "cache_creation_input_tokens": 6000},
                 segments=[Segment(id=f"s{i}", role="system", tokens=6000, index=0,
-                                  cache_marked=True, ttl="5m")], session="s"))
+                                  cache_marked=True, ttl="5m")], session="s", target_id="anthropic/direct"))
         for a in fired:
             with self.subTest(code=a.code):
                 self.assertIsInstance(str(a), str)

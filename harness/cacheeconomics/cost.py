@@ -12,6 +12,7 @@ negative, and it frequently is on a workload that writes caches nothing reads.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -269,6 +270,70 @@ class Spend:
         return None if h == 0 else 100.0 * self.saving_vs_uncached / h
 
 
+# The three multipliers this cost model is shaped for. Named once because four
+# call sites checked for them independently and two of them checked differently.
+ANTHROPIC_SHAPED_MULTIPLIERS = ("read", "write_5m", "write_1h")
+
+
+def is_multiplier(value) -> bool:
+    """Is this a number a token count may be multiplied by?
+
+    Finite, positive, and not a bool. All four exclusions are here because all
+    four have been measured reaching a published figure.
+
+    `bool` came first. `bool` subclasses `int`, so `isinstance(True, (int,
+    float))` is True and a registry row carrying `write_5m: true` sailed through
+    every numeric guard and priced at 1.0x: one million 5m-write tokens came
+    back $5.00 instead of $6.25, a silent 20% understatement. `read: true` is
+    the same defect inverted -- 1.0x instead of 0.1x makes a cache read cost
+    what fresh input costs, so the allocator models caching as worthless.
+
+    The rest were closed one round later, and the way they were missed is worth
+    recording: this predicate was written *because* `effective_rate` fifty lines
+    below already excluded bool, and only the bool third of that rule was
+    carried across. `effective_rate` rejects bool AND non-finite AND
+    non-positive; this rejected bool. Measured on anthropic/direct with
+    `write_5m` poisoned, all four priced rather than refusing:
+
+        NaN       -> usd = nan          rendered "$nan", and `--format json`
+                                        emits a bare NaN, which is not valid JSON
+        Infinity  -> usd = inf
+        -1.0      -> usd = -5.00        a negative bill
+        0.0       -> usd = 0.00         writes free
+
+    `json.loads` accepts the `NaN` and `Infinity` literals by default, so those
+    two reach the process from a hand-edited registry file without anything
+    malformed being written.
+
+    Zero is refused with the rest, and no registry row is affected: every
+    recorded multiplier is 0.1 or above, checked across all eight rows. A zero
+    write multiplier prices a cache write as free, which is a claim no row
+    should be able to make by accident -- and "the row is corrupt" and "this
+    surface writes for free" would otherwise produce the same $0.00.
+
+    `None` fails on the type check. `read: null` is a real value on
+    openai/direct, and multiplying by it raised a TypeError one layer from the
+    cause instead of a refusal naming the surface.
+    """
+    return (isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(value)
+            and value > 0)
+
+
+def unusable_multipliers(mapping, keys=ANTHROPIC_SHAPED_MULTIPLIERS) -> list:
+    """Which of `keys` are absent, null, or not a usable multiplier.
+
+    Returns names rather than raising, so each caller can refuse in its own
+    idiom: `cost.price` raises because it is where a figure is produced,
+    `tiers._surface` raises `Unsupported` because a plan cannot be scored, and
+    `analyzer._lifetime_multipliers` returns None because a rule that cannot
+    price simply does not run. One predicate, three refusals.
+    """
+    m = mapping if isinstance(mapping, dict) else {}
+    return [k for k in keys if not is_multiplier(m.get(k))]
+
+
 def price(usage: Usage, model: str, target_id: str,
           on_date: str | None = None, effective_rate: float | None = None) -> Spend:
     """Cost this usage.
@@ -332,12 +397,12 @@ def price(usage: Usage, model: str, target_id: str,
     # report. A surface this model cannot price has to say so, so the analyzer
     # can exclude those requests and fail the publication gate the same way it
     # does for an unknown model.
-    missing = [k for k in ("read", "write_5m", "write_1h")
-               if not isinstance(m.get(k), (int, float))]
+    missing = unusable_multipliers(m)
     if missing:
         raise registry.RegistryError(
             f"{target_id} does not record Anthropic-shaped multipliers "
-            f"({', '.join(missing)} absent or null), so this cost model cannot price it. "
+            f"({', '.join(missing)} absent, null or not a number), so this cost "
+            f"model cannot price it. "
             f"Add a target-specific pricing path before analysing this surface.")
     per = rate / 1_000_000
 
@@ -386,13 +451,22 @@ def ratios(usages: list[Usage]) -> dict:
     }
 
 
-def ttl_crossover(target_id: str = "anthropic/direct") -> dict:
+def ttl_crossover(target_id: str) -> dict:
     """Where the one-hour cache is worth its write premium.
 
     Derived from the registry rather than asserted, so it stays correct if a
     provider changes a multiplier. Both boundaries belong to the cache, not the
     price list, so this is model-independent: changing the model rescales the
     money without moving the window.
+
+    `target_id` is required rather than defaulted, and required rather than
+    accepting `UNATTRIBUTED`, because every number below is read out of one
+    surface's row: the lifetimes it offers and its read and write multipliers.
+    A default named `anthropic/direct`, so a caller who never chose a surface
+    was told which lifetime wins on a surface they may not be using -- and
+    deepseek/direct, one row away, offers no 1h lifetime at all. Same reasoning
+    as `registry.base_rate`, which took only model and date until the surface it
+    had erased turned out to decide the answer.
     """
     # Applicability first. An implicit-prefix surface has neither TTLs nor
     # write multipliers, so asking for multipliers before checking would raise
@@ -409,12 +483,12 @@ def ttl_crossover(target_id: str = "anthropic/direct") -> dict:
     # report. A surface this model cannot price has to say so, so the analyzer
     # can exclude those requests and fail the publication gate the same way it
     # does for an unknown model.
-    missing = [k for k in ("read", "write_5m", "write_1h")
-               if not isinstance(m.get(k), (int, float))]
+    missing = unusable_multipliers(m)
     if missing:
         raise registry.RegistryError(
             f"{target_id} does not record Anthropic-shaped multipliers "
-            f"({', '.join(missing)} absent or null), so this cost model cannot price it. "
+            f"({', '.join(missing)} absent, null or not a number), so this cost "
+            f"model cannot price it. "
             f"Add a target-specific pricing path before analysing this surface.")
     return {
         "applicable": True,

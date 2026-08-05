@@ -273,14 +273,35 @@ class CachePlugin:
     # --- the request path -------------------------------------------------
 
     def on_request(self, body: dict, *, model: str,
-                   target_id: str = "anthropic/direct",
+                   target_id: str = UNATTRIBUTED,
                    tenant: str | None = None,
                    session: str | None = None,
                    agent: str = "unknown",
                    markable: frozenset | None = None,
-                   apply: bool = True,
+                   apply: bool = False,
                    at: datetime | None = None) -> tuple[dict, Decision]:
         """Return the body to send, and what was decided about it.
+
+        **Observes by default; mutates only when asked.** `apply` defaults to
+        False, matching `litellm_handler(mutate=False)`, which is the same
+        decision made one layer up and was the only place it was made. A direct
+        integration -- the caller who wires this into their own client rather
+        than into a proxy -- got the opposite default, so the two supported ways
+        of using this package disagreed about whether it rewrites live requests.
+        Rewriting somebody's traffic is a decision they make, not one they
+        inherit from a signature.
+
+        `target_id` has no default surface either, for the same reason and a
+        second one. It selects the minimum cacheable prefix, the supported
+        lifetimes and the breakpoint budget, and it used to name
+        `anthropic/direct` -- so a caller who never chose a surface had markers
+        placed against Anthropic's 512-token minimum while their traffic went to
+        a surface whose minimum is 1,024. A minimum guessed too low is not an
+        error: the provider processes the request uncached, writes nothing,
+        returns no error and bills normally. `UNATTRIBUTED` is the absence of a
+        surface, is not in the registry, and therefore fails every lookup
+        closed -- the plugin stands down with a note rather than acting on a
+        provider nobody named.
 
         `markable` names the segment roles this caller can actually attach a
         marker to. Pass it when the transport cannot carry `cache_control`
@@ -368,7 +389,7 @@ class CachePlugin:
                             segments=as_sent)
 
     def _decide(self, body, segs, scope, target_id, model, markable=None,
-                apply: bool = True, shape_scope=None):
+                apply: bool = False, shape_scope=None):
         """Placement from prior evidence only. Returns `(body, Decision)`."""
         estimated = sum(s.tokens for s in segs)
         if not segs:
@@ -416,7 +437,13 @@ class CachePlugin:
 
         try:
             alloc = tiers.allocate(segs, rates, target_id=target_id,
-                                   model=model, gaps=gaps)
+                                   model=model, gaps=gaps,
+                                   # Intent, passed down rather than re-derived.
+                                   # The allocator refuses to plan a mutation on
+                                   # a surface that does not control caching by
+                                   # explicit breakpoints; a dry run still gets
+                                   # the plan, marked indicative.
+                                   for_mutation=apply)
         except tiers.Unsupported as e:
             return body, Decision(False, reason=str(e), estimated_tokens=estimated)
 
@@ -525,7 +552,13 @@ class CachePlugin:
         """
         from .segment import usage_from_response
         usage = usage_from_response(response) or {}
-        scope = decision.scope or (tenant, target_id or "anthropic/direct", model)
+        # `UNATTRIBUTED`, not a literal surface. The same class of defect as the
+        # parameter defaults above, reached by a different route: a caller who
+        # skipped `on_request` and named no surface had its effectiveness
+        # counters filed under `anthropic/direct`, so measured provider counters
+        # for traffic nobody attributed accumulated against a first-party
+        # surface -- and `effectiveness(scope)` reads that key.
+        scope = decision.scope or (tenant, target_id or UNATTRIBUTED, model)
         alerts = []
         if usage:
             new = self.monitor.observe_usage(Request(

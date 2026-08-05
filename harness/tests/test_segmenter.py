@@ -339,7 +339,7 @@ class TestAlignmentCannotCertifyAPartialOrLossyExport(unittest.TestCase):
 
     def _req(self, rid, segs):
         return Request(request_id=rid, sent_at=T0, model="claude-opus-5",
-                       usage={}, segments=segs)
+                       usage={}, segments=segs, target_id="anthropic/direct")
 
     def _seg(self, i, sid, marked=False, ttl=None):
         return Segment(id=sid, role="system", tokens=10, index=i,
@@ -805,13 +805,13 @@ class TestMalformedCountersCannotBePriced(unittest.TestCase):
                         agent="a", session="s", ttl_requested="5m",
                         usage={"input_tokens": 2_000_000,
                                "cache_read_input_tokens": 0,
-                               "cache_creation_input_tokens": 0}, segments=[]),
+                               "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct"),
                 Request(request_id="evil", sent_at=t0 + timedelta(seconds=60),
                         model="claude-opus-5", agent="a", session="s",
                         ttl_requested="5m",
                         usage={"input_tokens": -1_000_000,
                                "cache_read_input_tokens": 0,
-                               "cache_creation_input_tokens": 0}, segments=[])]
+                               "cache_creation_input_tokens": 0}, segments=[], target_id="anthropic/direct")]
         a = analyze(TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x"),
                     invoice_usd=5.0)
         self.assertFalse(a.reconciliation["within_ship_gate"])
@@ -835,7 +835,7 @@ class TestSplitOnlyWritesReachEveryReader(unittest.TestCase):
         called it "no usage fields" while it carried 200,000 billable tokens."""
         from cacheeconomics.trace import Request, Tier, TraceSet
         r = Request(request_id="r", sent_at=None, model="claude-opus-5",
-                    usage=dict(self.SPLIT_ONLY), segments=[])
+                    usage=dict(self.SPLIT_ONLY), segments=[], target_id="anthropic/direct")
         self.assertTrue(r.has_usage)
         ts = TraceSet(requests=[r], tier=Tier.USAGE_ONLY, source="x")
         self.assertEqual(len(ts.analysable), 1)
@@ -855,7 +855,7 @@ class TestSplitOnlyWritesReachEveryReader(unittest.TestCase):
                                   sent_at=t0 + timedelta(seconds=120 * i),
                                   model="claude-opus-5", agent="main",
                                   session="s", ttl_requested="5m",
-                                  usage=dict(usage), segments=[])
+                                  usage=dict(usage), segments=[], target_id="anthropic/direct")
                           for i in range(14)],
                 tier=Tier.USAGE_ONLY, source="x")
 

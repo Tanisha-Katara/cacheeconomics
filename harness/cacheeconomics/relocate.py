@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from . import registry
 from .allocate import Plan, _place
-from .trace import Request, Segment
+from .trace import UNATTRIBUTED, Request, Segment
 
 # Two authority classes. Within one, order changes instruction priority. Across
 # one, it changes how strongly the model weighs the content at all.
@@ -382,7 +382,27 @@ def propose(reqs: list[Request], volatility: dict, model: str | None = None,
     reordered = observed_reordering(reqs)
     # Derived from the whole group by default. An explicit model/target is a
     # single-scope override for callers that already know the group is uniform.
-    scopes = ([(target_id or "anthropic/direct", model)] if model
+    #
+    # `UNATTRIBUTED`, not `anthropic/direct`. A caller who supplied `model` and
+    # omitted `target_id` had a first-party surface invented for them, and the
+    # surface is what `_authority_mechanism` reads to decide whether
+    # system-authority content may leave the system block at all. So the
+    # override answered a different question from the derived path on identical
+    # requests. Measured, on twelve UNATTRIBUTED claude-opus-5 requests:
+    #
+    #   propose(reqs, vol, model='claude-opus-5')  -> [medium] cross-authority,
+    #       mechanism 'role:system message inside messages[]'
+    #   propose(reqs, vol)                         -> [blocked], "claude-opus-5
+    #       on unknown/unattributed has no recorded authority-preserving
+    #       relocation mechanism"
+    #
+    # The medium one is a recommendation to rewrite a prompt using a mechanism
+    # recorded for one named surface, handed to somebody whose surface nobody
+    # stated. `_authority_mechanism` already refuses an unknown surface -- it
+    # returns (False, "") when `registry.target` raises -- so passing the
+    # absence of a surface through makes the override agree with the derived
+    # path instead of overruling it.
+    scopes = ([(target_id or UNATTRIBUTED, model)] if model
               else scopes_of(reqs))
     order = sorted(segs)
     moves: list[Move] = []
