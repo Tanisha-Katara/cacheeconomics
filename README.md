@@ -3,562 +3,197 @@
 [![ci](https://github.com/Tanisha-Katara/cacheeconomics/actions/workflows/ci.yml/badge.svg)](https://github.com/Tanisha-Katara/cacheeconomics/actions/workflows/ci.yml)
 [![pypi](https://img.shields.io/pypi/v/cacheeconomics)](https://pypi.org/project/cacheeconomics/)
 
-Your provider bills input tokens at four different prices. Fresh input is 1x. A
-cache read is 0.1x. A five-minute cache write is 1.25x. A one-hour write is 2x.
-That is a 20x spread between the cheapest token you can send and the most
-expensive one. Nearly every dashboard adds all four together and shows you a
-single number labelled "input tokens".
+[![Cache is the new cash](docs/assets/cache-is-new-cash.jpg)](https://commodiverus388593.substack.com/p/cache-economics-how-to-stop-paying)
 
-cacheeconomics pulls that number apart. Point it at logs you already have and it
-tells you what each class actually cost, which part of your prompt is sitting in
-the expensive buckets, and how much of that you can get back. It runs on your
-machine and will not print a dollar figure about your traffic that it cannot tie
-to an invoice.
+Local prompt-cache economics for LLM agents.
 
-In one sentence: **cacheeconomics turns a vague "input token" bill into a
-local, evidence-backed fix list for prompt-cache waste.**
+cacheeconomics turns a vague "input tokens" bill into a concrete fix list:
+which tokens were fresh input, which were cache reads, which were cache writes,
+what they cost, and what caching behavior to fix first.
 
-A useful run answers four questions:
-
-- Which tokens were fresh input, cache reads, five-minute writes and one-hour
-  writes?
-- Which cache behaviour is wasting money: expiry, rebuilds, bad marker
-  placement, model switches, tiny prefixes or something else?
-- What is the first change to make?
-- Can the dollar figure be tied to an invoice, or is it only safe to treat as a
-  DRAFT?
-
-## Who it helps
-
-cacheeconomics is for teams whose LLM agents run often enough that prompt-cache
-behaviour has become real money, real latency, or both. It is most useful when
-you already have traces or proxy logs and need to know what to change next.
-
-It is also for individual Claude Code power users and small agent builders: if
-you are vibe-coding across long sessions, running coding agents on loops, or
-building on the Claude API, you already have cache behaviour worth inspecting.
-
-- **Claude Code power users and vibe coders** get a zero-instrumentation way to
-  inspect their own Claude Code history: why usage spiked, whether caching is
-  working, whether compaction or model switches are rebuilding prefixes, and
-  which session pattern to fix first.
-- **Claude API agent builders** get pre-ship and post-ship cache feedback for
-  coding agents, research agents, browser agents and internal tools: minimum
-  checks, TTL choice, marker-placement bake-offs, volatile prompt sections and
-  optional conservative live placement.
-- **Agent engineers** get a diagnosis of why caching is missing: prefixes below
-  the model minimum, cache entries expiring before reuse, volatile prompt
-  sections rebuilding the prefix, model switches that split reuse, or too many
-  breakpoints. Each finding carries a "do this" line instead of stopping at a
-  chart.
-- **Platform and gateway teams** get a local audit path for Claude Code
-  transcripts, LiteLLM logs, request-body exports, Bedrock, Vertex and custom
-  gateways. Surfaces, tenants and tokenizer identities stay explicit, so one
-  customer's traffic does not quietly borrow another surface's assumptions.
-- **FinOps and engineering leadership** get dollar figures only when they
-  reconcile against an invoice, or DRAFT figures clearly labelled as
-  unreconciled. That lets you ask "what can we save?" without handing around
-  numbers that never matched money leaving the account.
-- **Framework maintainers and auditors** get reproducible evidence for
-  cache-marker, token-accounting and TTL bugs in agent frameworks. The repo
-  keeps live experiments, per-call evidence and disclosure verifiers beside the
-  code that produced the claims.
-
-The payoff is concrete: it can tell you that a cron agent is rebuilding a
-five-minute cache every seven minutes, that a marker is below the provider's
-minimum and therefore doing nothing, or that the expensive prompt block is a
-tool schema rather than the prose you were about to trim. It is not trying to be
-a general LLM observability dashboard. It is the tool you run when the question
-is: **which cache behaviour is wasting money, and what should we change first?**
-
-## Three ways to use it
-
-**Diagnose what happened.** Run it on traces you already have. It separates the
-four token classes, explains whether caching is paying for itself, and ranks the
-findings by what the evidence supports.
-
-**Optimize what to ship next.** `cacheeconomics bakeoff` replays the same trace
-against marker-placement policies, and `cacheeconomics checks` works as a CI
-gate for cache configs before they reach production. This is where it answers:
-should this prefix be marked, is it above the model minimum, are there too many
-breakpoints, and does a one-hour TTL actually fit this cadence?
-
-**Implement live placement, carefully.** `CachePlugin` can sit in a request path
-and place cache markers automatically once it has observed enough traffic. It is
-observe-first and opt-in for mutation: it stands down on cold data, existing
-markers, unsafe wire positions, near-minimum token estimates and anything that
-would require moving prompt content. Automatic placement is available; guessing
-on live traffic is not the design.
-
-## What it supports, and what it refuses
-
-cacheeconomics is strongest on Claude/Anthropic-style prompt caching, where the
-provider exposes separate cache read/write counters, prices the token classes
-differently, and gives developers some control over cache markers or TTLs. It
-also understands adjacent surfaces through the registry: Bedrock and Vertex have
-different billing surfaces, OpenAI and DeepSeek have different cache control
-models, and a custom gateway has to say which surface it is fronting.
-
-It does **not** claim to support every model or every kind of caching. Unknown
-models, missing provider facts, unsupported lifetimes, unpriced partner
-surfaces, contested registry rows and self-hosted models with no cache-hit
-accounting are refused or reported as abstentions. That is deliberate: a tool
-that guesses here can publish a beautiful dollar figure no invoice will ever
-match.
-
-DeepSeek is the shape of extension that makes sense. DeepSeek's direct API has
-implicit prefix caching and reports cache-hit and cache-miss input tokens, but
-it does not expose Anthropic-style `cache_control` markers or 5m/1h write
-premiums. So DeepSeek support means hit/miss economics, ordering, routing
-affinity and trace coverage; it does **not** mean placing breakpoints or running
-the Anthropic TTL allocator on that surface.
-
-For open-weight and self-hosted models, support is about the serving stack, not
-the model license. A vLLM, SGLang or custom gateway deployment belongs in the
-registry only when it exposes stable cache semantics, usage counters and rates
-worth auditing.
-
-## Similar projects, and the narrow claim
-
-cacheeconomics is not the first LLM cost tool, and it is not the first LLM
-caching project. [Langfuse](https://langfuse.com/docs/observability/features/token-and-cost-tracking),
-[Helicone](https://docs.helicone.ai/guides/cookbooks/cost-tracking) and
-[Phoenix](https://arize.com/docs/phoenix/tracing/how-to-tracing/cost-tracking)
-already track token usage and cost. [LiteLLM](https://docs.litellm.ai/docs/tutorials/prompt_caching)
-and [Portkey](https://portkey.ai/docs/product/open-source) sit in gateways where
-teams route, price and cache requests. [GPTCache](https://github.com/zilliztech/gptcache)
-and gateway caches can store whole responses or semantic matches.
-
-The narrower claim is the useful one: cacheeconomics is purpose-built for
-provider-side prompt-cache economics. It starts from traces on disk, separates
-fresh input, cache reads, five-minute writes and one-hour writes, refuses
-unsupported registry facts, ties dollars to invoices, and turns marker, TTL,
-minimum-prefix and cadence problems into specific fixes. Use it beside
-observability and gateway tools when the question is not "what happened in
-production?" but **which cache behaviour made this bill worse, and what exact
-prompt-cache change should we try first?**
-
-To be precise about the network, because "runs locally" is the kind of claim
-that quietly stops being true: **the installed package opens no sockets.** It
-imports no network library and a test asserts it, so you can check by grepping
-the wheel. Two things in this repo do reach the network, both deliberately and
-both outside that package: `tier-b/count_tokens.py` sends prompt prefixes to a
-tokenizer, and `tier-b/capture_proxy.py` is a forwarding proxy. Every section
-below that tells you to run one says so.
-
-## Try it in thirty seconds
-
-If you use Claude Code, the data is already on your disk.
+Read the launch essay:
+[Cache Economics: How to Stop Paying](https://commodiverus388593.substack.com/p/cache-economics-how-to-stop-paying).
 
 ```bash
 pip install cacheeconomics
 cacheeconomics claude-code
 ```
 
-Nothing to instrument, no API key, nothing leaves the machine. This is what it
-said about my own history when this README was written. It reads whatever
-transcripts are on the machine, so your numbers and even the finding count will
-differ, and so will mine tomorrow — this is a sample of the shape, not output
-you can reproduce. Section 1 is trimmed:
+If you use Claude Code, that is enough to inspect the transcripts already on
+your machine. No instrumentation, no API key, no network call from the installed
+package.
 
-```
-  cacheeconomics · what your prompt caching actually costs
-  ────────────────────────────────────────────────────────────────────────────
+## Why It Exists
 
-  Your provider charges four different prices for the same token. Sending text
-  fresh costs 1x. Reading it back out of the cache costs 0.1x. Putting it into
-  the cache costs 1.25x, or 2x for the version that survives an hour. Your
-  bill adds all four together and shows you one number called "input tokens".
+LLM dashboards often show one number called "input tokens." For prompt caching,
+that hides the useful part.
 
-  This pulls that number back apart, from logs you already have, and tells you
-  which of the four you have been buying.
+Provider-side prompt caching can price input-like tokens very differently:
 
-── 1 · what I read ───────────────────────────────────────────────────────────
+| token class | typical price shape |
+|---|---:|
+| fresh input | 1x |
+| cache read | 0.1x |
+| 5 minute cache write | 1.25x |
+| 1 hour cache write | 2x |
 
-  volume          14,362 requests over 31 days
-  could be read   14,362 of 14,362 (100%)
-  depth           token counts only. Enough for spend and cadence; the prompts
-                  themselves are not here, so nothing can say which *part* of
-                  a prompt costs you
-  privacy         read on this machine. Nothing was sent anywhere
+That is a 20x spread between the cheapest and most expensive token bucket.
+cacheeconomics separates those buckets and tells you which behavior is wasting
+money: expiry, rebuilds, bad marker placement, model switches, tiny prefixes,
+or TTLs that do not match request cadence.
 
-── 2 · how your caching is doing ─────────────────────────────────────────────
+## What You Get
 
-  Caching is working: most of what gets written to cache is read back before
-  it expires.
+- A local report over Claude Code transcripts, LiteLLM logs, request-body
+  exports, or captured proxy traffic.
+- Cache health metrics, including cache-read share and prefix efficiency.
+- Ranked findings with a concrete "do this" recommendation.
+- Policy bake-offs for marker placement and TTL choices.
+- CI-friendly cache checks before a config ships.
+- Optional live marker placement through `CachePlugin`, observe-first and
+  opt-in for mutation.
 
-  measure             value   in plain english
-  ─────────────────── ──────  ────────────────────────────────────────────────
-  input from cache    97%     of everything you sent, the share billed at the
-                              cheap 0.1x read rate instead of full price
-  prefix efficiency   97%     of every token you paid to put into cache, the
-                              share something read back before it expired.
-                              This is the one that says whether caching is
-                              working
+## Who It Helps
 
-── 3 · what it is costing you — 3 findings, worst first ──────────────────────
+- **Claude Code users and vibe coders** who want to know why usage spiked,
+  whether compaction/model switches are rebuilding prefixes, and which session
+  pattern to fix first.
+- **Claude API agent builders** shipping coding agents, browser agents, research
+  agents, or internal tools.
+- **Platform and gateway teams** running LiteLLM, Bedrock, Vertex, custom
+  gateways, or multi-tenant traffic.
+- **FinOps and engineering leads** who need spend claims tied to evidence.
+- **Framework maintainers and auditors** investigating cache-marker,
+  token-accounting, and TTL bugs.
 
-  FIGURES WITHHELD — no invoice was supplied, so nothing here has been
-  reconciled against money actually spent.
+## Common Commands
 
-  The findings themselves still stand. This is a rule about publishing money,
-  not a doubt about the analysis. Step 1 at the end turns the numbers on.
-
-  #   severity  what it costs  what is happening
-  ─── ───────── ────────────── ────────────────────────────────────────────
-  1   MEDIUM    not costed     Sessions switching model mid-conversation
-      do this   Keep a session on one model. Where a cheaper model is wanted
-                for a sub-task, run it as a separate call rather than
-                switching the main loop.
-      basis     SPL-1 · measured · confidence high · quality risk medium
-
-  2   MEDIUM    not costed     The cached prefix is being rebuilt, not
-                               extended
-      do this   Find what changes the prefix between turns before touching a
-                TTL. Compaction in particular trades a smaller prompt for a
-                full rewrite, and immediately after it every read you were
-                getting at 0.1x is rebought at 1.25x.
-      basis     REB-1 · measured · confidence high · quality risk low
-
-  3   LOW       not costed     Caching is paying for itself
-      do this   No action indicated on this measure. If the bill is still too
-                high, the driver is input volume rather than cache
-                configuration, and the questions are prompt size and turn
-                count.
-      basis     CAC-1 · measured · confidence high · quality risk low
-
-  'not costed' — this rule names a mechanism and does not produce a dollar
-  amount at this depth. Section 1 says what depth you gave it.
-
-  Every row above is the short version. Re-run with --detail for the reasoning
-  behind each one, the counts, and what was excluded from them.
-
-── 4 · what to do next ───────────────────────────────────────────────────────
-
-  1.  Get a dollar figure: re-run with --invoice-usd <amount> from the
-      provider bill covering this window. Every number stays hidden until it
-      reconciles to within 5% of money that actually left an account.
-
-  2.  Or, for an internal look before the bill arrives: add
-      --allow-unreconciled. It releases the figures and stamps the report
-      DRAFT, which is not something to forward.
-
-  3.  Reach the structural findings: this input carries usage counters but not
-      prompt structure, so nothing here can say *which part* of the prompt
-      costs you. Export request bodies from your gateway and re-run with
-      --from bodies, or point the agent at tier-b/capture_proxy.py if you
-      cannot export.
-
-  4.  Act on SPL-1 first (sessions switching model mid-conversation). It is
-      the highest-severity finding here, and the 'do this' line in its row is
-      the change to make. Re-run with --detail for the reasoning behind it.
-
-  5 note(s) on provenance and coverage are printed with --detail.
-```
-
-It always closes on numbered next steps chosen from what that particular run
-could not do, so you never have to guess what to type after it. `--detail` puts
-the reasoning back under each row.
-
-Give it your invoice and the money column fills in:
-
-```bash
-cacheeconomics claude-code --invoice-usd 4820.16
-```
-
-```
-  #   severity  what it costs  what is happening
-  ─── ───────── ────────────── ────────────────────────────────────────────
-  1   HIGH      ~$214/mo       'research-agent' request cadence sits inside
-                               the one-hour window
-      do this   Set a one-hour TTL on the static prefix for this agent.
-                Outside the five-minute-to-one-hour band the five-minute
-                default is cheaper, so this is not a blanket change.
-      basis     TTL-1 · modeled · confidence medium · quality risk low
-```
-
-## What the clock does to your bill
-
-This is the finding I did not expect, and it is the one worth stealing whether or
-not you ever install this.
-
-I ran [browser-use](https://github.com/browser-use/browser-use) 0.13.7 on one
-task at five different schedules, captured every real request through a
-forwarding proxy, and counted the tokens against the provider's own tokenizer.
-Same code, same task, same prompts. The only thing I changed was how often it
-ran.
-
-| schedule | cache writes per request |
+| what you have | command |
 |---|---|
-| back to back, ~7s apart | 39 |
-| every 2 minutes | 536 |
-| every 7 minutes | 3,597 |
-| every 10 minutes | 4,109 |
-| every 15 minutes | 3,417 |
-
-A hundredfold jump between two minutes and seven, because a five-minute cache
-entry survives five minutes. Faster than that and the agent reads its cache.
-Slower and it rebuilds the whole thing, every single run, forever, paying a
-premium for a cache it never once reads.
-
-Turning those rewrites into reads is worth 13–17% of input spend on the three
-slow schedules and nothing at all on the fast two. If your agent runs on a cron,
-this is probably happening to you right now and no dashboard you own will show
-it.
-
-The write-up, including [the part of my own prediction the data
-refuted](case-studies/schedule-decides-your-cache-bill.md), is in
-`case-studies/`. Raw per-call rows are in `tier-b/evidence/`.
-
-## Two more ways this leaks
-
-**A cache marker below the minimum does nothing, and nobody tells you.** The
-threshold is 512, 1024, 2048 or 4096 tokens depending on the model, and it does
-not track model generation the way you would guess: `claude-opus-5` is 512,
-`claude-opus-4-6` is 4096. Under it, the provider processes your request
-uncached, writes nothing, returns `cache_creation_input_tokens: 0`, and raises no
-error. I found four of these in the browser-use run.
-
-**The one-hour cache only wins inside a band.** It costs 2x to write where the
-short one costs 1.25x, so it pays only when requests are more than five minutes
-and less than an hour apart. I measured this on live API calls: $0.190 for the 5m
-arm against $0.114 for the 1h arm on the same prefix, 40.2% cheaper, with all
-eight probes matching predictions written down before the run.
-
-## What you can point it at
-
-| what you have | how to run it | what you get |
-|---|---|---|
-| Claude Code transcripts | `cacheeconomics claude-code` | spend, ratios, rebuild and lifetime findings |
-| LiteLLM proxy logs | `cacheeconomics analyze log.jsonl --from litellm` | the same, across every model your proxy sees |
-| request bodies from your gateway | `cacheeconomics analyze bodies.jsonl --from bodies` | plus *which part* of the prompt costs you |
-| an agent you did not write | `tier-b/capture_proxy.py` | the same as bodies, no code change |
+| Claude Code history | `cacheeconomics claude-code` |
+| LiteLLM proxy logs | `cacheeconomics analyze log.jsonl --from litellm` |
+| gateway request bodies | `cacheeconomics analyze bodies.jsonl --from bodies` |
+| policy bake-off | `cacheeconomics bakeoff trace.jsonl --by-agent` |
+| CI cache check | `cacheeconomics checks --target-id anthropic/direct --prefix-tokens 900 --model claude-opus-5 --breakpoints 5` |
+| registry summary | `cacheeconomics registry` |
 
 `--from bodies` needs `CACHEECONOMICS_HMAC_KEY` or `--key-file`, because segment
-ids are keyed hashes of prompt content. That is a privacy boundary, not a setup
-tax: the tool refuses to write bare prompt digests.
+ids are keyed hashes of prompt content. The tool refuses bare prompt digests.
 
-The last row is how the browser-use measurement was done. Most agents let you
-point them at a different base URL, because that is how people use gateways, and
-that is all you need:
+For Bedrock, Vertex, or another partner-operated surface, pass the surface and
+your effective rate from the bill:
 
 ```bash
-python3 tier-b/capture_proxy.py --out run.jsonl --port 8787 &
-# start the agent with its base URL set to http://127.0.0.1:8787
+cacheeconomics analyze trace.jsonl \
+  --target-id amazon-bedrock/converse \
+  --effective-rate 1.10
 ```
 
-It forwards every request byte for byte and writes each one down with its
-response. Nothing is mutated, so you are measuring the agent rather than
-measuring an agent with something in its path.
+## What It Can Find
 
-The file you supply decides what the tool will claim, and it works that out from
-the contents rather than from what you tell it. An export cannot ask for more
-confidence than it earns.
+- A cron agent rebuilding a five-minute cache every seven minutes.
+- A cache marker below the model's minimum prefix size.
+- A static tool schema sitting in an expensive write bucket.
+- A model switch splitting cache reuse.
+- A one-hour TTL that only helps inside the five-minute-to-one-hour reuse band.
+- Prompt sections that change too early and invalidate everything after them.
 
-## Other things it does
+The schedule effect is the clearest example: in the browser-use case study,
+moving from a two-minute cadence to a seven-minute cadence turned cache writes
+from hundreds of tokens per request into thousands, because the five-minute
+cache expired before reuse. The full write-up is in
+[case-studies/schedule-decides-your-cache-bill.md](case-studies/schedule-decides-your-cache-bill.md).
+
+## Live Placement
+
+`CachePlugin` can sit inside a LiteLLM proxy and place cache markers on outgoing
+requests.
+
+It is conservative by default:
+
+- observes before mutating
+- never double-injects existing markers
+- stands down on cold data
+- stands down near model minimums
+- stands down on unsupported or contested registry rows
+- does not move prompt content
+
+Install the optional dependency only when mounting the live plugin:
 
 ```bash
-# compare cache placement policies over the same requests
-cacheeconomics bakeoff trace.jsonl --by-agent
-
-# check a cache config before you ship it. works as a CI gate
-cacheeconomics checks --target-id anthropic/direct --prefix-tokens 900 --model claude-opus-5 --breakpoints 5
-
-# what does this build actually know about pricing?
-cacheeconomics registry
-
-# Bedrock or Vertex: the rate comes off your cloud bill, not from me
-cacheeconomics analyze trace.jsonl --target-id amazon-bedrock/converse --effective-rate 1.10
+pip install "cacheeconomics[litellm]"
 ```
 
-`checks` exits 0 for pass and 2 for fail, and 3 when nothing failed but something
-could not be evaluated, usually a model with no dated registry entry. That third
-code exists because "I did not check" is not "this passed", and collapsing them
-gives you a green build where the check that catches silently-ignored cache
-markers never ran.
+## Support Boundaries
 
-## Counting the tokens
+cacheeconomics is strongest on Claude/Anthropic-style prompt caching, where the
+provider exposes separate cache read/write counters and developers can control
+markers or TTLs.
 
-Skip this and you still get every finding. You just will not get dollar figures
-on the ones about prompt structure. Here is why.
+It does not claim every model or every cache is the same thing:
 
-To say "34,000 tokens sit behind that volatile block", the tool has to know how
-many tokens each part of your prompt is worth, and it cannot count them locally.
-There is no local tokenizer for these models. So by default it takes the input
-total your provider billed and splits it between segments in proportion to their
-bytes.
+- Anthropic direct, Bedrock, and Vertex are separate billing/control surfaces.
+- OpenAI and DeepSeek have different cache-control models.
+- DeepSeek-style support means hit/miss economics, not Anthropic breakpoint
+  placement.
+- Open-weight or self-hosted support depends on the serving stack exposing
+  stable cache semantics, usage counters, and rates.
+- Unknown or contested registry facts become abstentions, not guesses.
 
-That split is worse than it sounds: 19.2% off at the median, 181% at worst.
-Bytes-per-token is not one number. Dense JSON tool schemas run about 2.74 bytes
-per token where English prose runs 5.22. A prompt mixing them, which is every
-agent prompt, over-allocates the prose and starves the tools at the same time.
-
-Counting properly is one command, and it is the default:
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-python3 tier-b/run_diagnostic.py bodies.jsonl --invoice-usd 4820.16
-```
-
-That counts, then analyses. **It sends prompt content to a tokenizer** — see the
-three notes below before you run it.
-
-Against the same tokenizer the split error effectively disappears, which is the
-whole point of counting rather than estimating. I have not committed an artifact
-measuring the residual the way `inferred-token-split.json` measures the 19.2%,
-so treat "near zero" as the claim and the 19.2% as the measured one.
-It is free, because the endpoint costs nothing and the work caches on the
-prefix. A prefix that is not shared is not being cached in the first place, so
-one count covers every request that shares it. On the demo trace, 286 requests
-needed 345 calls, and a second run costs nothing at all.
-
-It does send prompt content to a tokenizer, and you pick which one. `--endpoint`
-points it at your own gateway. To see exactly what it would send before agreeing
-to any of it:
-
-```bash
-python3 tier-b/count_tokens.py bodies.jsonl -o counted.jsonl --dry-run
-```
-
-That reports the call count and the host and sends nothing. It writes nothing
-either, deliberately. An earlier version wrote an output file full of zeroes
-that the analyzer then read as exact counts, which is exactly the kind of
-confident wrong answer the rest of this exists to refuse.
-
-`--estimate-only` skips it entirely.
-
-It is a separate script rather than a flag because the installed package imports
-no network library at all and a test asserts it. Zero egress is what a client is
-trusting when they hand over a trace, and they can check it by grepping the
-wheel. A flag would have made that claim depend on reading the flag's
-implementation.
-
-## What it refuses to tell you
-
-**No invoice, no dollars.** Every figure stays hidden until it reconciles to
-within 5% of money that actually left your account. `--allow-unreconciled`
-releases them for internal drafts and stamps the report DRAFT.
-
-**Structure and usage have to agree.** Spend comes from usage counters,
-structural findings from segment sizes. If those two descriptions of the same
-prompt disagree by more than 5%, you get the findings without their dollar
-figures.
-
-**Coverage is measured in money, not rows.** A structural claim needs to cover
-90% of your billed tokens before a figure attaches. Nine small structured
-requests next to one huge unstructured one is 90% of rows and can be 8% of the
-bill.
-
-**Bedrock and Vertex are not priced here.** AWS and Google operate and invoice
-those, so those rates are not mine to publish and I do not borrow Anthropic's.
-Pass `--effective-rate` from your own bill. That is the better number anyway:
-partner rates vary by region and endpoint, and nobody at volume pays list.
-
-**Every number says what kind of number it is.** Measured means observed in usage
-fields. Modeled means projected, always as a range, with the pessimistic end as
-the headline. Verified means observed in production after a change shipped.
-Nothing gets promoted between them quietly.
+This is not a replacement for observability platforms such as Langfuse,
+Helicone, Phoenix, LiteLLM, Portkey, or GPTCache. It is narrower: a local tool
+for provider-side prompt-cache economics and the concrete cache changes to try
+first.
 
 ## Privacy
 
-Everything runs locally. Nothing in the package opens a socket, the registry is
-packaged data, every input is a path on your disk.
+The installed package opens no sockets. It imports no network library, and CI
+tests that claim.
 
-Prompt text is optional. Hashes, structure and token counts are enough for every
-finding here. Segment identifiers are keyed HMAC-SHA-256 rather than bare
-digests, because a bare digest of a short policy line is confirmable by anyone
-holding a guess. There is deliberately no `--key` flag: `argv` shows up in `ps`
-and lands in shell history, so the key comes from `CACHEECONOMICS_HMAC_KEY` or a
-`--key-file` whose permissions get checked before it is read.
+Network-touching tools are separate and explicit:
 
-Keying and scoping are different things, and the difference matters on a shared
-gateway. A key stops someone guessing your content. It does nothing about
-equality, which is the whole job of an identifier: under one key, identical text
-produces an identical id no matter who sent it. So identity is scoped to the
-tenant too. Pass `--tenant` on a multi-tenant export and two tenants sending the
-same policy block stop sharing an id. That is also the arithmetically correct
-answer, since caches are isolated per tenant and those requests could never have
-shared an entry.
+- `tier-b/count_tokens.py` sends prompt prefixes to a tokenizer.
+- `tier-b/capture_proxy.py` is a forwarding proxy for measurement.
 
-## What is in here
+Prompt text is optional. Hashes, structure, and token counts are enough for the
+main findings. Segment identifiers are keyed HMAC-SHA-256, and multi-tenant
+identity can be scoped with `--tenant`.
 
-```
-harness/cacheeconomics/
-  registry.py   dated capability and pricing registry, refuses to guess
-  cost.py       the four token classes, date-effective pricing
-  money.py      a dollar figure that cannot be printed until it is released
-  trace.py      ingest, tiering, reconciliation
-  analyzer.py   the finding rules (EFF-1, VOL-1, MIN-1, TTL-1, TTL-2, REB-1, ...)
-  report.py     text and self-contained HTML
-  simulate.py   replay a trace against a modelled cache; the policy bake-off
-  allocate.py   placement policies, including a model of LiteLLM auto-injection
-  tiers.py      the DP tier allocator and an exact evaluator that agrees with it
-  monitor.py    runtime diagnostics, bounded state
-  plugin.py     a gateway plugin that decides inside the request path
-  recorder.py   instrumented capture
-  segment.py    the single traversal of a request body
-  cli.py        the commands above
-  data/         providers.json, pricing.json
+## Repository Map
 
-web/            a browser demo; the analyzer runs in a worker via Pyodide
-tier-a/         static findings on three open-source agents, cited to file and line
-tier-b/         the live experiments and their per-call evidence
-case-studies/   the browser-use write-up
-disclosure/     findings as filed against the projects they affect
-contrib/        upstream contributions (BerriAI/litellm#35011)
+```text
+harness/cacheeconomics/  package source
+web/                     browser demo bundle
+tier-a/                  static findings on open-source agents
+tier-b/                  live experiments and evidence rows
+case-studies/            narrative write-ups
+disclosure/              upstream disclosures and verifiers
+contrib/                 upstream contribution material
 ```
 
-Only `harness/` ships in the wheel. The measurement work stays here, where you
-can check it: `tier-a/FINDINGS.md` cites a file and line for every claim and logs
-its own correction where the first screen was wrong, and `tier-b/evidence/` holds
-the per-call rows behind the 40.2% number, including one run that reports
-`script_sha256: null` because it predates run-time hashing.
-
-Eight provider surfaces are described. The recorded rates are Anthropic
-first-party list prices and the table names which surfaces they are valid for.
-The scope is default-deny, so a surface earns those rates by being named rather
-than by being absent from an exclusion list. That is not theoretical: before the
-scope existed, a Bedrock trace priced straight off the Anthropic table and
-produced a confident total no AWS bill would ever match.
-
-## Running it live
-
-`plugin.py` can sit inside a LiteLLM proxy and place cache markers on outgoing
-requests. It observes by default and only mutates when you ask.
-
-The worry was that LiteLLM normalises Anthropic-shaped bodies through an
-OpenAI-shaped intermediate and drops `cache_control`, which would give you churn
-and no cache writes while the plugin's own counters cheerfully reported
-placements that never arrived. It does not. On litellm 1.83.9, an unmarked
-control writes nothing, a marked call writes 15,624 tokens, the same body a
-moment later reads all 15,624 back, and a request routed through the handler with
-`mutate=True` writes too. The runs are in
-`tier-b/evidence/litellm-marker-survival.json` and the script starts cold each
-time, so you can repeat it.
-
-`mutate` still defaults to False. Knowing the mechanism works is not the same as
-deciding to rewrite somebody's live traffic, and that second decision is yours.
+Only `harness/` ships in the wheel. Evidence and experiments stay in the repo
+for auditability.
 
 ## Development
 
 ```bash
 git clone https://github.com/Tanisha-Katara/cacheeconomics.git
-cd cacheeconomics && pip install .
+cd cacheeconomics
+pip install .
 
-python3 -m pytest -q          # no services or API keys
-python3 web/build_bundle.py   # after changing anything under harness/cacheeconomics
+python3 -m pytest -q
+python3 web/build_bundle.py   # after changing harness/cacheeconomics
 ```
 
-Python 3.9 or newer and nothing else. CI runs the suite on 3.9 and 3.13 with only
-pytest installed, so an accidental dependency fails the build rather than
-shipping. `pip install "cacheeconomics[litellm]"` only if you are mounting the
-live proxy plugin.
+Python 3.9 or newer. The package has no runtime dependencies. CI runs on Python
+3.9 and 3.13 with only `pytest` installed.
 
 Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md). Security reports
 and accidental egress concerns belong in the private flow described in
 [SECURITY.md](SECURITY.md), not in public issues.
 
+Known limitations are tracked in [PENDING.md](PENDING.md).
+
 ## License
 
 Apache-2.0. Copyright 2026 KCG Consulting LLC.
-</content>
