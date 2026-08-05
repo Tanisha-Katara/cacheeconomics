@@ -15,6 +15,29 @@ the expensive buckets, and how much of that you can get back. It runs on your
 machine and will not print a dollar figure about your traffic that it cannot tie
 to an invoice.
 
+In one sentence: **cacheeconomics turns a vague "input token" bill into a
+local, evidence-backed fix list for prompt-cache waste.**
+
+## Who it helps
+
+cacheeconomics is for teams whose LLM agents run often enough that prompt-cache
+behaviour has become real money, real latency, or both. It is most useful when
+you already have traces or proxy logs and need to know what to change next.
+
+| who you are | what cacheeconomics gives you |
+|---|---|
+| Agent engineers | A diagnosis of why caching is missing: prefixes below the model minimum, cache entries expiring before reuse, volatile prompt sections rebuilding the prefix, model switches that split reuse, or too many breakpoints. Each finding carries a "do this" line instead of stopping at a chart. |
+| Platform and gateway teams | A local audit path for Claude Code transcripts, LiteLLM logs, request-body exports, Bedrock, Vertex and custom gateways. Surfaces, tenants and tokenizer identities are kept explicit so one customer's traffic does not quietly borrow another surface's assumptions. |
+| FinOps and engineering leadership | Dollar figures only when they reconcile against an invoice, or DRAFT figures clearly labelled as unreconciled. That lets you ask "what can we save?" without handing around numbers that never matched money leaving the account. |
+| Framework maintainers and auditors | Reproducible evidence for cache-marker, token-accounting and TTL bugs in agent frameworks. The repo keeps live experiments, per-call evidence and disclosure verifiers beside the code that produced the claims. |
+
+The payoff is concrete: it can tell you that a cron agent is rebuilding a
+five-minute cache every seven minutes, that a marker is below the provider's
+minimum and therefore doing nothing, or that the expensive prompt block is a
+tool schema rather than the prose you were about to trim. It is not trying to be
+a general LLM observability dashboard. It is the tool you run when the question
+is: **which cache behaviour is wasting money, and what should we change first?**
+
 To be precise about the network, because "runs locally" is the kind of claim
 that quietly stops being true: **the installed package opens no sockets.** It
 imports no network library and a test asserts it, so you can check by grepping
