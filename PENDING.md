@@ -256,9 +256,9 @@ public registry API and no track owned it this round.
 
 ---
 
-## 11. FIVE BRANCHES COMPLETE AND UNVERIFIED EXTERNALLY
+## 11. FIVE BRANCHES MERGED WITHOUT EXTERNAL VERIFICATION
 
-**Status: not merged. Do not merge without reading this entry.**
+**Status: MERGED at `caa77f8`, on an explicit decision, unverified.**
 
 Five worktree branches carry substantial fixes. Every one is committed, tested
 and self-reported as complete. **None has passed a clean external review**, and
@@ -358,3 +358,59 @@ constants. Verified that `parse_constant` closes it.
 (`allow_contested`), and this is a different concern in the same file. Track B
 found it, guarded every consumer it owns, and correctly declined to edit a file
 outside its remit.
+
+---
+
+## 13. THE MERGE ITSELF IS UNVERIFIED — read before trusting any figure
+
+All five tracks were merged at `caa77f8`. **No part of that work passed a clean
+external adversarial review, and the merged result has had none at all.**
+
+### What was actually verified
+
+- **1735 tests pass, exit 0**, up from a 1327 baseline. Every track's own
+  revert-proofs bit, per its report.
+- The three disclosure verifiers exit 0; generated fixtures are byte-identical.
+- Four cross-track seams were found and fixed during the merge, none of them a
+  textual conflict. Each track was individually correct and the composition was
+  not — which is precisely the class a per-track review cannot see, and the
+  reason the final review was specified.
+
+### What was NOT verified, and why it matters
+
+1. **No track ever returned a clean review.** 49 scoped reviews; every one found
+   at least one real defect. The last verdict on every track was
+   `needs-attention`. The findings were fixed, and the fixes were not re-reviewed.
+2. **Every track's final round is unreviewed.** The external reviewer hit its
+   usage limit (resets 2026-08-11) after Track B's round 9. Everything after
+   that — including Track D's two HIGH egress findings, Track A's poison-test
+   rework, Track C's predicate split and Track E's DRAFT rendering — rests on
+   the tracks' own reports and my reading of them.
+3. **The merged result has had no review.** Item 11 called this out as the one
+   review covering what per-track reviews structurally cannot. It did not run.
+   Four seams were caught by the suite; there is no evidence about seams the
+   suite does not model.
+4. **The base rate is the argument.** In this round, work that looked complete
+   was wrong on the first review **49 times out of 49**. Nothing about the last
+   round makes it different in kind — only unexamined.
+
+### Concrete things a reviewer should attack first
+
+- **`cacheeconomics claude-code` now REFUSES** without `--target-id` or
+  `--assume-anthropic-direct`. A deliberate change to a shipped command's
+  default behaviour, unreviewed.
+- **`is_multiplier` now refuses `0`**, beyond the reported defect. Justified
+  because all eight registry rows carry 0.1+; wrong if a surface ever prices a
+  token class at zero, and the message would call the row corrupt.
+- **`--tokenizer-id` is effectively required** for counts to load as exact. The
+  tool now says so before spending egress, but it is a workflow change.
+- **Track D edited 5 fixtures in two other tracks' test files** (26 insertions,
+  0 deletions, no assertion altered — I verified). Additive, and cross-track.
+- **The four seams I fixed during the merge** were fixed by me, alone, at the
+  moment no checker was available. They are the least-examined code here.
+
+### What to do when the reviewer returns
+
+Run the final merged review specified in item 11. Treat this entry as open until
+it comes back and its findings are closed. `pre-merge-baseline` tags the last
+externally-sane state if a clean revert is ever wanted.
