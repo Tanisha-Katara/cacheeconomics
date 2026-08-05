@@ -38,6 +38,25 @@ tool schema rather than the prose you were about to trim. It is not trying to be
 a general LLM observability dashboard. It is the tool you run when the question
 is: **which cache behaviour is wasting money, and what should we change first?**
 
+## Three ways to use it
+
+**Diagnose what happened.** Run it on traces you already have. It separates the
+four token classes, explains whether caching is paying for itself, and ranks the
+findings by what the evidence supports.
+
+**Optimize what to ship next.** `cacheeconomics bakeoff` replays the same trace
+against marker-placement policies, and `cacheeconomics checks` works as a CI
+gate for cache configs before they reach production. This is where it answers:
+should this prefix be marked, is it above the model minimum, are there too many
+breakpoints, and does a one-hour TTL actually fit this cadence?
+
+**Implement live placement, carefully.** `CachePlugin` can sit in a request path
+and place cache markers automatically once it has observed enough traffic. It is
+observe-first and opt-in for mutation: it stands down on cold data, existing
+markers, unsafe wire positions, near-minimum token estimates and anything that
+would require moving prompt content. Automatic placement is available; guessing
+on live traffic is not the design.
+
 To be precise about the network, because "runs locally" is the kind of claim
 that quietly stops being true: **the installed package opens no sockets.** It
 imports no network library and a test asserts it, so you can check by grepping
