@@ -750,7 +750,7 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
     # Cost before title, deliberately. The first question anybody brings to this
     # is "where is the money going", so the money column sits where the eye
     # lands rather than at the far right of a wrapped title.
-    _c = [4, 10, 15, _WIDTH - 33]
+    _c = [4, 10, 24, _WIDTH - 42]
     out += _cols([("#", "severity", "what it costs", "what is happening"),
                   ("─" * 3, "─" * 9, "─" * 14, "─" * (_c[3] - 1))], _c)
     for i, f in enumerate(a.findings, 1):

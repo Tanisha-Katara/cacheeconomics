@@ -116,6 +116,24 @@ def _no_surface_named(check: str, target_id) -> Result | None:
         "'amazon-bedrock/converse'")
 
 
+def _contested_result(check: str, target_id: str, err: Exception,
+                      inspect=None) -> Result:
+    detail = str(err)
+    try:
+        if inspect is not None:
+            inspect()
+    except registry.RegistryError as e:
+        detail += f" After inspecting the contested row: {e}"
+    return Result(
+        check, Status.ABSTAIN,
+        f"{target_id} is flagged contested, so this check cannot treat its "
+        f"registry row as fact",
+        detail,
+        "settle the contested row against a dated source before relying on "
+        "this check; if the inspected row also lacks the needed value, record "
+        "that value separately")
+
+
 def check_minimum(prefix_tokens: int, model: str,
                   target_id: str = registry.UNATTRIBUTED,
                   tokens_are_estimated: bool = True) -> Result:
@@ -134,6 +152,11 @@ def check_minimum(prefix_tokens: int, model: str,
         return unnamed
     try:
         minimum = registry.min_cacheable_tokens(target_id, model)
+    except registry.ContestedRow as e:
+        return _contested_result(
+            name, target_id, e,
+            lambda: registry.min_cacheable_tokens(
+                target_id, model, allow_contested=True))
     except registry.RegistryError as e:
         return Result(name, Status.ABSTAIN,
                       f"no minimum recorded for {model} on {target_id}",
@@ -193,6 +216,11 @@ def check_breakpoint_budget(breakpoints: int,
         return unnamed
     try:
         maximum = registry.capability(target_id, "max_breakpoints")
+    except registry.ContestedRow as e:
+        return _contested_result(
+            name, target_id, e,
+            lambda: registry.capability(
+                target_id, "max_breakpoints", allow_contested=True))
     except registry.RegistryError as e:
         return Result(name, Status.ABSTAIN, f"no breakpoint budget recorded for {target_id}", str(e))
 
@@ -263,6 +291,11 @@ def check_ttl_ordering(ttls_in_order: list[str], target_id: str,
         return unnamed
     try:
         supported = registry.supported_ttls(target_id, model)
+    except registry.ContestedRow as e:
+        return _contested_result(
+            name, target_id, e,
+            lambda: registry.supported_ttls(
+                target_id, model, allow_contested=True))
     except registry.RegistryError as e:
         return Result(name, Status.ABSTAIN,
                       f"no TTL support recorded for {target_id}", str(e),

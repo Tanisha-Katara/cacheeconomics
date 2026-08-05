@@ -329,6 +329,15 @@ class TestMinimumAndBudget(unittest.TestCase):
         alerts = Monitor().observe(req(0, segs))
         self.assertIn("RT-BUDGET", [a.code for a in alerts])
 
+    def test_exceeding_the_marker_budget_is_an_error_not_headroom_pressure(self):
+        segs = [sg(i, "system", 3000, f"s{i}", marked=True, ttl="5m")
+                for i in range(5)]
+        alert = next(a for a in Monitor().observe(req(0, segs))
+                     if a.code == "RT-BUDGET")
+        self.assertEqual("high", alert.severity)
+        self.assertIn("exceeds", alert.summary)
+        self.assertIn("request-level error", alert.detail)
+
     def test_headroom_stays_quiet(self):
         segs = [sg(i, "system", 3000, f"s{i}", marked=True, ttl="5m") for i in range(2)]
         self.assertNotIn("RT-BUDGET", [a.code for a in Monitor().observe(req(0, segs))])
@@ -1004,6 +1013,22 @@ class TestARegistryLookupItCannotMakeIsSaidAloud(unittest.TestCase):
         self.assertEqual([], silent,
                          "these are recorded as null and disable a check with "
                          "no alert: " + ", ".join(silent))
+
+    def test_the_same_missing_key_is_not_deduped_across_different_checks(self):
+        r = req(0, STABLE)
+        blocked = monitor._RegistryReads()
+        blocked.unanswered = {
+            "min_cacheable_tokens": (
+                {monitor._NOT_RECORDED}, {"RT-BLOCKED (inactive)"})}
+        below_min = monitor._RegistryReads()
+        below_min.unanswered = {
+            "min_cacheable_tokens": (
+                {monitor._NOT_RECORDED}, {"RT-MIN (inactive)"})}
+        self.assertNotEqual(
+            Monitor._nosurface(r, ("scope",), blocked).subject,
+            Monitor._nosurface(r, ("scope",), below_min).subject,
+            "a later check using the same missing registry key would be "
+            "suppressed as a duplicate")
 
     def test_the_alert_names_the_key_and_what_it_costs(self):
         """"Some checks are inactive" is not actionable. The reader needs the

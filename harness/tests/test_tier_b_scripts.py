@@ -341,8 +341,8 @@ class _CountStub(http.server.BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
-class TestTheDefaultPathCounts(unittest.TestCase):
-    """Counting was correct and optional, and optional meant skipped.
+class TestTheDiagnosticCountsOnlyWhenItCanProduceExactEvidence(unittest.TestCase):
+    """Counting is on by default only after the tokenizer deployment is named.
 
     The earlier version of this class asserted that `--estimate-only` appeared
     in `--help` and `--count-tokens` did not. That is help text, not behaviour:
@@ -385,20 +385,28 @@ class TestTheDefaultPathCounts(unittest.TestCase):
             env=dict(os.environ, ANTHROPIC_API_KEY="test",
                      CACHEECONOMICS_HMAC_KEY="k" * 32))
 
-    def test_counting_happens_without_being_asked_for(self):
-        r = self._run()
+    def test_counting_happens_when_a_tokenizer_identity_is_supplied(self):
+        r = self._run("--tokenizer-id", "stub-1")
         self.assertGreater(_CountStub.hits, 0,
-                           f"the default path never counted.\n{r.stderr[-500:]}")
+                           f"the identity-backed path never counted.\n"
+                           f"{r.stderr[-500:]}")
+
+    def test_default_analysis_does_not_spend_counting_egress(self):
+        r = self._run()
+        self.assertEqual(_CountStub.hits, 0,
+                         f"the wrapper counted without --tokenizer-id.\n"
+                         f"{r.stderr[-500:]}")
+        self.assertIn("--tokenizer-id", r.stderr)
 
     def test_estimate_only_actually_skips_it(self):
-        r = self._run("--estimate-only")
+        r = self._run("--tokenizer-id", "stub-1", "--estimate-only")
         self.assertEqual(_CountStub.hits, 0,
                          f"--estimate-only still counted.\n{r.stderr[-500:]}")
         self.assertIn("counting skipped", r.stderr)
 
     def test_the_counted_output_carries_segment_tokens(self):
         """The point of counting: sizes the analyzer can attach money to."""
-        self._run()
+        self._run("--tokenizer-id", "stub-1")
         out = self.src.replace(".jsonl", "-counted.jsonl")
         self.assertTrue(os.path.exists(out), "no counted export was written")
         rows = [json.loads(l) for l in open(out) if l.strip()]
@@ -643,17 +651,17 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
                                   "ephemeral_1h_input_tokens": 0}}}) + "\n")
         return p
 
-    def _analyse(self, tmp):
+    def _analyse(self, tmp, target_id=None):
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "sweep_report_under_test", os.path.join(TIER_B, "sweep_report.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        return mod.analyse(self._bodies(tmp))
+        return mod.analyse(self._bodies(tmp), target_id=target_id)
 
     def test_the_result_declares_it_is_unreconciled(self):
         with tempfile.TemporaryDirectory() as tmp:
-            got = self._analyse(tmp)
+            got = self._analyse(tmp, target_id="anthropic/direct")
         if "error" in got:
             self.fail(f"sweep analyse failed: {got['error']}")
         self.assertIs(got.get("unreconciled"), True)
@@ -662,7 +670,7 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
 
     def test_the_gate_reason_names_what_released_the_figures(self):
         with tempfile.TemporaryDirectory() as tmp:
-            got = self._analyse(tmp)
+            got = self._analyse(tmp, target_id="anthropic/direct")
         if "error" in got:
             self.fail(got["error"])
         self.assertIn("unreconciled", (got.get("gate") or "").lower())
@@ -671,12 +679,22 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
         """The property rather than the field list: if a money key is present,
         the gate state must be present and true."""
         with tempfile.TemporaryDirectory() as tmp:
-            got = self._analyse(tmp)
+            got = self._analyse(tmp, target_id="anthropic/direct")
         if "error" in got:
             self.fail(got["error"])
         money = [k for k in got if "usd" in k]
         self.assertTrue(money, "fixture produced no dollar fields; vacuous")
         self.assertIs(got.get("unreconciled"), True)
+
+    def test_withheld_figures_do_not_claim_the_draft_gate_released_them(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            got = self._analyse(tmp)
+        if "error" in got:
+            self.fail(got["error"])
+        self.assertIs(got.get("unreconciled"), False)
+        self.assertIn("withheld", (got.get("gate") or "").lower())
+        self.assertIsNone(got.get("monthly_input_usd"))
+        self.assertTrue(str(got.get("measured_usd")).startswith("[withheld:"))
 
 
 class TestTheDechunkerTellsOneNothingFromAnother(unittest.TestCase):
@@ -1818,6 +1836,16 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                          "counts from one tokenizer deployment were handed back "
                          "for another")
 
+    def test_a_malformed_resume_cache_is_refused_before_any_egress(self):
+        src = self._export("claude-opus-5")
+        with open(self.out + ".cache.json", "w") as f:
+            f.write("[]")
+        r = self._run(src, "--tokenizer-id", "stub-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(_ModelStub.seen, [],
+                         "a prefix was sent before the cache shape was checked")
+        self.assertIn("refusing to resume", r.stderr)
+
     def test_the_counter_version_scopes_the_cache_too(self):
         """A change to how a count is produced must not be resumable across."""
         m = load("count_tokens")
@@ -2245,6 +2273,14 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
                     f"priced; that is priceability wearing serveability's name")
                 self.assertTrue(ok(dated, assume=True),
                                 "the operator's assertion must still work")
+        for retired in ("claude-sonnet-4", "claude-haiku-3-5"):
+            with self.subTest(model=retired):
+                self.assertFalse(
+                    ok(retired),
+                    f"{retired} is priced for historical invoice analysis, but "
+                    f"the registry marks it retired on the first-party API")
+                self.assertTrue(ok(retired, assume=True),
+                                "the operator's assertion must still work")
 
     def test_a_priced_id_is_not_servable_on_an_arbitrary_endpoint(self):
         """The endpoint was used only in the error string. A model this project
@@ -2430,7 +2466,7 @@ class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
             [sys.executable, "-B", os.path.join(TIER_B, "run_diagnostic.py"),
              src, "--assume-endpoint-serves", "--endpoint",
              f"http://127.0.0.1:{stub.server_address[1]}/v1/messages/count_tokens",
-             "--allow-unreconciled"],
+             "--tokenizer-id", "stub-1", "--allow-unreconciled"],
             capture_output=True, text=True, timeout=120,
             env=dict(os.environ, ANTHROPIC_API_KEY="test",
                      CACHEECONOMICS_HMAC_KEY="k" * 32))
@@ -2465,7 +2501,8 @@ class TestEveryPathThisToolchainDerivesIsIgnored(unittest.TestCase):
             subprocess.run(
                 [sys.executable, "-B", os.path.join(TIER_B, "run_diagnostic.py"),
                  src, "--assume-endpoint-serves",
-                 "--endpoint", endpoint, "--allow-unreconciled"],
+                 "--endpoint", endpoint, "--tokenizer-id", "stub-1",
+                 "--allow-unreconciled"],
                 capture_output=True, text=True, timeout=120,
                 env=dict(os.environ, ANTHROPIC_API_KEY="test",
                          CACHEECONOMICS_HMAC_KEY="k" * 32))
@@ -2943,7 +2980,8 @@ class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
         return list(args) + list(kwargs.values())
 
     def test_the_surface_reaches_the_counting_subprocess_and_analysis(self):
-        rc, seen = self._run_main("--target-id", "amazon-bedrock/converse")
+        rc, seen = self._run_main("--target-id", "amazon-bedrock/converse",
+                                  "--tokenizer-id", "gateway-build-7")
         self.assertEqual(rc, 0)
         cmd = self._count_cmd(seen)
         self.assertIn("--target-id", cmd,
@@ -2956,7 +2994,8 @@ class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
                       "--target-id never reached analysis")
 
     def test_the_endpoint_reaches_the_counting_subprocess(self):
-        rc, seen = self._run_main("--endpoint", "https://gateway.internal/count")
+        rc, seen = self._run_main("--endpoint", "https://gateway.internal/count",
+                                  "--tokenizer-id", "gateway-build-7")
         self.assertEqual(rc, 0)
         cmd = self._count_cmd(seen)
         self.assertIn("--endpoint", cmd,
@@ -2978,7 +3017,8 @@ class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
         unrecognised flags, the attempt would have handed
         `--assume-endpoint-serves` to `cacheeconomics analyze`, which has no such
         option."""
-        rc, seen = self._run_main("--assume-endpoint-serves")
+        rc, seen = self._run_main("--assume-endpoint-serves",
+                                  "--tokenizer-id", "gateway-build-7")
         self.assertEqual(rc, 0)
         self.assertIn("--assume-endpoint-serves", self._count_cmd(seen))
         self.assertNotIn("--assume-endpoint-serves",
@@ -3003,12 +3043,23 @@ class TestTheSweepCanBeToldWhereItsTrafficWent(unittest.TestCase):
         """The failure mode is not only that a value is missing, but that the
         two halves disagree: a file counted under one surface and analysed under
         another resolves two different models from one row."""
-        _rc, seen = self._run_main("--target-id", "amazon-bedrock/converse")
+        _rc, seen = self._run_main("--target-id", "amazon-bedrock/converse",
+                                   "--tokenizer-id", "gateway-build-7")
         cmd = self._count_cmd(seen)
         self.assertEqual(cmd[cmd.index("--target-id") + 1],
                          "amazon-bedrock/converse")
         self.assertIn("amazon-bedrock/converse", self._analyse_values(seen),
                       "counting and analysis were not given the same surface")
+
+    def test_the_default_path_does_not_spend_counting_egress(self):
+        rc, seen = self._run_main()
+        self.assertEqual(rc, 0)
+        self.assertFalse(
+            [cmd for cmd in seen["cmds"]
+             if any(str(c).endswith("count_tokens.py") for c in cmd)],
+            "sweep_report counted without --tokenizer-id even though those "
+            "counts would not load as exact")
+        self.assertIsNotNone(seen["analyse"], "analysis should still run")
 
     def test_the_artifact_records_the_settings_it_was_run_with(self):
         """They change what the points mean — the surface decides which rate
@@ -3070,31 +3121,43 @@ class TestTheDiagnosticForwardsTheOverrideAndOnlyToCounting(unittest.TestCase):
 
     def test_the_flag_is_recognised_at_all(self):
         """Before it was declared, argparse dropped it into the passthrough."""
-        counting, _ = self._run_main("--assume-endpoint-serves")
+        counting, _ = self._run_main("--tokenizer-id", "stub-1",
+                                     "--assume-endpoint-serves")
         self.assertTrue(counting, "counting never ran")
 
     def test_it_reaches_the_counting_subprocess(self):
-        counting, _ = self._run_main("--assume-endpoint-serves")
+        counting, _ = self._run_main("--tokenizer-id", "stub-1",
+                                     "--assume-endpoint-serves")
         self.assertIn("--assume-endpoint-serves", counting[0],
                       "the override never reached counting, so the one-command "
                       "path cannot count a gateway or dated-id capture")
 
     def test_it_never_reaches_the_analyzer(self):
-        counting, analysis = self._run_main("--assume-endpoint-serves")
+        counting, analysis = self._run_main("--tokenizer-id", "stub-1",
+                                            "--assume-endpoint-serves")
         self.assertTrue(analysis, "the analyzer never ran")
         self.assertNotIn("--assume-endpoint-serves", analysis[0],
                          "the override was forwarded to `cacheeconomics "
                          "analyze`, which has no such option")
 
     def test_it_is_absent_when_not_asked_for(self):
-        counting, analysis = self._run_main()
+        counting, analysis = self._run_main("--tokenizer-id", "stub-1")
         self.assertNotIn("--assume-endpoint-serves", counting[0])
         self.assertNotIn("--assume-endpoint-serves", analysis[0])
+
+    def test_the_wrapper_does_not_count_without_a_tokenizer_identity(self):
+        counting, analysis = self._run_main()
+        self.assertFalse(counting,
+                         "run_diagnostic spent counting egress without "
+                         "--tokenizer-id even though the analyzer would "
+                         "estimate those counts")
+        self.assertTrue(analysis, "analysis should still run over estimates")
 
     def test_an_unrelated_flag_still_reaches_the_analyzer(self):
         """The passthrough must keep working: declaring one flag here must not
         turn the wrapper into a whitelist."""
-        _counting, analysis = self._run_main("--allow-unreconciled")
+        _counting, analysis = self._run_main("--tokenizer-id", "stub-1",
+                                             "--allow-unreconciled")
         self.assertIn("--allow-unreconciled", analysis[0])
 
 

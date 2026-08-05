@@ -198,12 +198,14 @@ class Figure:
         if not self.released:
             return (f"Figure(withheld={self.withheld_because!r}, "
                     f"basis={self.basis!r})")
-        return (f"Figure({self._usd!r}, basis={self.basis!r}, released=True)")
+        return (f"Figure({self._usd!r}, basis={self.basis!r}, "
+                f"released=True, released_as={self.released_as!r})")
 
     def __str__(self) -> str:
         if not self.released:
             return f"[withheld: {self.withheld_because}]"
-        return f"${self._usd:,.0f}" if abs(self._usd) >= 100 else f"${self._usd:,.2f}"
+        text = f"${self._usd:,.0f}" if abs(self._usd) >= 100 else f"${self._usd:,.2f}"
+        return text + (" [DRAFT]" if self.released_as == DRAFT else "")
 
     def __format__(self, spec: str) -> str:
         # Deliberately ignores the format spec when withheld. A renderer asking
@@ -211,7 +213,8 @@ class Figure:
         # TypeError it might catch and paper over.
         if not self.released:
             return f"[withheld: {self.withheld_because}]"
-        return format(self._usd, spec) if spec else str(self)
+        text = format(self._usd, spec) if spec else str(self)
+        return text + (" [DRAFT]" if spec and self.released_as == DRAFT else "")
 
     def __bool__(self) -> bool:
         return self._usd != 0

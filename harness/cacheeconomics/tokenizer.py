@@ -471,7 +471,10 @@ def locally_vouched_serveable(tokenizer_id: str, endpoint: str) -> bool:
     """
     if endpoint != FIRST_PARTY_COUNT_ENDPOINT:
         return False
-    return tokenizer_id in pricing()["models"]
+    row = pricing()["models"].get(tokenizer_id)
+    if row is None:
+        return False
+    return row.get("first_party_served", True) is not False
 
 
 def countable(models: RowModels, endpoint: str, assume_serves: bool = False):

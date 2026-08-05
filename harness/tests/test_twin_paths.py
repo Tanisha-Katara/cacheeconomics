@@ -3912,7 +3912,7 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
     # spelled `~\$[\d,]+/mo` went vacuous the moment that floor reached the
     # per-finding figures -- it stopped finding an amount, and its own guard is
     # the only reason that was visible rather than silent.
-    ANY_AMOUNT = r"~\$[\d,]+(?:\.\d+)?/(?:mo|window)"
+    ANY_AMOUNT = r"~\$[\d,]+(?:\.\d+)?(?: \[DRAFT\])?/(?:mo|window)"
 
     def test_the_money_column_never_shows_a_number_the_gate_withheld(self):
         """The table is a new surface for a figure to escape through. It reads

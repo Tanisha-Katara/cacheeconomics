@@ -5,6 +5,7 @@ Stdlib unittest, no pytest dependency. Run: python3 -m unittest discover tests
 
 import os
 import sys
+import tempfile
 import unittest
 from datetime import date
 
@@ -26,6 +27,21 @@ class TestRegistry(unittest.TestCase):
     def test_contested_rows_hidden_from_default_listing(self):
         self.assertNotIn("openai/bedrock", registry.target_ids())
         self.assertIn("openai/bedrock", registry.target_ids(include_contested=True))
+
+    def test_non_finite_json_literals_are_refused_at_load(self):
+        real = registry.REGISTRY_DIR
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pricing.json")
+            with open(path, "w") as f:
+                f.write('{"models": {"bad": {"rates": [["1970-01-01", NaN]]}}}')
+            registry.REGISTRY_DIR = tmp
+            try:
+                with self.assertRaises(registry.RegistryError) as e:
+                    registry._load("pricing.json")
+            finally:
+                registry.REGISTRY_DIR = real
+        self.assertIn("non-finite", str(e.exception))
+        self.assertIn("NaN", str(e.exception))
 
     def test_minimums_are_non_monotonic(self):
         """Newer is not always lower. This is why they cannot be inferred."""
@@ -282,6 +298,20 @@ class TestChecks(unittest.TestCase):
         r = checks.check_ttl_ordering(["5m"], "deepseek/direct")
         self.assertIs(r.status, Status.FAIL)
         self.assertIn("no TTL values", r.summary)
+
+    def test_contested_rows_are_not_reported_as_merely_missing_data(self):
+        for result in (
+                checks.check_minimum(2000, "claude-opus-5", "openai/bedrock",
+                                     tokens_are_estimated=False),
+                checks.check_breakpoint_budget(1, "openai/bedrock"),
+                checks.check_ttl_ordering(["5m"], "openai/bedrock",
+                                          model="claude-opus-5")):
+            with self.subTest(check=result.check):
+                self.assertIs(result.status, Status.ABSTAIN)
+                whole = str(result).lower()
+                self.assertIn("contested", whole)
+                self.assertIn("settle the contested row", whole)
+                self.assertIn("after inspecting", whole)
 
     def test_run_all_cannot_pass_with_a_bogus_ttl(self):
         rs = checks.run_all(prefix_tokens=20000, model="claude-sonnet-4-6",
@@ -1133,6 +1163,7 @@ class TestRoundFourteen(unittest.TestCase):
                                  "cache_creation_input_tokens": 0}),
                     allow_unreconciled=True)
         self.assertFalse(a.spend["input_usd"].released)
+        self.assertIn("failed", a.spend["input_usd"].withheld_because)
 
     def test_a_failed_call_that_billed_nothing_does_not(self):
         """Blocking on every transport error would withhold every report
@@ -1149,6 +1180,48 @@ class TestRoundFourteen(unittest.TestCase):
                     invoice_usd=5.0)
         self.assertFalse(a.reconciliation["within_ship_gate"])
         self.assertEqual(a.reconciliation["blockers"]["failed_but_billed"], 1)
+
+    def test_a_skipped_row_names_that_blocker_after_the_draft_override(self):
+        from datetime import datetime, timezone
+        from cacheeconomics.analyzer import analyze
+        from cacheeconomics.trace import Request, Tier, TraceSet
+        req = Request(
+            request_id="ok", sent_at=datetime(2026, 7, 29, 9, tzinfo=timezone.utc),
+            model="claude-opus-5", agent="a", session="s", ttl_requested="5m",
+            usage={"input_tokens": 1_000_000, "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 0},
+            segments=[], status=200, target_id="anthropic/direct")
+        a = analyze(TraceSet(requests=[req], tier=Tier.USAGE_ONLY, source="x",
+                             skipped_rows=1),
+                    allow_unreconciled=True)
+        self.assertFalse(a.spend["input_usd"].released)
+        self.assertIn("could not be read", a.spend["input_usd"].withheld_because)
+        self.assertNotIn("no invoice was supplied",
+                         a.spend["input_usd"].withheld_because)
+
+    def test_a_no_usage_row_names_that_blocker_after_the_draft_override(self):
+        from datetime import datetime, timedelta, timezone
+        from cacheeconomics.analyzer import analyze
+        from cacheeconomics.trace import Request, Tier, TraceSet
+        t0 = datetime(2026, 7, 29, 9, tzinfo=timezone.utc)
+        reqs = [
+            Request(request_id="ok", sent_at=t0, model="claude-opus-5",
+                    agent="a", session="s", ttl_requested="5m",
+                    usage={"input_tokens": 1_000_000,
+                           "cache_read_input_tokens": 0,
+                           "cache_creation_input_tokens": 0},
+                    segments=[], status=200, target_id="anthropic/direct"),
+            Request(request_id="blind", sent_at=t0 + timedelta(seconds=60),
+                    model="claude-opus-5", agent="a", session="s",
+                    ttl_requested="5m", usage={}, segments=[], status=200,
+                    target_id="anthropic/direct"),
+        ]
+        a = analyze(TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x"),
+                    allow_unreconciled=True)
+        self.assertFalse(a.spend["input_usd"].released)
+        self.assertIn("no usage fields", a.spend["input_usd"].withheld_because)
+        self.assertNotIn("no invoice was supplied",
+                         a.spend["input_usd"].withheld_because)
 
 
 if __name__ == "__main__":

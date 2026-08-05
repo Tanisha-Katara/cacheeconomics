@@ -811,6 +811,9 @@ def main(argv: list[str] | None = None) -> int:
         # it gets a plain message rather than a traceback.
         print(f"cacheeconomics: {e}", file=sys.stderr)
         return 1
+    except ValueError as e:
+        print(f"cacheeconomics: {e}", file=sys.stderr)
+        return 1
     except BrokenPipeError:
         # `cacheeconomics analyze ... | head` should not print a traceback.
         return 0

@@ -2467,6 +2467,15 @@ def analyze(ts: TraceSet, invoice_usd: float | None = None,
         if undated:
             return (f"{undated} request(s) carry no usable timestamp, so no "
                     f"date-effective rate applies to them")
+        if skipped_rows:
+            return (f"{skipped_rows} row(s) could not be read by the loader at "
+                    f"all, so their cost is outside this total")
+        if blind_rows:
+            return (f"{blind_rows} request(s) carry no usage fields, so their "
+                    f"cost is unknown")
+        if failed_billed:
+            return (f"{failed_billed} failed request(s) still billed input, so "
+                    f"their cost is outside this total")
         return ""
 
     if recon is None:

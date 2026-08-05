@@ -109,6 +109,12 @@ def main() -> int:
     if args.estimate_only:
         print("  counting skipped (--estimate-only). Structural findings will "
               "carry no dollar figures.", file=sys.stderr)
+    elif not args.tokenizer_id and not args.dry_run:
+        print("  counting skipped: no --tokenizer-id was supplied. The wrapper "
+              "only spends counting egress when the counted export will name "
+              "the tokenizer deployment and load as exact; analysis will use "
+              "estimated segment sizes. Run count_tokens.py directly if you "
+              "want standalone counts for another purpose.", file=sys.stderr)
     else:
         cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), args.path,
                "-o", out_path]

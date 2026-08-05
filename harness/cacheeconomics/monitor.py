@@ -482,6 +482,9 @@ class Monitor:
         for causes, _ in reads.unanswered.values():
             seen |= causes
         fix = "; ".join(sorted({_REMEDIES[c] for c in seen if c in _REMEDIES}))
+        subject = ",".join(
+            f"{key}:{'|'.join(sorted(users))}"
+            for key, (_causes, users) in sorted(reads.unanswered.items()))
         return Alert(
             "RT-NOSURFACE", "low", scope,
             f"{r.target_id!r} cannot answer {what} these checks make, so they "
@@ -489,7 +492,7 @@ class Monitor:
             f"The registry could not answer: {detail}. Their silence means "
             f"unmeasured, not healthy.{example} Only the checks named here are "
             f"affected -- the rest read nothing from the registry.",
-            subject="nosurface:" + ",".join(missing), at=r.sent_at,
+            subject="nosurface:" + subject, at=r.sent_at,
             fix=fix[:1].upper() + fix[1:] + ".")
 
     def _fire(self, st: _ScopeState, a: Alert, into: list) -> None:
@@ -1191,6 +1194,17 @@ class Monitor:
         # `None` from `reads.get` above is unanswered, and that one has already
         # been recorded for RT-NOSURFACE by the time it gets here.
         if not budget or count < budget:
+            return
+        if count > budget:
+            yield Alert(
+                "RT-BUDGET", "high", scope,
+                f"{count} cache markers exceeds the limit of {budget} on "
+                f"{r.target_id}",
+                f"This request already exceeds the provider's marker budget. "
+                f"That is a request-level error, not a future headroom warning.",
+                subject=f"budget-exceeded:{budget}", at=r.sent_at,
+                fix=f"Merge sections that change at similar rates until "
+                    f"{budget} or fewer markers remain.")
             return
         yield Alert(
             "RT-BUDGET", "medium", scope,

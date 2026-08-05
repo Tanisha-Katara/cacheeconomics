@@ -593,7 +593,7 @@ def _mixed_exhaustive(segments, cum, survive, minimum, budget, write_rates,
     for i, p in enumerate(positions):
         tiers.append(Tier(p, first, blocks[i][0], cum[p], assignment[i],
                           survive[p] * surv_by_ttl[assignment[i]],
-                          tuple(range(first, p + 1))))
+                          tuple(s.index for s in segments[first:p + 1])))
         first = p + 1
     label = "mixed " + "/".join(assignment)
     note = ("placement found by scoring every marker set up to the budget "

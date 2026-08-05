@@ -459,7 +459,7 @@
   <p class="note" style="margin-top:22px">There is nothing here to install. This is the instrument we run during an assessment, not a product you configure yourself, and we are not asking you to adopt a tool.</p>
 
   <h3>Watch it run</h3>
-  <div class="col"><p>The same analyzer, compiled to WebAssembly and running in this tab against a sample trace. Not a JavaScript restatement of it &mdash; the actual code that produces a paid report, which is why its output here matches the sample report above exactly.</p></div>
+  <div class="col"><p>The same analyzer, compiled to WebAssembly and running in this tab against a sample trace. Not a JavaScript restatement of it &mdash; the actual code that produces a paid report, shown here in the no-invoice path so the withholding behavior is visible.</p></div>
 
   <div class="col"><p>It deliberately does not take your file. Python comes from a public CDN, so it is third-party code, and it runs in a worker rather than on this page &mdash; a worker has no document, no window, and no way to reach the textarea further down where you might paste a real prompt. That is a property of where the code executes, not a promise about the CDN. The demo still runs only on data we ship, and your traces never enter a browser tab at all.</p></div>
 

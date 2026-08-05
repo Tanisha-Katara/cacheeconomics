@@ -327,7 +327,7 @@ def simulate(reqs: list[Request], policy, volatility=None, cadence=None,
             res.usages.append(cost.Usage(uncached_input=total))
             res.priced.append(r)
             res.unmodelled_ttl += 1
-            res.omitted.setdefault("with an unmodelled lifetime", set()).add(r.request_id)
+            res.omitted.setdefault("with an unmodelled cache minimum", set()).add(r.request_id)
             continue
         pres = [p for p in plan.prefixes(r.segments) if p[1] >= minimum]
 
@@ -633,8 +633,9 @@ class BakeOff:
         lines.append(f"                     relocation "
                      f"{self._range(self.delta_pct_relocation, self.delta_pct_relocation_optimistic)}")
         if self.unmodelled_ttl:
-            lines.append(f"  !! {self.unmodelled_ttl} request(s) use a cache lifetime this "
-                         f"replay does not model and were treated as uncached.")
+            lines.append(f"  !! {self.unmodelled_ttl} request(s) use a cache lifetime "
+                         f"or minimum this replay does not model and were treated as "
+                         f"uncached.")
         if self.unmodelled_target:
             lines.append(f"  !! {self.unmodelled_target} request(s) name a surface the "
                          f"registry does not carry, so no policy could plan for them.")

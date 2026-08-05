@@ -117,6 +117,16 @@ class TestTheKeyNeverTouchesArgv(unittest.TestCase):
                 os.environ[cli.KEY_ENV] = env
 
 
+class TestCliReportsBadPricingInputsWithoutTracebacks(unittest.TestCase):
+
+    def test_invalid_effective_rate_is_a_user_error(self):
+        code, _out, err = run("analyze", FIXTURE, "--effective-rate", "nan",
+                              "--allow-unreconciled")
+        self.assertEqual(code, 1)
+        self.assertIn("effective_rate must be", err)
+        self.assertNotIn("Traceback", err)
+
+
 class TestFiguresStayWithheldByDefault(unittest.TestCase):
     """The rule the whole project is sold on. A CLI is an easy place for it to
     stop being true, because the convenient default is to print the number."""
@@ -138,7 +148,7 @@ class TestFiguresStayWithheldByDefault(unittest.TestCase):
         # absence had stopped testing anything. The claim is that the released
         # run prints amounts and no row still reads as withheld.
         self.assertNotRegex(out, r"\bwithheld\b\s{2,}")
-        self.assertRegex(out, r"~\$[\d,.]+/mo")
+        self.assertRegex(out, r"~\$[\d,.]+(?: \[DRAFT\])?/mo")
 
     def test_json_output_serialises_a_withheld_figure_as_text(self):
         """Not as a number. A script reading this must not be handed a float it
@@ -190,7 +200,7 @@ class TestEveryDollarFieldInTheJsonCarriesItsReleaseState(unittest.TestCase):
         out = []
         if isinstance(node, str):
             if node.startswith("[withheld") or re.fullmatch(
-                    r"\$-?[\d,]+(?:\.\d+)?", node.strip()):
+                    r"\$-?[\d,]+(?:\.\d+)?(?: \[DRAFT\])?", node.strip()):
                 out.append(path)
         elif isinstance(node, dict):
             for k, v in node.items():
@@ -816,7 +826,8 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
                    and not isinstance(node, bool))
         by_render = isinstance(node, str) and (
             node.startswith("[withheld")
-            or bool(re.fullmatch(r"\$-?[\d,]+(?:\.\d+)?", node.strip())))
+            or bool(re.fullmatch(
+                r"\$-?[\d,]+(?:\.\d+)?(?: \[DRAFT\])?", node.strip())))
         if by_name or by_render:
             out.append(path)
         return out

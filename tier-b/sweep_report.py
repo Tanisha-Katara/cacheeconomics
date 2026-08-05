@@ -161,6 +161,13 @@ def counted(path: str, endpoint: str = DEFAULT_ENDPOINT,
               f"    delete that file and re-run to count it again.",
               file=sys.stderr)
         return path
+    if not tokenizer_id:
+        print(f"    counting skipped for {os.path.basename(path)}: no "
+              f"--tokenizer-id was supplied, so any new counts would be "
+              f"treated as estimates by the analyzer. Pass --tokenizer-id "
+              f"to spend counting egress for this evidence artifact.",
+              file=sys.stderr)
+        return path
     cmd = [sys.executable, os.path.join(HERE, "count_tokens.py"), path,
            "-o", out]
     if endpoint != DEFAULT_ENDPOINT:
@@ -259,10 +266,21 @@ def analyse(path: str, target_id: str | None = None) -> dict:
     # the normal gate would have withheld, with the caveat left behind in a
     # report nobody keeps.
     draft = [n for n in d.get("notes") or [] if n.startswith("DRAFT")]
-    return {"unreconciled": True,
-            "gate": ("figures released with --allow-unreconciled and no "
-                     "invoice; not reconciled against money that left an "
-                     "account"),
+    states = d.get("release_state") or {}
+    released = [state for state in states.values() if state]
+    unreconciled = "draft" in released
+
+    def _withheld_reason(text):
+        if isinstance(text, str) and text.startswith("[withheld: "):
+            return text[len("[withheld: "):-1] if text.endswith("]") else text
+        return "the analyzer withheld the figure"
+
+    gate = (("figures released with --allow-unreconciled and no invoice; not "
+             "reconciled against money that left an account")
+            if unreconciled else
+            f"figures withheld: {_withheld_reason(d['spend'].get('input_usd'))}")
+    return {"unreconciled": unreconciled,
+            "gate": gate,
             "draft_notes": draft,
             "monthly_input_usd": monthly, "ttl1_usd_month": rec,
             # None, not zero. A withheld figure is unknown, and `rec or 0.0`

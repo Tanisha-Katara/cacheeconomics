@@ -117,6 +117,26 @@ def counter_id(models: RowModels, endpoint: str,
                         endpoint, tokenizer_id or ""])
 
 
+def load_resume_cache(path: str) -> dict:
+    """A resume cache must be a dict of finite, non-negative token counts."""
+    with open(path) as f:
+        cache = json.load(f)
+    if not isinstance(cache, dict):
+        raise ValueError("expected a JSON object mapping prefix keys to counts")
+    for key, value in cache.items():
+        bad_key = not isinstance(key, str)
+        bad_value = (isinstance(value, bool)
+                     or not isinstance(value, (int, float))
+                     or value != value
+                     or value in (float("inf"), float("-inf"))
+                     or value < 0)
+        if bad_key or bad_value:
+            raise ValueError(
+                f"invalid cache entry {key!r}: counts must be finite "
+                f"non-negative numbers, got {value!r}")
+    return cache
+
+
 def provenance(row, body, endpoint: str, target_id: str | None,
                tokenizer_id: str | None, assume_serves: bool = False) -> dict:
     """What produced this row's `segment_tokens`.
@@ -260,8 +280,12 @@ def main() -> int:
     # a re-run is exactly when the tokenizer may have moved.
     resume = bool(args.tokenizer_id) and not args.dry_run
     if resume and os.path.exists(cache_path):
-        with open(cache_path) as f:
-            cache = json.load(f)
+        try:
+            cache = load_resume_cache(cache_path)
+        except (OSError, ValueError) as e:
+            print(f"  refusing to resume from {cache_path}: {e}. No counting "
+                  f"calls were made.", file=sys.stderr)
+            return 2
         # Naming the counter, because after key scoping a model or endpoint
         # change resumes from 0 against a full file, which otherwise reads as a
         # missing cache rather than a deliberate recount. The model half of that

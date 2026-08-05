@@ -112,6 +112,7 @@
           3.0
         ]
       ],
+      "first_party_served": false,
       "note": "Retired on the first-party API, still served on Bedrock and Google Cloud. Those are partner-priced surfaces; this rate is the Anthropic list price and applies to anthropic/direct only."
     },
     "claude-haiku-3-5": {
@@ -121,6 +122,7 @@
           0.8
         ]
       ],
+      "first_party_served": false,
       "note": "Retired on the first-party API, still served on Bedrock and Google Cloud. Same caveat as claude-sonnet-4."
     }
   },

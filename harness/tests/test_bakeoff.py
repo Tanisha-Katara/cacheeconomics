@@ -3176,6 +3176,7 @@ class TestUnknownMinimumsAreNotAssumedCacheable(unittest.TestCase):
         res = simulate.simulate(self._reqs("claude-unregistered-9"), "allocator-lite")
         self.assertEqual(res.reads, 0)
         self.assertEqual(res.unmodelled_ttl, 6)
+        self.assertIn("with an unmodelled cache minimum", res.omitted)
 
     def test_a_registered_model_still_produces_a_verdict(self):
         reqs = self._reqs("claude-opus-5")

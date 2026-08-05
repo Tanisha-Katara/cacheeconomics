@@ -553,6 +553,13 @@ class TestEveryFigureCarriesItsReleaseProvenance(unittest.TestCase):
                 self.assertNotEqual(a, b, f"__eq__ ignores {slot}")
                 self.assertNotEqual(hash(a), hash(b), f"__hash__ ignores {slot}")
 
+    def test_generic_rendering_marks_draft_figures(self):
+        draft = Figure(12.34, money.MEASURED, released=True,
+                       released_as=money.DRAFT)
+        self.assertIn("DRAFT", str(draft))
+        self.assertIn("DRAFT", f"{draft:,.2f}")
+        self.assertIn("released_as='draft'", repr(draft))
+
     def test_the_json_output_carries_release_state_for_every_figure(self):
         """Every dollar field in `--format json`, found by scanning the payload.
 
@@ -639,7 +646,8 @@ _INPUT_ONLY_MONEY = frozenset({"invoice_usd"})
 
 def _looks_like_usd(s: str) -> bool:
     import re
-    return bool(re.fullmatch(r"\$-?[\d,]+(?:\.\d+)?", s.strip()))
+    return bool(re.fullmatch(
+        r"\$-?[\d,]+(?:\.\d+)?(?: \[DRAFT\])?", s.strip()))
 
 
 def _has_release_state(payload: dict, path: str) -> bool:

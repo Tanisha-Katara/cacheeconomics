@@ -59,8 +59,15 @@ def _load(name):
     path = os.path.join(REGISTRY_DIR, name)
     if not os.path.exists(path):
         raise RegistryError(f"registry file missing: {path}")
+
+    def reject_non_finite(value):
+        raise RegistryError(
+            f"{name} contains non-finite JSON literal {value}. Registry "
+            f"numbers must be finite, because they feed dollar figures and "
+            f"cache limits.")
+
     with open(path) as f:
-        return json.load(f)
+        return json.load(f, parse_constant=reject_non_finite)
 
 
 _PROVIDERS = None
