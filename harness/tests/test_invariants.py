@@ -352,10 +352,7 @@ KNOWN_SURFACE_FALLBACKS = ()   # closed by Track B
 KNOWN_HELP_TEXT_CLAIMS = ()   # closed by Track B
 
 # INV-5, Track C. Registry dependencies that disable a check in silence.
-KNOWN_SILENT_ABSTENTIONS = (
-    "capability(lookback_blocks)",
-    "capability(max_breakpoints)",
-)
+KNOWN_SILENT_ABSTENTIONS = ()   # closed by Track C
 
 # --- fixtures --------------------------------------------------------------
 
