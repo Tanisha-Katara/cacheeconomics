@@ -168,6 +168,45 @@ def renderers():
 
 
 
+def _fallbacks_in(tree, label):
+    """The AST shapes meaning "a surface supplied when nobody named one".
+
+    Split out so the detector can be pointed at a synthetic source. The guard
+    proving this mechanism works used to assert the package HAD offenders,
+    which stopped being a fair question the moment the class was fully closed.
+    """
+    import ast
+    ids = {t for t in registry.target_ids() if t != registry.UNATTRIBUTED}
+
+    def surface(n):
+        return (isinstance(n, ast.Constant) and isinstance(n.value, str)
+                and n.value in ids)
+
+    out = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.arguments):
+            for d in list(node.defaults) + [k for k in node.kw_defaults if k]:
+                if surface(d):
+                    out.append(f"{label} parameter default")
+        elif isinstance(node, (ast.AnnAssign, ast.Assign)):
+            v = node.value
+            if v is not None and surface(v):
+                out.append(f"{label} field default")
+        elif isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            for v in node.values[1:]:
+                if surface(v):
+                    out.append(f"{label} `or` fallback")
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            if (isinstance(fn, ast.Attribute) and fn.attr == "get"
+                    and len(node.args) == 2 and surface(node.args[1])):
+                out.append(f"{label} dict.get fallback")
+            for kw in node.keywords:
+                if kw.arg in ("default", "target_id") and surface(kw.value):
+                    out.append(f"{label} {kw.arg}= keyword")
+    return out
+
+
 def surface_fallback_sites():
     """Every place package source supplies a first-party surface as a FALLBACK.
 
@@ -195,39 +234,13 @@ def surface_fallback_sites():
     """
     import ast
     import pathlib
-    ids = {t for t in registry.target_ids() if t != registry.UNATTRIBUTED}
-
-    def surface(n):
-        return (isinstance(n, ast.Constant) and isinstance(n.value, str)
-                and n.value in ids)
-
     root = pathlib.Path(registry.HERE)
     out = []
     for f in sorted(root.rglob("*.py")):
         if f.name == "registry.py":
             continue
-        rel = f.relative_to(root.parent)
-        for node in ast.walk(ast.parse(f.read_text())):
-            if isinstance(node, ast.arguments):
-                for d in list(node.defaults) + [k for k in node.kw_defaults if k]:
-                    if surface(d):
-                        out.append(f"{rel} parameter default")
-            elif isinstance(node, (ast.AnnAssign, ast.Assign)):
-                v = node.value
-                if v is not None and surface(v):
-                    out.append(f"{rel} field default")
-            elif isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
-                for v in node.values[1:]:
-                    if surface(v):
-                        out.append(f"{rel} `or` fallback")
-            elif isinstance(node, ast.Call):
-                fn = node.func
-                if (isinstance(fn, ast.Attribute) and fn.attr == "get"
-                        and len(node.args) == 2 and surface(node.args[1])):
-                    out.append(f"{rel} dict.get fallback")
-                for kw in node.keywords:
-                    if kw.arg in ("default", "target_id") and surface(kw.value):
-                        out.append(f"{rel} {kw.arg}= keyword")
+        out.extend(_fallbacks_in(ast.parse(f.read_text()),
+                                 str(f.relative_to(root.parent))))
     # Counted, not de-duplicated, and keyed on file+shape rather than
     # file:line. Line numbers churn on every unrelated edit in the same file --
     # the first version went red because a help string three lines above moved
@@ -269,7 +282,20 @@ def help_text_surface_claims():
             h = kw.get("help")
             if not (isinstance(h, ast.Constant) and isinstance(h.value, str)):
                 continue
-            named = {i for i in ids if i in h.value}
+            # Only a DEFAULT CLAIM counts, not a mention. Track B's new help
+            # text names surfaces as examples -- "e.g. anthropic/direct,
+            # openai/direct, amazon-bedrock/converse" -- which is correct and
+            # useful, and the first version of this check flagged all three.
+            # An invariant that fires on good help text gets the help text
+            # changed to appease it, which is worse than not having the check.
+            #
+            # The claim being hunted is "this flag defaults to <surface>" when
+            # it does not. That needs the word near the name, not the name.
+            import re as _re
+            claim = _re.compile(
+                r"default[s]?\b[^.;]{0,40}?(" + "|".join(
+                    _re.escape(i) for i in ids) + r")", _re.I)
+            named = {m.group(1) for m in claim.finditer(h.value)}
             if not named:
                 continue
             d = kw.get("default")
@@ -313,38 +339,16 @@ KNOWN_JSON_UNPROVENANCED = (
 )
 
 # INV-4, Track B. Public callables defaulting target_id to a named surface.
-KNOWN_SURFACE_DEFAULTS = (
-    "adapters.claude_code.load_sessions(target_id='anthropic/direct')",
-    "checks.check_breakpoint_budget(target_id='anthropic/direct')",
-    "checks.check_minimum(target_id='anthropic/direct')",
-    "checks.run_all(target_id='anthropic/direct')",
-    "cost.ttl_crossover(target_id='anthropic/direct')",
-    "plugin.CachePlugin.on_request(target_id='anthropic/direct')",
-    "recorder.Recorder.__init__(target_id='anthropic/direct')",
-    "trace.Request.__init__(target_id='anthropic/direct')",
-)
+KNOWN_SURFACE_DEFAULTS = ()   # closed by Track B
 
 # INV-4, Track B. Entry points that mutate unless told not to.
-KNOWN_MUTATE_BY_DEFAULT = (
-    "plugin.CachePlugin.on_request(apply=True)",
-)
+KNOWN_MUTATE_BY_DEFAULT = ()   # closed by Track B
 
 # INV-6. Every place the package supplies a first-party surface when nobody
 # named one. Found by AST shape, not by name, so it covers routes
 # `inspect.signature` cannot see. Line numbers move -- re-run
 # `surface_fallback_sites()` and paste, do not hand-edit.
-KNOWN_SURFACE_FALLBACKS = (
-    "cacheeconomics/adapters/claude_code.py parameter default x1",
-    "cacheeconomics/checks.py parameter default x3",
-    "cacheeconomics/cli.py `or` fallback x1",
-    "cacheeconomics/cli.py default= keyword x1",
-    "cacheeconomics/cost.py parameter default x1",
-    "cacheeconomics/plugin.py `or` fallback x1",
-    "cacheeconomics/plugin.py parameter default x1",
-    "cacheeconomics/recorder.py parameter default x1",
-    "cacheeconomics/relocate.py `or` fallback x1",
-    "cacheeconomics/trace.py field default x1",
-)
+KNOWN_SURFACE_FALLBACKS = ()   # closed by Track B
 
 # INV-6b. argparse help text naming a surface its default does not supply.
 # The shared ingest flag is fixed. The remaining entry belongs to
@@ -352,9 +356,7 @@ KNOWN_SURFACE_FALLBACKS = (
 # `--assume-anthropic-direct` opt-in -- its help text changes with that work, so
 # correcting the sentence here would collide with the fix for the behaviour it
 # describes.
-KNOWN_HELP_TEXT_CLAIMS = (
-    "cacheeconomics/cli.py help says ['anthropic/direct'] but default is None",
-)
+KNOWN_HELP_TEXT_CLAIMS = ()   # closed by Track B
 
 # INV-5, Track C. Registry dependencies that disable a check in silence.
 KNOWN_SILENT_ABSTENTIONS = (
@@ -1023,10 +1025,27 @@ class TestNoSurfaceIsFabricatedAnywhereInTheSource(unittest.TestCase):
     source is what this reads.
     """
 
-    def test_the_scan_finds_something_to_check(self):
-        self.assertTrue(surface_fallback_sites(),
-                        "no fallback sites found at all; the AST scan is "
-                        "broken and this invariant is vacuous")
+    def test_the_scanner_can_still_find_a_fallback(self):
+        """Prove the MECHANISM works, not that offenders exist.
+
+        The first version asserted `surface_fallback_sites()` was non-empty, so
+        the invariant could not pass on a broken scan. That was right while the
+        class had members and became WRONG the moment Track B closed the last
+        one: "no offenders" and "the scanner is broken" are the same
+        observation, and the guard read the good news as the bad.
+
+        A guard that cannot tell success from failure is the defect this file
+        exists to catch. It now scans a synthetic source carrying a known
+        fallback, which answers "does the detector detect" without depending on
+        whether the package currently offends.
+        """
+        import ast
+        found = _fallbacks_in(
+            ast.parse('def go(target_id="anthropic/direct"):\n    pass\n'),
+            "probe.py")
+        self.assertEqual(["probe.py parameter default"], found,
+                         "the AST fallback detector no longer detects a "
+                         "parameter default it is looking straight at")
 
     def test_the_scan_ignores_legitimate_surface_names(self):
         """Guard against over-reach in the other direction.
