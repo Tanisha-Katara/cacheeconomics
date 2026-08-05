@@ -67,6 +67,25 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual(up, {"effective": "2026-09-01", "rate": 3.00})
         self.assertIsNone(registry.upcoming_rate_change("claude-sonnet-5", "2026-09-02"))
 
+    def test_malformed_rate_rows_are_refused_before_sorting(self):
+        """A bad stored effective date must be a registry error, not TypeError."""
+        import json
+        saved = registry._PRICING
+        poisoned = json.loads(json.dumps(registry.pricing()))
+        poisoned["models"]["claude-opus-5"]["rates"].append([20260801, 9.0])
+        registry._PRICING = poisoned
+        try:
+            for read in (
+                    lambda: registry.base_rate("claude-opus-5", "2026-08-01",
+                                               "anthropic/direct"),
+                    lambda: registry.upcoming_rate_change("claude-opus-5",
+                                                          "2026-07-01")):
+                with self.subTest(read=read):
+                    with self.assertRaises(registry.RegistryError):
+                        read()
+        finally:
+            registry._PRICING = saved
+
     def test_bedrock_lacks_automatic_caching(self):
         self.assertFalse(registry.capability("amazon-bedrock/converse", "automatic_prefix_cache"))
         self.assertTrue(registry.capability("google-cloud/vertex", "automatic_prefix_cache"))
@@ -1560,6 +1579,28 @@ class TestARegistryNumberCannotBeNonFinite(unittest.TestCase):
         finally:
             self._restore(old)
 
+    def test_an_overflowing_numeric_capability_is_refused(self):
+        import json
+        d = json.loads(open(os.path.join(registry.REGISTRY_DIR,
+                                         "providers.json")).read())
+        for row in d["targets"]:
+            if row.get("id") == "anthropic/direct":
+                row.setdefault("capabilities", {})["max_breakpoints"] = 123456.789
+        text = json.dumps(d).replace("123456.789", "1e999", 1)
+        data = self._with("providers.json", lambda _: text)
+        old = self._reload(data)
+        try:
+            with self.assertRaises(registry.RegistryError) as caught:
+                registry.capability("anthropic/direct", "max_breakpoints")
+            self.assertIn("finite", str(caught.exception))
+
+            result = checks.check_breakpoint_budget(
+                1_000_000, "anthropic/direct")
+            self.assertIs(result.status, Status.ABSTAIN)
+            self.assertIn("finite", result.detail)
+        finally:
+            self._restore(old)
+
     def test_zero_is_a_legitimate_number_and_is_not_refused(self):
         """Guard against over-blocking, which is the other way to be wrong.
 
@@ -1580,13 +1621,8 @@ class TestARegistryNumberCannotBeNonFinite(unittest.TestCase):
 
 class TestEveryPricedModelIsClassifiedAsServedOrNot(unittest.TestCase):
     """`first_party_served` decides whether prompt bodies may be sent to the
-    first-party count endpoint without an operator assertion. Its default is
-    `True`, so a model that carries no classification is vouched by omission.
-
-    That default is the right one -- a newly launched model is served far more
-    often than not, and refusing by default would silently degrade counting to
-    estimation on every launch, with no test firing and the operator told
-    nothing. But it is only safe if omission cannot happen QUIETLY.
+    first-party count endpoint without an operator assertion. It must be explicit
+    and boolean; anything else is not a locally vouchable fact.
 
     Measured before this class existed: 12 of the 14 priced models relied on
     the default, and a planted `claude-retired-tomorrow` was vouched as
@@ -1633,10 +1669,18 @@ class TestEveryPricedModelIsClassifiedAsServedOrNot(unittest.TestCase):
         self.assertEqual(
             [], unclassified,
             f"these models are priced but nobody has said whether the "
-            f"first-party count endpoint serves them: {unclassified}. Until "
-            f"someone decides, `locally_vouched_serveable` vouches them by "
-            f"omission and prompt bodies go out for a model that may 400. Add "
+            f"first-party count endpoint serves them: {unclassified}. Add "
             f"`first_party_served` to the row, or an entry to SERVED here.")
+
+    def test_every_served_decision_is_boolean(self):
+        models = registry.pricing()["models"]
+        malformed = sorted(m for m, row in models.items()
+                           if not isinstance(row.get("first_party_served"), bool))
+        self.assertEqual(
+            [], malformed,
+            f"these models carry malformed first_party_served values: "
+            f"{malformed}. The value must be a boolean judgement, not a "
+            f"truthy string or placeholder.")
 
     def test_the_decisions_match_what_the_gate_actually_does(self):
         """The table is only worth having if it describes the shipped gate."""
@@ -1647,6 +1691,21 @@ class TestEveryPricedModelIsClassifiedAsServedOrNot(unittest.TestCase):
                  if tokenizer.locally_vouched_serveable(m, endpoint) != expected}
         self.assertEqual({}, wrong,
                          f"the gate disagrees with the recorded decision: {wrong}")
+
+    def test_a_malformed_decision_does_not_vouch_the_model(self):
+        import json
+        from cacheeconomics import tokenizer
+        endpoint = tokenizer.FIRST_PARTY_COUNT_ENDPOINT
+        saved = registry._PRICING
+        poisoned = json.loads(json.dumps(registry.pricing()))
+        poisoned["models"]["claude-opus-5"]["first_party_served"] = "yes"
+        registry._PRICING = poisoned
+        try:
+            self.assertFalse(
+                tokenizer.locally_vouched_serveable("claude-opus-5", endpoint),
+                "a truthy non-boolean registry value vouched prompt egress")
+        finally:
+            registry._PRICING = saved
 
     def test_a_retired_model_is_not_vouched(self):
         """Guard the guard: if nothing were refused this class would be vacuous."""

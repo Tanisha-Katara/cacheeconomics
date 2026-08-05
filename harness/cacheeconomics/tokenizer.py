@@ -425,8 +425,9 @@ def row_models(row: dict, body: dict,
         row = {}
     override = body.get("model") if isinstance(body, dict) else None
     kwargs = {"default_target": target_id} if target_id else {}
-    analysis = request_from_row(row, [], renamed={}, model_override=override,
-                                **kwargs).model
+    request = request_from_row(row, [], renamed={}, model_override=override,
+                               **kwargs)
+    analysis = request.model
     # The same expression the loader resolves, stopping before `_normalised`.
     # `_text` still applies: a list or a dict is not an id anyone can send, and
     # the loader discards those too.
@@ -438,7 +439,7 @@ def row_models(row: dict, body: dict,
     raw = raw.strip() if isinstance(raw, str) else raw
     if not raw:
         return RowModels(None, analysis)
-    tokenizer, prefix = _without_routing_prefix(raw, target_id)
+    tokenizer, prefix = _without_routing_prefix(raw, request.target_id)
     return RowModels(tokenizer, analysis, prefix)
 
 
@@ -474,7 +475,7 @@ def locally_vouched_serveable(tokenizer_id: str, endpoint: str) -> bool:
     row = pricing()["models"].get(tokenizer_id)
     if row is None:
         return False
-    return row.get("first_party_served", True) is not False
+    return row.get("first_party_served") is True
 
 
 def countable(models: RowModels, endpoint: str, assume_serves: bool = False):

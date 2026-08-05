@@ -118,7 +118,7 @@ def counter_id(models: RowModels, endpoint: str,
 
 
 def load_resume_cache(path: str) -> dict:
-    """A resume cache must be a dict of finite, non-negative token counts."""
+    """A resume cache must be a dict of non-negative integer token counts."""
     with open(path) as f:
         cache = json.load(f)
     if not isinstance(cache, dict):
@@ -126,14 +126,12 @@ def load_resume_cache(path: str) -> dict:
     for key, value in cache.items():
         bad_key = not isinstance(key, str)
         bad_value = (isinstance(value, bool)
-                     or not isinstance(value, (int, float))
-                     or value != value
-                     or value in (float("inf"), float("-inf"))
+                     or not isinstance(value, int)
                      or value < 0)
         if bad_key or bad_value:
             raise ValueError(
-                f"invalid cache entry {key!r}: counts must be finite "
-                f"non-negative numbers, got {value!r}")
+                f"invalid cache entry {key!r}: counts must be non-negative "
+                f"integers, got {value!r}")
     return cache
 
 
@@ -305,8 +303,8 @@ def main() -> int:
         # would go to api.anthropic.com" seconds after a real run had populated
         # it -- true here, false everywhere the client would run it, and exactly
         # the wrong thing to say while asking for permission to send anything.
-        print(f"  ({len(json.load(open(cache_path))):,} counts are cached locally; "
-              f"a dry run ignores them and reports a cold run)", file=sys.stderr)
+        print(f"  (cache file {cache_path} exists; a dry run ignores it and "
+              f"reports a cold run)", file=sys.stderr)
 
     stats = {"calls": 0}
     # One counter per model in the export, built on first sight of that model.

@@ -32,6 +32,7 @@ import tempfile
 import types
 import threading
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 
@@ -415,10 +416,6 @@ class TestTheDiagnosticCountsOnlyWhenItCanProduceExactEvidence(unittest.TestCase
                         "counted export carries no segment_tokens")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestCountingCannotFakeAnExactResult(unittest.TestCase):
     """The counted path is what releases structural dollar figures.
 
@@ -633,7 +630,7 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
     real function against a real fixture now.
     """
 
-    def _bodies(self, tmp):
+    def _bodies(self, tmp, days=1):
         p = os.path.join(tmp, "run.jsonl")
         body = {"model": "claude-opus-5",
                 "system": [{"type": "text", "text": "s" * 30_000,
@@ -641,8 +638,11 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
                 "messages": [{"role": "user", "content": "hi"}]}
         with open(p, "w") as f:
             for i in range(20):
+                day = 29 + (i // 10 if days > 1 else 0)
+                minute = i % 10 if days > 1 else i
                 f.write(json.dumps({
-                    "sent_at": f"2026-07-29T09:{i:02d}:00Z", "body": body,
+                    "sent_at": f"2026-07-{day:02d}T09:{minute:02d}:00Z",
+                    "body": body,
                     "usage": {"input_tokens": 200,
                               "cache_read_input_tokens": 30_000 if i else 0,
                               "cache_creation_input_tokens": 0 if i else 30_000,
@@ -651,13 +651,13 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
                                   "ephemeral_1h_input_tokens": 0}}}) + "\n")
         return p
 
-    def _analyse(self, tmp, target_id=None):
+    def _analyse(self, tmp, target_id=None, days=1):
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "sweep_report_under_test", os.path.join(TIER_B, "sweep_report.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        return mod.analyse(self._bodies(tmp), target_id=target_id)
+        return mod.analyse(self._bodies(tmp, days=days), target_id=target_id)
 
     def test_the_result_declares_it_is_unreconciled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -685,6 +685,31 @@ class TestSweepEvidenceCarriesItsGateState(unittest.TestCase):
         money = [k for k in got if "usd" in k]
         self.assertTrue(money, "fixture produced no dollar fields; vacuous")
         self.assertIs(got.get("unreconciled"), True)
+
+    def test_draft_rendered_money_is_still_parsed_when_released(self):
+        """The CLI appends `[DRAFT]`; the sweep still needs the number."""
+        import types
+        spec = importlib.util.spec_from_file_location(
+            "sweep_report_under_test", os.path.join(TIER_B, "sweep_report.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        cli = {
+            "spend": {"monthly_input_usd": "$14.68 [DRAFT]",
+                      "input_usd": "$0.49 [DRAFT]"},
+            "findings": [{"code": "TTL-1",
+                          "avoidable_usd_month": "$4.00 [DRAFT]"}],
+            "notes": ["DRAFT -- released without invoice reconciliation"],
+            "release_state": {"monthly_input_usd": "draft"},
+            "window_days": 1.0,
+        }
+        fake = types.SimpleNamespace(returncode=0, stdout=json.dumps(cli),
+                                     stderr="")
+        with mock.patch.object(mod.subprocess, "run", return_value=fake):
+            got = mod.analyse("ignored.jsonl", target_id="anthropic/direct")
+        self.assertIs(got.get("unreconciled"), True)
+        self.assertEqual(got.get("monthly_input_usd"), 14.68)
+        self.assertEqual(got.get("ttl1_usd_month"), 4.0)
+        self.assertAlmostEqual(got.get("recoverable_share"), 4.0 / 14.68)
 
     def test_withheld_figures_do_not_claim_the_draft_gate_released_them(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1846,6 +1871,26 @@ class TestEveryRowIsCountedByTheTokenizerItNames(unittest.TestCase):
                          "a prefix was sent before the cache shape was checked")
         self.assertIn("refusing to resume", r.stderr)
 
+    def test_a_fractional_resume_cache_count_is_refused(self):
+        src = self._export("claude-opus-5")
+        with open(self.out + ".cache.json", "w") as f:
+            json.dump({"prefix": 1.9}, f)
+        r = self._run(src, "--tokenizer-id", "stub-1")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(_ModelStub.seen, [],
+                         "a prefix was sent before fractional counts were refused")
+        self.assertIn("integers", r.stderr)
+
+    def test_a_dry_run_ignores_a_corrupt_existing_cache(self):
+        src = self._export("claude-opus-5")
+        with open(self.out + ".cache.json", "w") as f:
+            f.write("{bad")
+        r = self._run(src, "--dry-run", "--tokenizer-id", "stub-1")
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertIn("dry run ignores", r.stderr)
+        self.assertNotIn("Traceback", r.stderr)
+        self.assertEqual(_ModelStub.seen, [], "a dry run sent something")
+
     def test_the_counter_version_scopes_the_cache_too(self):
         """A change to how a count is produced must not be resumable across."""
         m = load("count_tokens")
@@ -2243,6 +2288,15 @@ class TestTheCounterAsksTheLoaderWhichModelThisIs(unittest.TestCase):
                 got = m.row_models({}, {"model": raw, "messages": []}, target)
                 self.assertEqual(got.tokenizer, tok)
                 self.assertEqual(got.prefix, prefix)
+
+    def test_a_row_local_target_id_strips_the_tokenizer_routing_prefix(self):
+        """Rows can carry the surface even when the CLI did not repeat it."""
+        m = load("count_tokens")
+        body = {"model": "anthropic.claude-haiku-4-5", "messages": []}
+        got = m.row_models({"target_id": "amazon-bedrock/converse"}, body)
+        self.assertEqual(got.analysis, "claude-haiku-4-5")
+        self.assertEqual(got.tokenizer, "claude-haiku-4-5")
+        self.assertTrue(m.countable(got, m.FIRST_PARTY_COUNT_ENDPOINT)[0])
 
     def test_priceable_is_not_the_same_as_servable(self):
         """The rule said "known to serve" and checked "known to price".
@@ -3484,3 +3538,7 @@ class TestAppendingOntoATruncatedTailLosesNothingExtra(unittest.TestCase):
                 break
             seen += line
         self.assertIn("ended mid-row", seen)
+
+
+if __name__ == "__main__":
+    unittest.main()

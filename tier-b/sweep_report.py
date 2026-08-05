@@ -21,6 +21,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import statistics as st
 import subprocess
 import sys
@@ -249,10 +250,10 @@ def analyse(path: str, target_id: str | None = None) -> dict:
         """
         if not isinstance(text, str) or text.startswith("["):
             return None
-        try:
-            return float(text.replace("$", "").replace(",", ""))
-        except ValueError:
+        m = re.match(r"^\$?([0-9][0-9,]*(?:\.[0-9]+)?)(?: \[DRAFT\])?$", text)
+        if not m:
             return None
+        return float(m.group(1).replace(",", ""))
 
     monthly = _usd(d["spend"].get("monthly_input_usd"))
     ttl = next((f for f in d["findings"] if f["code"] == "TTL-1"), None)

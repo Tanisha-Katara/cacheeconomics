@@ -230,29 +230,12 @@ tests it breaks are the ones that assert the analyzer's own trust gates.
 
 ---
 
-## 10. `min_cacheable_tokens` cannot be inspected on a contested row
+## 10. ~~`min_cacheable_tokens` cannot be inspected on a contested row~~ — CLOSED
 
-`registry.capability(target_id, name, allow_contested=False)` takes an
-`allow_contested` flag; `registry.min_cacheable_tokens(target_id, model)` does
-not. So on a contested surface — shipped: `openai/bedrock`,
-`google/gemini-explicit` — a caller cannot distinguish "this row records a
-minimum, but the row is disputed" from "this row records no minimum at all".
-
-**Consequence, found by Track C:** `RT-NOSURFACE` can name the dispute but not
-whether the value also needs recording. It now reports the key as *not
-inspected* rather than guessing, which is correct — "present" understates a row
-that needs values, "absent" invents a gap — but it is an answer the operator
-cannot act on precisely.
-
-**Why not fixed there:** reproducing the registry's `inherits_minimums_from`
-walk inside `monitor.py` would be a second copy of the registry's own knowledge,
-and every second copy in this codebase has drifted. The fix belongs in
-`registry.py`: either give `min_cacheable_tokens` the same `allow_contested`
-parameter `capability` has, or add a diagnostic that reports row-level contested
-status separately from per-key presence.
-
-**Scope:** `registry.py` only, plus whatever calls it. Small, but it is the
-public registry API and no track owned it this round.
+Closed: `registry.min_cacheable_tokens(target_id, model, allow_contested=False)`
+now takes the same inspect-never-publish affordance as `capability()`, and the
+monitor uses it to distinguish "contested" from "missing minimum" without
+copying the registry's inheritance walk.
 
 ---
 
@@ -356,16 +339,17 @@ Closed at `4f71713` in two places, because one was not enough:
   never sees it, and it overflows to `inf`. Reproduced against the review's own
   fix: `base_rate -> inf`, `price().usd -> nan`, rendered `$nan`.
 
-Four tests, all planting the overflow token rather than the literal — a test
-that plants `NaN` passes on the parser alone and proves nothing about the
-readers.
+The reader tests plant the overflow token rather than the literal — a test that
+plants `NaN` passes on the parser alone and proves nothing about the consumers.
 
 ---
 
-## 13. THE MERGE ITSELF IS UNVERIFIED — read before trusting any figure
+## 13. ~~THE MERGE ITSELF IS UNVERIFIED~~ — superseded by item 14
 
-All five tracks were merged at `caa77f8`. **No part of that work passed a clean
-external adversarial review, and the merged result has had none at all.**
+This entry recorded the state immediately after the five-track merge at
+`caa77f8`: all tracks were merged and the merged result had not yet had the
+external adversarial review item 11 required. That review later ran against
+`1f6699d`; item 14 is now the current record.
 
 ### What was actually verified
 
@@ -387,10 +371,10 @@ external adversarial review, and the merged result has had none at all.**
    that — including Track D's two HIGH egress findings, Track A's poison-test
    rework, Track C's predicate split and Track E's DRAFT rendering — rests on
    the tracks' own reports and my reading of them.
-3. **The merged result has had no review.** Item 11 called this out as the one
-   review covering what per-track reviews structurally cannot. It did not run.
-   Four seams were caught by the suite; there is no evidence about seams the
-   suite does not model.
+3. **At the time this was written, the merged result had had no review.** Item
+   11 called this out as the one review covering what per-track reviews
+   structurally cannot. That review later ran; item 14 records its findings and
+   the audit of their fixes.
 4. **The base rate is the argument.** In this round, work that looked complete
    was wrong on the first review **49 times out of 49**. Nothing about the last
    round makes it different in kind — only unexamined.
@@ -412,8 +396,7 @@ external adversarial review, and the merged result has had none at all.**
 
 ### What to do when the reviewer returns
 
-Run the final merged review specified in item 11. Treat this entry as open until
-it comes back and its findings are closed. `pre-merge-baseline` tags the last
+Current status moved to item 14. `pre-merge-baseline` still tags the last
 externally-sane state if a clean revert is ever wanted.
 
 ---
@@ -460,6 +443,6 @@ and both worth recording because they are the kind that look fine:
   the poison applying and the test failed for having nothing to detect rather
   than for detecting nothing.
 
-**Still unreviewed:** this audit is mine. Codex resets 2026-08-11, and the final
-merged review in item 11 remains outstanding — it is the one check that looks at
-the seams between all of this, and nothing here replaces it.
+**Still unreviewed:** this audit is mine. The final merged review found six
+issues and those fixes were audited here, but the audit's own follow-up fixes
+need the next holistic seam review.

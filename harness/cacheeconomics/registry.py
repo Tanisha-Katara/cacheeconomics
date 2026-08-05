@@ -115,12 +115,22 @@ def target(target_id, allow_contested=False):
                         f"known: {', '.join(target_ids())}")
 
 
+_NUMERIC_CAPABILITIES = {
+    "lookback_blocks",
+    "max_breakpoints",
+    "routing_hash_prefix_tokens",
+}
+
+
 def capability(target_id, name, allow_contested=False):
     t = target(target_id, allow_contested)
     caps = t.get("capabilities", {})
     if name not in caps:
         raise RegistryError(f"{target_id} records no capability {name!r}")
-    return caps[name]
+    value = caps[name]
+    if name in _NUMERIC_CAPABILITIES and value is not None:
+        return _finite_number(value, f"capability {name!r} on {target_id}")
+    return value
 
 
 def multipliers(target_id):
@@ -387,17 +397,35 @@ def _finite_number(value, what):
     return value
 
 
+def _rate_rows(model):
+    try:
+        rows = pricing()["models"][model]["rates"]
+    except KeyError as e:
+        raise RegistryError(f"no recorded rates for {model}") from e
+    out = []
+    for row in rows:
+        try:
+            start, rate = row
+        except (TypeError, ValueError) as e:
+            raise RegistryError(
+                f"a rate row for {model!r} must be [effective_date, rate], got "
+                f"{row!r}") from e
+        out.append((_as_date(start, "rate effective date"), start, rate))
+    return sorted(out, key=lambda row: row[0])
+
+
 def _base_rate_unscoped(model, on_date):
     """Base input USD/Mtok effective on `on_date` (ISO yyyy-mm-dd or date)."""
     when = _as_date(on_date, "on_date")
     models = pricing()["models"]
     if model not in models:
         raise RegistryError(f"no pricing recorded for {model!r}")
-    applicable = [r for start, r in sorted(models[model]["rates"])
-                  if _as_date(start, "rate effective date") <= when]
+    applicable = [(start, r) for parsed, start, r in _rate_rows(model)
+                  if parsed <= when]
     if not applicable:
         raise RegistryError(f"no rate for {model!r} effective on {when}")
-    return _finite_number(applicable[-1], f"the rate for {model!r} on {when}")
+    start, rate = applicable[-1]
+    return _finite_number(rate, f"the rate for {model!r} effective {start}")
 
 
 # The surface an ingest reports when a row states no provider at all. Registered
@@ -452,14 +480,12 @@ def upcoming_rate_change(model, on_date):
     # month digit and hid a rate change a month away, "not-a-date" silently
     # returned None, and an int raised a bare TypeError that callers catching
     # RegistryError do not catch.
-    try:
-        rows = pricing()["models"][model]["rates"]
-    except KeyError as e:
-        raise RegistryError(f"no recorded rates for {model}") from e
     when = _as_date(on_date)
-    for start, rate in sorted(rows):
-        if _as_date(start) > when:
-            return {"effective": start, "rate": rate}
+    for parsed, start, rate in _rate_rows(model):
+        if parsed > when:
+            return {"effective": start,
+                    "rate": _finite_number(
+                        rate, f"the rate for {model!r} effective {start}")}
     return None
 
 
