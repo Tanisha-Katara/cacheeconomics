@@ -326,17 +326,10 @@ def help_text_surface_claims():
 # A track closing one of these edits its set to `()`. Leaving it stale fails.
 
 # INV-1, Track A. A 1-hour window publishes these as released projections.
-KNOWN_PROJECTION_LEAKS = (
-    "root.findings[0].avoidable_usd_month",
-    "root.total_avoidable_month",
-)
+KNOWN_PROJECTION_LEAKS = ()   # closed by Track A
 
 # INV-2, Track A. Money in --format json with no state scoped to that field.
-KNOWN_JSON_UNPROVENANCED = (
-    "findings[0].avoidable_usd_month",
-    "reconciliation.computed_usd",
-    "reconciliation.delta_usd",
-)
+KNOWN_JSON_UNPROVENANCED = ()   # closed by Track A
 
 # INV-4, Track B. Public callables defaulting target_id to a named surface.
 KNOWN_SURFACE_DEFAULTS = ()   # closed by Track B

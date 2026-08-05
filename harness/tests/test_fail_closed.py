@@ -606,11 +606,6 @@ class TestARateFreeRuleIsSafeOnATraceNothingCanPrice(unittest.TestCase):
         """
         self._assert_poison_is_refused(scope="shared")
 
-    # KNOWN-FAILING pending Track B: `cost.price` and `cost.ttl_crossover` guard
-    # with `isinstance(m.get(k), (int, float))`, and `bool` satisfies that -- so
-    # the delegated pricing path still takes True as 1.0x. Delete this marker
-    # when `cost.py` refuses booleans.
-    @unittest.expectedFailure
     def test_the_delegated_pricing_path_also_refuses_a_boolean(self):
         """At the seam, because the figure cannot tell the two cases apart.
 
@@ -689,12 +684,6 @@ class TestARateFreeRuleIsSafeOnATraceNothingCanPrice(unittest.TestCase):
                           "read": None}, False),
     )
 
-    # KNOWN-FAILING until Track B's `cost.py` lands here: this worktree's copy
-    # predates `unusable_multipliers`, so `_lifetime_multipliers` is still
-    # running its own pre-merge branch. When the shared helper arrives this
-    # reports "Unexpected success" -- delete this marker AND the fallback branch
-    # in `_lifetime_multipliers` together.
-    @unittest.expectedFailure
     def test_the_multiplier_validator_has_one_definition(self):
         """Seven consumers of `registry.multipliers`, one decision.
 
@@ -1069,7 +1058,23 @@ class TestARealAssumedSurfaceTraceIsNotInvoiceChecked(unittest.TestCase):
 
     def _loaded(self):
         from cacheeconomics.adapters.claude_code import load_sessions
-        return load_sessions(root=self._root())
+        # `surface_assumed=True` because that is what the assumed path IS
+        # after Track B: the adapter records the assumption only when the
+        # caller says the surface was arrived at by assumption, so that
+        # `--target-id anthropic/direct` stated from knowledge is not
+        # mislabelled. This test is about the ASSUMED path, so it says so.
+        # Before that change the note was unconditional and this call did not
+        # need to.
+        # Both arguments, because both are what the assumed path IS after
+        # Track B: `--assume-anthropic-direct` sets the surface AND says it was
+        # assumed rather than known. `target_id` now defaults to UNATTRIBUTED,
+        # so passing only `surface_assumed` records an assumption of
+        # "unknown/unattributed" -- true, and not the assumption this class is
+        # about. Before that change the note was unconditional and the default
+        # was anthropic/direct, so this call needed neither.
+        return load_sessions(root=self._root(),
+                             target_id="anthropic/direct",
+                             surface_assumed=True)
 
     def test_the_loader_really_does_assume_the_surface(self):
         """Guard the guard. If the transcript named a provider there would be no
@@ -1087,9 +1092,6 @@ class TestARealAssumedSurfaceTraceIsNotInvoiceChecked(unittest.TestCase):
         self.assertTrue(a.reconciliation["within_ship_gate"])
         self.assertTrue(a.spend["input_usd"].released)
 
-    # KNOWN-FAILING pending Track B: `TraceSet.assumed_inputs` does not exist
-    # and `load_sessions` does not populate it. Delete this marker when it does.
-    @unittest.expectedFailure
     def test_the_figures_are_not_marked_invoice_checked(self):
         from cacheeconomics import money
         ts = self._loaded()
@@ -3768,7 +3770,6 @@ class TestAnAssumedSurfaceMustNotReconcileWithoutTheCLI(unittest.TestCase):
             "cannot detect a fix that forgets them: " + ", ".join(missing)
             + f"\n    released: {sorted(released)}")
 
-    @unittest.expectedFailure
     def test_an_assumed_surface_is_never_labelled_reconciled(self):
         from cacheeconomics.money import RECONCILED
         with tempfile.TemporaryDirectory() as tmp:
@@ -4477,14 +4478,6 @@ class TestABooleanMultiplierIsRefusedRatherThanPricedAtOneX(unittest.TestCase):
                     f"{v!r}: effective_rate {'accepts' if rate_ok else 'refuses'}"
                     f" it, is_multiplier says {cost.is_multiplier(v)}")
 
-    # KNOWN-FAILING in this worktree only, and deliberately an invariant rather
-    # than a scoped check. The four analyzer consumers delegate to Track A's
-    # `_lifetime_multipliers`, which lives on their branch; here they are
-    # genuinely unguarded, so this reports the true state of *this* tree. At
-    # merge it flips to "Unexpected success" and forces the marker's deletion,
-    # which is the confirmation that all seven are closed together -- exactly
-    # what a scoped-to-my-files version could never tell anyone.
-    @unittest.expectedFailure
     def test_every_consumer_of_the_registry_multipliers_validates(self):
         """Discovered by AST walk, not by a list written here.
 

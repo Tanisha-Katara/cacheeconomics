@@ -1007,15 +1007,6 @@ class TestAnAssumedSurfaceCannotBePublishedAsReconciled(unittest.TestCase):
             "these say an invoice checked them, over an assumed rate table: "
             + ", ".join(claimed))
 
-    # KNOWN-FAILING here only: this is finding M2 (`analysis_json` builds
-    # `release_state` from `a.spend` alone), which Track A has already fixed on
-    # main with one `_release_state` helper covering spend, reconciliation and
-    # findings. This worktree predates that fix, so `reconciliation.computed_usd`
-    # and `reconciliation.delta_usd` come back with no state at all. The
-    # underlying Figures *are* draft -- `test_and_the_reconciliation_figures_too`
-    # pins that on the Analysis -- so this asserts the serialiser carries it.
-    # Delete this marker once Track A's `analysis_json` is merged in.
-    @unittest.expectedFailure
     def test_every_money_field_in_the_json_carries_release_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = self._payload(tmp)
