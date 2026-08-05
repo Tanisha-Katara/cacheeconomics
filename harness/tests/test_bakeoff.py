@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -44,6 +45,41 @@ def req(n, segments, gap=60, model="claude-opus-5", usage=None):
     return Request(request_id=f"r{n}", sent_at=T0 + timedelta(seconds=gap * n),
                    model=model, usage=usage or {}, segments=segments,
                    agent="a", target_id="anthropic/direct")
+
+
+def instrumented(reqs, **kw):
+    """The trace a list of hand-built requests came from, stated.
+
+    `bake_off` will not answer the gate over segment boundaries whose
+    provenance nobody has claimed -- alignment, coverage and whether the sizes
+    were counted live on the `TraceSet` and on nothing a `Request` carries, so
+    a bare list means "not stated" and not "fine". Tests that assert a verdict
+    say what they are asserting it over; tests that assert an *indeterminate*
+    verdict do not need this, because the condition they are testing blocks
+    first either way.
+
+    Rows with no `usage` get the minimum that makes them internally consistent:
+    the segment total as uncached input. Many simulator fixtures were written
+    structure-only, with `usage={}` standing for "this test is not about
+    counters" -- but a row with no counters is not in `analysable`, so a
+    `TraceSet` built from it declares every row a billed row no arm could
+    model, which is both true of the declaration and false of the intent.
+
+    Synthetic, and safe to synthesise here because it was measured rather than
+    assumed: over `volatile_head(20)`, `volatile_head(30)` and two other
+    structure-only fixtures, adding this usage left every arm's reads, writes
+    and raw spend byte-identical. The arms price from segments and the modelled
+    cache and never read `usage`. It deliberately claims no cache behaviour --
+    zero reads, zero writes -- because the fixture never recorded any; it claims
+    only that the prompt these segments describe was billed once at its own
+    size, which is what makes `segment_sum_ratio` 1.0 and the row analysable.
+    """
+    fixed = [r if r.has_usage
+             else replace(r, usage={"input_tokens": sum(s.tokens for s in r.segments),
+                                    "cache_read_input_tokens": 0,
+                                    "cache_creation_input_tokens": 0})
+             for r in reqs]
+    return TraceSet(requests=fixed, tier=Tier.INSTRUMENTED, **kw)
 
 
 def volatile_head(n=6, model="claude-opus-5"):
@@ -238,7 +274,9 @@ class TestRelocationLite(unittest.TestCase):
 class TestBakeOff(unittest.TestCase):
 
     def test_relocation_beats_placement_when_the_prefix_is_blocked(self):
-        b = simulate.bake_off(volatile_head(n=20))
+        reqs = volatile_head(n=20)
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertGreater(b.delta_pct_relocation, b.delta_pct)
 
     def test_verdict_says_linter_below_the_gate(self):
@@ -591,7 +629,9 @@ class TestNoFabricatedReads(unittest.TestCase):
             self.assertLessEqual(p.reads, n.reads)
 
     def test_the_headline_is_the_pessimistic_end_of_the_range(self):
-        b = simulate.bake_off(volatile_head(n=30))
+        reqs = volatile_head(n=30)
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertLessEqual(b.delta_pct, b.delta_pct_optimistic,
                              "the reported verdict must not be the flattering end")
         # A tie states itself in words rather than as "0.0%". That case became
@@ -2819,7 +2859,9 @@ class TestPartialBakeOffsAreIndeterminate(unittest.TestCase):
                       seg(1, "user", 100, f"t{i}")]) for i in range(n)]
 
     def test_a_clean_trace_still_produces_a_verdict(self):
-        b = simulate.bake_off(self._clean())
+        reqs = self._clean()
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertIsNotNone(b.delta_pct)
         self.assertNotIn("indeterminate", b.verdict)
 
@@ -3136,7 +3178,9 @@ class TestUnknownMinimumsAreNotAssumedCacheable(unittest.TestCase):
         self.assertEqual(res.unmodelled_ttl, 6)
 
     def test_a_registered_model_still_produces_a_verdict(self):
-        b = simulate.bake_off(self._reqs("claude-opus-5"))
+        reqs = self._reqs("claude-opus-5")
+        ts = instrumented(reqs)
+        b = simulate.bake_off(ts.analysable, trace=ts)
         self.assertIsNotNone(b.delta_pct)
 
 
@@ -3463,6 +3507,12 @@ class TestTheBakeOffRefusesUnvalidatedSizes(unittest.TestCase):
                  # used to get from the loader defaulting an unnamed row
                  # to first-party.
                  "target_id": "anthropic/direct",
+                 # Stated alongside the surface, and for the same reason: these
+                 # tests are about size *agreement*, so counted sizes are a
+                 # precondition rather than the thing under test. A row that does
+                 # not say counts as estimated, and an estimated split now blocks
+                 # the comparison as well as the dollars.
+                 "tokens_counted": True,
                  "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
                            "cache_creation_input_tokens": 1_000,
                            "cache_creation": {"ephemeral_5m_input_tokens": 1_000,
@@ -3480,22 +3530,26 @@ class TestTheBakeOffRefusesUnvalidatedSizes(unittest.TestCase):
         try:
             with open(path, "w") as f:
                 f.write("\n".join(json.dumps(r) for r in rows))
-            return load_jsonl(path).analysable
+            return load_jsonl(path)
         finally:
             os.unlink(path)
 
+    def _bake(self, seg_tokens, n=20):
+        ts = self._trace(seg_tokens, n=n)
+        return simulate.bake_off(ts.analysable, trace=ts)
+
     def test_agreeing_sizes_produce_a_verdict(self):
         """The control. Refusing everything would also pass a bad test."""
-        b = simulate.bake_off(self._trace(500))
+        b = self._bake(500)
         self.assertIsNotNone(b.delta_pct)
 
     def test_mis_scaled_sizes_produce_no_percentage(self):
-        b = simulate.bake_off(self._trace(500_000))
+        b = self._bake(500_000)
         self.assertIsNone(b.delta_pct)
         self.assertTrue(b.verdict.startswith("indeterminate"))
 
     def test_the_verdict_says_the_percentage_survives_but_the_absolutes_do_not(self):
-        b = simulate.bake_off(self._trace(500_000))
+        b = self._bake(500_000)
         self.assertIn("differ from", b.verdict)
         self.assertIn("does not cancel out of the absolutes", b.verdict)
         # The observed magnitude, not just that something was wrong. An operator
@@ -3659,6 +3713,13 @@ class TestArmSpendIsATypedFigure(unittest.TestCase):
                          # unnamed row to first-party, which is the thing that
                          # default now refuses to do.
                          "target_id": "anthropic/direct",
+                         # Stated for the same reason `target_id` is. Releasing
+                         # arm spend now also asks whether the segment sizes it
+                         # is priced from were counted rather than split by byte
+                         # share, and a row that does not say counts as
+                         # estimated. These tests are about the *size* gate, so
+                         # they state the precondition instead of inheriting it.
+                         "tokens_counted": True,
                          "usage": {"input_tokens": 0,
                                    "cache_read_input_tokens": 0,
                                    "cache_creation_input_tokens": 1_000,
@@ -3672,7 +3733,11 @@ class TestArmSpendIsATypedFigure(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("\n".join(json.dumps(r) for r in rows))
             kw.setdefault("allow_unreconciled", True)
-            return simulate.bake_off(load_jsonl(path).analysable, **kw)
+            ts = load_jsonl(path)
+            # The trace, not just the rows the arms replay. Alignment, coverage
+            # and counted-versus-estimated sizes live here and nowhere on a
+            # `Request`, so a bake-off handed only `analysable` cannot ask them.
+            return simulate.bake_off(ts.analysable, trace=ts, **kw)
         finally:
             os.unlink(path)
 
@@ -3809,6 +3874,9 @@ class TestSizesInsideTheOldFactorStillWithhold(unittest.TestCase):
                 # get one from the loader answering an unnamed row with
                 # first-party.
                 "target_id": "anthropic/direct",
+                # As above: this class isolates the size gate, so the
+                # counted-sizes precondition is stated rather than assumed.
+                "tokens_counted": True,
                 "usage": {"input_tokens": 0, "cache_read_input_tokens": 0,
                           "cache_creation_input_tokens": self.BILLED,
                           "cache_creation": {
@@ -3827,7 +3895,7 @@ class TestSizesInsideTheOldFactorStillWithhold(unittest.TestCase):
             with open(path, "w") as f:
                 f.write("\n".join(json.dumps(r) for r in rows))
             ts = load_jsonl(path)
-            return ts, simulate.bake_off(ts.analysable, **kw)
+            return ts, simulate.bake_off(ts.analysable, trace=ts, **kw)
         finally:
             os.unlink(path)
 
@@ -3954,14 +4022,26 @@ class TestBakeOffNeedsAnInvoiceToo(unittest.TestCase):
     at the same rates, so they inherit its credibility once it has earned it.
     """
 
-    def _reqs(self):
+    def _ts(self):
         from cacheeconomics.trace import load_jsonl
         return load_jsonl(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "fixtures", "demo-traces.jsonl")).analysable
+            "fixtures", "demo-traces.jsonl"))
+
+    def _bake(self, **kw):
+        """The whole trace, not only the rows the arms replay.
+
+        This class isolates the *invoice* half of the release rule, and the
+        structural half now has to be satisfied for the invoice to be the thing
+        under test. The demo fixture is instrumented with counted segment sizes
+        and full coverage, so passing it establishes the precondition rather
+        than waiving it.
+        """
+        ts = self._ts()
+        return simulate.bake_off(ts.analysable, trace=ts, **kw)
 
     def test_no_invoice_withholds_the_absolutes(self):
-        b = simulate.bake_off(self._reqs())
+        b = self._bake()
         self.assertFalse(b.arms["as-shipped"]["spend"].released)
         self.assertIn("no invoice was supplied",
                       b.arms["as-shipped"]["spend"].withheld_because)
@@ -3969,37 +4049,157 @@ class TestBakeOffNeedsAnInvoiceToo(unittest.TestCase):
     def test_the_percentage_survives_that(self):
         """It is scale-invariant and it is what Gate 1 reads. Withholding it
         because the dollars are unreconciled would be theatre."""
-        b = simulate.bake_off(self._reqs())
+        b = self._bake()
         self.assertIsNotNone(b.delta_pct)
         self.assertIn("vs litellm-auto", str(b))
 
     def test_a_reconciling_invoice_releases(self):
-        b = simulate.bake_off(self._reqs(), invoice_usd=17.45)
+        b = self._bake(invoice_usd=17.45)
         self.assertTrue(b.arms["as-shipped"]["spend"].released)
 
     def test_an_invoice_that_does_not_reconcile_withholds(self):
-        b = simulate.bake_off(self._reqs(), invoice_usd=99.00)
+        b = self._bake(invoice_usd=99.00)
         self.assertFalse(b.arms["as-shipped"]["spend"].released)
         self.assertIn("does not reconcile",
                       b.arms["as-shipped"]["spend"].withheld_because)
 
     def test_the_draft_flag_is_the_deliberate_override(self):
-        b = simulate.bake_off(self._reqs(), allow_unreconciled=True)
+        b = self._bake(allow_unreconciled=True)
         self.assertTrue(b.arms["as-shipped"]["spend"].released)
 
     def test_a_nonsense_invoice_does_not_release(self):
         for bad in (0.0, -17.45):
             with self.subTest(invoice=bad):
-                b = simulate.bake_off(self._reqs(), invoice_usd=bad)
+                b = self._bake(invoice_usd=bad)
                 self.assertFalse(b.arms["as-shipped"]["spend"].released)
 
+    def test_the_same_trace_without_the_trace_argument_withholds(self):
+        """The reconciling invoice from two tests up, minus the trace.
+
+        Nothing about the workload changed -- only whether the caller stated the
+        evidence. An unstated gate is not a passed one, so the figures that
+        released above are withheld here.
+        """
+        ts = self._ts()
+        b = simulate.bake_off(ts.analysable, invoice_usd=17.45)
+        self.assertFalse(b.arms["as-shipped"]["spend"].released)
+        self.assertIn("no trace was supplied",
+                      b.arms["as-shipped"]["spend"].withheld_because)
+
+    def _two_agents(self, n=6):
+        """Two agents with identical, clean traffic, so the whole workload
+        prices at almost exactly twice either group."""
+        reqs = []
+        for agent in ("alpha", "beta"):
+            for i in range(n):
+                reqs.append(Request(
+                    request_id=f"{agent}{i}",
+                    sent_at=T0 + timedelta(seconds=60 * i),
+                    model="claude-opus-5", agent=agent, tenant="t",
+                    session=f"s{agent}", target_id="anthropic/direct",
+                    ttl_requested="5m",
+                    usage={"input_tokens": 300,
+                           "cache_creation_input_tokens": 30_000,
+                           "cache_read_input_tokens": 0},
+                    segments=[seg(0, "system", 300, f"h{agent}{i}"),
+                              seg(1, "system", 30_000, "body", marked=True,
+                                  ttl="5m")]))
+        return TraceSet(requests=reqs, tier=Tier.INSTRUMENTED)
+
     def test_the_per_agent_run_does_not_reconcile_against_the_whole_invoice(self):
-        """The bill covers the workload, not one agent's slice of it. Passing it
-        down would let each group compare its own share to the full total and
-        release on whichever slice happened to land within 5%."""
-        import inspect
-        src = inspect.getsource(simulate.bake_off_by_agent)
-        self.assertNotIn("invoice_usd=invoice_usd", src)
+        """The bill covers the workload, not one agent's slice of it.
+
+        Behavioural, because the source check this replaced asserted that
+        `invoice_usd=invoice_usd` does not appear in `bake_off_by_agent` -- which
+        pins an implementation rather than the property, and went red on a
+        correct one. The invoice is passed there now, to a single whole-workload
+        run whose reconciliation every group inherits. What must never happen is
+        a *group* releasing because its own slice matched the full bill.
+
+        So the invoice here is one group's spend. Each group's share matches it
+        within 5%; the workload is twice it and does not. Nothing may release.
+        """
+        ts = self._two_agents()
+        alpha = [r for r in ts.analysable if r.agent == "alpha"]
+        scoped = replace(ts, requests=alpha)
+        one_group = simulate.bake_off(
+            scoped.analysable, trace=scoped,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        whole = simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        self.assertAlmostEqual(whole / one_group, 2.0, places=2,
+                               msg="the fixture must make the slice and the "
+                                   "workload disagree, or this proves nothing")
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=one_group)
+        self.assertTrue(out, "no groups came back, so nothing was checked")
+        for b in out:
+            self.assertFalse(
+                b.arms["as-shipped"]["spend"].released,
+                f"{b.group} released because its own slice matched the whole "
+                f"workload's invoice")
+            self.assertIsNone(b.delta_pct, b.group)
+
+    def test_a_reconciling_invoice_frees_the_comparison_but_not_the_dollars(self):
+        """The other direction, and the asymmetry is deliberate.
+
+        A *failed* reconciliation is evidence about the capture and taints every
+        slice cut from it, so it blocks the groups outright. A *passed* one is
+        evidence about the total, and a total that matches does not establish
+        that any particular agent's share does -- per-group errors can cancel in
+        the sum. So the comparison is freed and the dollars are not.
+
+        What must not survive is the caption. A group whose workload reconciled
+        against a real bill used to be told "no invoice was supplied", which is
+        simply false.
+        """
+        ts = self._two_agents()
+        whole = simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=whole)
+        self.assertTrue(out, "no groups came back, so nothing was checked")
+        for b in out:
+            fig = b.arms["as-shipped"]["spend"]
+            self.assertFalse(fig.released, b.group)
+            self.assertNotIn("no invoice was supplied", fig.withheld_because,
+                             f"{b.group} was told no invoice was supplied when "
+                             f"one was supplied and reconciled")
+            self.assertIn("reconciles against the whole workload",
+                          fig.withheld_because)
+            self.assertIsNotNone(b.delta_pct, b.group)
+            self.assertNotIn("indeterminate", b.verdict)
+
+    def test_the_draft_flag_still_reaches_the_per_agent_figures(self):
+        """The escape hatch has to keep working, or the by-agent path can never
+        show a dollar figure at all and the flag is decoration there."""
+        ts = self._two_agents()
+        whole = simulate.bake_off(
+            ts.analysable, trace=ts,
+            allow_unreconciled=True).arms["as-shipped"]["spend"].raw()
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=whole,
+                                         allow_unreconciled=True)
+        self.assertTrue(out)
+        for b in out:
+            self.assertTrue(b.arms["as-shipped"]["spend"].released, b.group)
+
+    def test_the_draft_flag_does_not_reach_them_when_the_invoice_failed(self):
+        """And it must not become a way round a bill the trace contradicts.
+        Measured on the real command before this: `--by-agent --invoice-usd
+        999999 --allow-unreconciled` printed $16.2077 per agent with a 68.9%
+        Gate 1 pass beside it."""
+        ts = self._two_agents()
+        out = simulate.bake_off_by_agent(ts.analysable, trace=ts,
+                                         invoice_usd=999_999.0,
+                                         allow_unreconciled=True)
+        self.assertTrue(out)
+        for b in out:
+            self.assertFalse(b.arms["as-shipped"]["spend"].released, b.group)
+            self.assertIsNone(b.delta_pct, b.group)
+            self.assertNotIn("beats the automatic baseline", b.verdict)
 
     def test_the_cli_exposes_both_flags(self):
         """It accepted neither, which is why the default printed dollars."""
