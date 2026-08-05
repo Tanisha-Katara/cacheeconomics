@@ -159,6 +159,48 @@ def _json_safe(value):
     return value
 
 
+def _release_state(mapping) -> dict:
+    """`{field: how it earned release}` for every Figure in `mapping`.
+
+    One function, called from every section of the payload that carries money.
+    It was inline in `spend` alone, so `spend` was the only section a script
+    could read release state from -- while `findings[].avoidable_usd_month` and
+    both reconciliation figures shipped as bare strings. A consumer could not
+    tell a published figure from a withheld or a draft one, which is the machine
+    half of the DRAFT banner and the entire point of the gate.
+
+    A withheld figure maps to `""`, which is what `released_as` holds when
+    nothing released it. The value string beside it already reads
+    "[withheld: ...]", so the pair says both what the figure is and why. That
+    convention comes from the `spend` block rather than being invented here:
+    two sections answering the same question in two encodings is how a consumer
+    ends up special-casing one of them.
+    """
+    return {k: v.released_as for k, v in (mapping or {}).items()
+            if hasattr(v, "released_as")}
+
+
+def _reconciliation_json(recon):
+    """The reconciliation block, with release state for the money in it.
+
+    `computed_usd` and `delta_usd` are Figures and go through the same gate as
+    everything else; they serialised as bare strings with nothing beside them
+    saying so. A script reading `"computed_usd": "$16.97"` cannot tell it from
+    `"$16.97"` that the gate refused -- and on a *failed* reconciliation that is
+    exactly the number the gate just declined to publish.
+
+    `invoice_usd` and `delta_pct` are deliberately not in the state map: the
+    invoice is the reader's own input rather than a claim this tool makes, and a
+    ratio is not a spend total. Both stay plain numbers, which is what the
+    analyzer already decided; this only reports what it decided.
+    """
+    if recon is None:
+        return None
+    out = _json_safe(recon)
+    out["release_state"] = _release_state(recon)
+    return out
+
+
 def analysis_json(a, tier_name: str = "", coverage=None) -> str:
     """The machine-readable analysis, as one callable both the CLI and its
     tests go through.
@@ -172,6 +214,29 @@ def analysis_json(a, tier_name: str = "", coverage=None) -> str:
 
     An invariant that cannot reach the real code path will be given a
     convincing substitute. The fix is not a better mirror, it is a seam.
+
+    Shape: money stays a string beside a `release_state` map, rather than
+    becoming `{value, release_state, caveats}` per figure. Three reasons, and
+    the middle one is the one that decided it.
+
+    Per-figure caveats would claim precision this package does not have. A
+    caveat here is a fact about the whole ingest -- the surface was assumed, a
+    class of rows was excluded -- and it qualifies every figure in the document
+    equally. Attaching the same list to each figure would either duplicate it
+    everywhere or imply the analyzer worked out which caveat bears on which
+    number, which it does not. A report-scoped fact belongs at report scope, and
+    inventing per-figure attribution to make a serialisation tidier is how a
+    number comes to look better-evidenced than it is.
+
+    The value type is also published surface. `spend` maps names to strings
+    today and a consumer can rely on that; changing it to objects in the same
+    round as four other fixes buys a uniformity that nothing has asked for.
+
+    What the alternative was actually meant to close -- a consumer picking up a
+    dollar value without its state -- is closed already and tested from the
+    outside: `TestEveryDollarFieldInTheJsonCarriesItsReleaseState` scans the
+    decoded payload for anything money-shaped and requires state for every one,
+    so a section added later is covered without editing that test.
     """
     # Figures are rendered through `str`, so a withheld one serialises as
     # "[withheld: ...]" rather than a number somebody's script would treat
@@ -180,20 +245,45 @@ def analysis_json(a, tier_name: str = "", coverage=None) -> str:
         "tier": tier_name,
         "coverage": coverage,
         "window_days": a.window_days,
+        # Before `spend`, and before every other dollar-bearing section.
+        #
+        # The text and HTML reports both print these above the first figure they
+        # qualify, and this renderer put every figure ahead of all of them while
+        # carrying the caveats nowhere at all -- `blocking_notes` was absent from
+        # the payload, so a consumer had to fish the sentences out of `notes` by
+        # matching prose. That is the same defect the ordering fix closed in the
+        # other two renderers, and worse in this one: the caveat was not late,
+        # it was missing.
+        #
+        # `draft` is derived here rather than left for the consumer to infer, so
+        # the machine-readable answer to "is this forwardable" is one boolean
+        # rather than a scan of every release state.
+        "caveats": list(a.blocking_notes),
+        "draft": any(getattr(v, "released_as", "") == "draft"
+                     for v in a.spend.values()),
         "spend": {k: str(v) for k, v in a.spend.items()},
         # A script reading this saw only strings and could not tell a
         # draft figure from an invoice-checked one. The state is the
         # machine-readable half of the DRAFT banner.
-        "release_state": {k: getattr(v, "released_as", "")
-                          for k, v in a.spend.items()
-                          if hasattr(v, "released_as")},
-        "reconciliation": _json_safe(a.reconciliation),
+        "release_state": _release_state(a.spend),
+        "reconciliation": _reconciliation_json(a.reconciliation),
         "findings": [{"code": f.code, "severity": f.severity,
                       "title": f.title, "confidence": f.confidence,
                       "affected_requests": f.affected_requests,
                       "avoidable_usd_month": (str(f.avoidable_usd_month)
                                               if f.avoidable_usd_month
-                                              else None)}
+                                              else None),
+                      # The amount over the observed window, beside the
+                      # extrapolation. On a trace below the projection floor
+                      # this is the only one of the two that is published, and
+                      # a consumer that could see only the monthly field read
+                      # the whole finding as uncosted.
+                      "avoidable_usd_window": (str(f.avoidable_usd_window)
+                                               if f.avoidable_usd_window
+                                               else None),
+                      "release_state": _release_state({
+                          "avoidable_usd_month": f.avoidable_usd_month,
+                          "avoidable_usd_window": f.avoidable_usd_window})}
                      for f in a.findings],
         "notes": a.notes,
     }, indent=2, default=str, allow_nan=False)

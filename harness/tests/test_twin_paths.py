@@ -1009,6 +1009,126 @@ class TestTheLiveResponseParserReadsBothLiteLLMShapes(unittest.TestCase):
                            "neither shape produced diagnostics; the test proves nothing")
 
 
+class TestACaveatPrecedesTheFigureItQualifies(unittest.TestCase):
+    """In both renderers, checked by offset rather than by presence.
+
+    A caveat is not a checkbox. The text report printed the spend caveats below
+    the findings table and the TOTAL, and the HTML one carried them in the
+    Standing block at section 04 -- after the Input spend KPI in 02 and every
+    finding in 03. So a reader met every number in the document and the sentence
+    saying what those numbers rest on afterwards. Measured on the fixture below:
+    the first "$" in the text report at character 2,213 against the caveat at
+    3,013.
+
+    This is the same defect, and the same test shape, as the DRAFT banner that
+    was inserted at index 1 -- inside `<head>` -- and passed a substring check
+    while rendering nowhere. Presence was never the claim; order is.
+    """
+
+    # Two, and the second one is load-bearing. The DRAFT banner quotes the
+    # *first* blocking note verbatim and prints at the top of both reports, so a
+    # check that searched for that text found the banner and passed wherever the
+    # caveat block itself sat -- measured by reverting the fix and watching this
+    # class stay green. A test whose subject is placement, satisfied by a
+    # different element that happens to contain the same words, is the same
+    # failure as asserting the DRAFT banner's presence while it rendered inside
+    # `<head>`. The second note appears only in the caveat block, so it is the
+    # one that actually pins the ordering.
+    NOTES = [("The surface was assumed to be anthropic/direct; the export names "
+              "none. Rates and cache multipliers here are an assumption."),
+             ("Sampling: this export carries one row in every four, so the "
+              "totals below describe a quarter of the traffic.")]
+
+    def _analysis(self):
+        reqs = [Request(request_id=f"r{i}",
+                        sent_at=T0 + timedelta(hours=6 * i),
+                        model="claude-opus-5", target_id="anthropic/direct",
+                        tenant="t", session="s", agent="a", ttl_requested="5m",
+                        usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 100_000},
+                        segments=[])
+                for i in range(12)]
+        ts = TraceSet(requests=reqs, tier=Tier.USAGE_ONLY, source="x",
+                      notes=list(self.NOTES),
+                      blocking_notes=list(self.NOTES))
+        invoice = analyze(ts, allow_unreconciled=True).spend["input_usd"].raw()
+        return analyze(ts, invoice_usd=invoice)
+
+    def _renderers(self):
+        from cacheeconomics import report
+        return [(n, getattr(report, n)) for n in dir(report)
+                if n.startswith("render_") and callable(getattr(report, n))]
+
+    def test_the_fixture_publishes_a_figure_to_be_qualified(self):
+        """Guard the guard: with nothing published there is no ordering to
+        check and every assertion below is vacuous."""
+        from cacheeconomics.analyzer import spend_caveats
+        a = self._analysis()
+        self.assertEqual(2, len(spend_caveats(a)), "both caveats must survive")
+        self.assertTrue(a.spend["input_usd"].released, "nothing published")
+
+    def test_the_second_caveat_is_not_carried_by_the_draft_banner(self):
+        """Guard the guard again, and this one is the reason the class has two
+        notes. The banner quotes the first blocking note, so only a caveat it
+        does not quote can prove where the caveat block itself sits."""
+        a = self._analysis()
+        banner = next((n for n in a.notes if n.startswith("DRAFT")), "")
+        self.assertNotIn(self._key(self.NOTES[1]), banner)
+
+    @staticmethod
+    def _key(note):
+        return note.split(";")[0][:40]
+
+    def test_the_first_dollar_is_a_computed_figure_not_the_invoice_echo(self):
+        """The check below measures against the first "$". That is the right
+        thing to measure only while the first "$" is a number this tool
+        *computed*.
+
+        The HTML report also echoes the client's own invoice back at them, and
+        an echo is an input rather than a claim -- a caveat about what the
+        analysis rests on has nothing to say about a number the reader typed in,
+        so placing a caveat relative to it would be answering a question nobody
+        asked. It happens not to be first in either renderer: the text report
+        states reconciliation as a percentage and never prints the invoice at
+        all, and the HTML hero carries "Caching saved $X" well above the
+        reconciliation card.
+
+        Asserted rather than assumed. If either of those ever changes, the probe
+        below starts silently measuring the wrong thing, and this is what says so.
+        """
+        a = self._analysis()
+        rendered = dict(self._renderers())
+        html = rendered["render_html"](a)
+        echo = html.find("against invoice")
+        self.assertNotEqual(-1, echo, "fixture no longer echoes the invoice")
+        self.assertLess(html.find("$"), echo,
+                        "the HTML report's first dollar is now the invoice echo")
+        text = rendered["render_text"](a)
+        head = text[:text.find("what it is costing you")]
+        self.assertNotIn("$", head,
+                         "the text report now prints a dollar before its "
+                         "findings table; check whether it is the invoice echo")
+
+    def test_every_renderer_puts_every_caveat_before_the_first_figure(self):
+        """Over every renderer found at runtime, so a third one cannot phrase
+        the ordering a third way -- which is exactly how these two diverged."""
+        from cacheeconomics.analyzer import spend_caveats
+        a = self._analysis()
+        for name, fn in self._renderers():
+            text = fn(a)
+            at_money = text.find("$")
+            self.assertNotEqual(-1, at_money, f"{name} printed no figure")
+            for note in spend_caveats(a):
+                with self.subTest(renderer=name, caveat=note[:30]):
+                    at_caveat = text.find(self._key(note))
+                    self.assertNotEqual(-1, at_caveat,
+                                        f"{name} dropped a caveat entirely")
+                    self.assertLess(
+                        at_caveat, at_money,
+                        f"{name} prints a computed figure at {at_money} and the "
+                        f"caveat that qualifies it at {at_caveat}")
+
+
 class TestCoverageThatGatesMoneyIsWeightedByMoney(unittest.TestCase):
     """Rows are the wrong denominator for a dollar figure.
 
@@ -1070,11 +1190,26 @@ class TestCoverageThatGatesMoneyIsWeightedByMoney(unittest.TestCase):
 
     def test_small_unstructured_rows_do_not_over_block(self):
         """Immaterial dark rows must still release. Refusing on any unstructured
-        row at all would make the gate useless on real exports."""
+        row at all would make the gate useless on real exports.
+
+        `avoidable_usd_window`: these thirty requests span an hour, so the
+        monthly figure is withheld by the projection floor whatever the billed
+        coverage is. The window figure is what this gate decides.
+        """
         ts = self._trace(100)
         self.assertGreaterEqual(ts.structural_coverage_billed, 0.90)
         a = analyze(ts, allow_unreconciled=True)
-        self.assertTrue(self._vol(a).avoidable_usd_month.released)
+        self.assertTrue(self._vol(a).avoidable_usd_window.released)
+
+    def test_a_dominant_unstructured_row_withholds_the_window_figure_too(self):
+        """The pair to the test above. The report falls back to the window
+        figure exactly where the monthly one is missing, so a gate that reached
+        only the monthly figure would put the withheld amount back on the page
+        under a different label."""
+        a = analyze(self._trace(3_000_000), allow_unreconciled=True)
+        self.assertFalse(self._vol(a).avoidable_usd_window.released)
+        self.assertIn("billed input tokens",
+                      self._vol(a).avoidable_usd_window.withheld_because)
 
     def test_alignment_is_weighted_by_billed_tokens_too(self):
         from cacheeconomics.adapters.bodies import score_alignment
@@ -1781,13 +1916,22 @@ class TestStructuralMoneyNeedsCountedTokens(unittest.TestCase):
         return next((f for f in a.findings if f.code == "VOL-1"), None)
 
     def test_estimated_tokens_carry_no_dollar_figure(self):
-        fig = self._vol(self._trace(tokens_counted=0.0)).avoidable_usd_month
-        self.assertFalse(fig.released)
-        self.assertIn("19.2%", fig.withheld_because)
+        v = self._vol(self._trace(tokens_counted=0.0))
+        for name in ("avoidable_usd_month", "avoidable_usd_window"):
+            with self.subTest(figure=name):
+                # Both, not just the monthly one. The report falls back to the
+                # window figure wherever the monthly one is missing, so a gate
+                # reaching one of them would print the amount it refused.
+                fig = getattr(v, name)
+                self.assertFalse(fig.released)
+                self.assertIn("19.2%", fig.withheld_because)
 
     def test_counted_tokens_do(self):
+        """`avoidable_usd_window`: this fixture is forty requests two minutes
+        apart, so its monthly figure is withheld by the projection floor however
+        the tokens were sized. The window figure is what counting gates."""
         self.assertTrue(self._vol(self._trace(tokens_counted=1.0))
-                        .avoidable_usd_month.released)
+                        .avoidable_usd_window.released)
 
     def test_the_finding_still_reports_without_the_figure(self):
         """Withholding the number must not withhold the diagnosis. The volatile
@@ -1952,6 +2096,14 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
         self.assertLess(len(brief), len(full),
                         "--detail added nothing, so the default hid nothing")
 
+    # Any amount the money column can print, as one pattern. Written against
+    # the column rather than against `/mo` alone: this fixture runs 78 minutes,
+    # so the projection floor withholds every monthly figure on it and a check
+    # spelled `~\$[\d,]+/mo` went vacuous the moment that floor reached the
+    # per-finding figures -- it stopped finding an amount, and its own guard is
+    # the only reason that was visible rather than silent.
+    ANY_AMOUNT = r"~\$[\d,]+(?:\.\d+)?/(?:mo|window)"
+
     def test_the_money_column_never_shows_a_number_the_gate_withheld(self):
         """The table is a new surface for a figure to escape through. It reads
         each Figure's own release state, so this checks the wiring rather than
@@ -1960,13 +2112,34 @@ class TestTheShortVersionLosesNothing(unittest.TestCase):
 
         from cacheeconomics.report import render_text
         released = self._analysis()
-        self.assertRegex(render_text(released), r"~\$[\d,]+/mo",
+        self.assertRegex(render_text(released), self.ANY_AMOUNT,
                          "fixture produces no amounts, so the check is vacuous")
 
         gated = self._gated()
         self.assertFalse(any(f.avoidable_usd_month and f.avoidable_usd_month.released
                              for f in gated.findings))
-        self.assertIsNone(re.search(r"~\$[\d,]+/mo", render_text(gated)))
+        self.assertFalse(any(f.avoidable_usd_window and f.avoidable_usd_window.released
+                             for f in gated.findings))
+        self.assertIsNone(re.search(self.ANY_AMOUNT, render_text(gated)))
+
+    def test_the_column_prints_the_window_amount_when_the_month_is_withheld(self):
+        """What the released run above is actually showing, named rather than
+        left to a regex alternation.
+
+        Without this the migration of that pattern reads as loosening it. The
+        claim is specific: this fixture reconciles, its monthly figures are
+        withheld because 78 minutes cannot be scaled to a month, and the amount
+        the window *did* support is printed instead of nothing at all.
+        """
+        from cacheeconomics.report import render_text
+        a = self._analysis()
+        eff = next(f for f in a.findings if f.code == "EFF-1")
+        self.assertFalse(eff.avoidable_usd_month.released,
+                         "fixture no longer sits below the projection floor")
+        self.assertTrue(eff.avoidable_usd_window.released)
+        out = render_text(a)
+        self.assertIn(f"~{eff.avoidable_usd_window}/window", out)
+        self.assertNotIn("/mo", out)
 
     def _gated(self):
         """The same analysis with the gate left on."""

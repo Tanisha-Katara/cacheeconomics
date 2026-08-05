@@ -280,15 +280,25 @@ class TestSegmentSizesMustAgreeWithWhatWasBilled(unittest.TestCase):
             os.unlink(path)
 
     def test_agreeing_sizes_still_publish(self):
-        """The control. Withholding everything would also pass a bad test."""
+        """The control. Withholding everything would also pass a bad test.
+
+        `avoidable_usd_window`, because these twenty rows are one minute apart
+        and the monthly figure is withheld by the projection floor whatever the
+        segment sizes say. This class is about sizes agreeing with the bill, and
+        the window figure is the one that gate decides.
+        """
         _, a = self._analyse(500)
         vol = next(f for f in a.findings if f.code == "VOL-1")
-        self.assertTrue(vol.avoidable_usd_month.released)
+        self.assertTrue(vol.avoidable_usd_window.released)
 
     def test_sizes_in_the_wrong_units_withhold_the_figure(self):
         _, a = self._analyse(1_000_000_000)
         vol = next(f for f in a.findings if f.code == "VOL-1")
         self.assertFalse(vol.avoidable_usd_month.released)
+        # Both of them. The report falls back to the window figure wherever the
+        # monthly one is missing, so a gate that reached only the monthly figure
+        # would print the amount it had just refused to publish.
+        self.assertFalse(vol.avoidable_usd_window.released)
 
     def test_the_reason_names_the_disagreement(self):
         _, a = self._analyse(1_000_000_000)

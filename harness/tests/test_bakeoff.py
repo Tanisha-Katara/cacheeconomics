@@ -1350,8 +1350,8 @@ class TestTTLMoneyRequiresProvenPrefixReuse(unittest.TestCase):
                 target_id="anthropic/direct", ttl_requested="5m"))
         return out
 
-    def _finding(self, reqs):
-        a = analyze(TraceSet(requests=reqs, tier=Tier.USAGE_ONLY), allow_unreconciled=True)
+    def _finding(self, reqs, tier=Tier.USAGE_ONLY):
+        a = analyze(TraceSet(requests=reqs, tier=tier), allow_unreconciled=True)
         return next((f for f in a.findings if f.code == "TTL-1"), None)
 
     def test_usage_only_reports_the_hypothesis_without_a_figure(self):
@@ -1361,13 +1361,48 @@ class TestTTLMoneyRequiresProvenPrefixReuse(unittest.TestCase):
         self.assertIn("does not carry segment identity", f.detail)
         self.assertEqual(f.severity, "medium")
 
-    def test_a_stable_marked_prefix_earns_the_figure(self):
-        f = self._finding(self._reqs(
+    def _stable(self):
+        return self._reqs(
             lambda i: [seg(0, "system", 7000, "same", "sys", marked=True, ttl="5m"),
-                       seg(1, "user", 100, f"t{i}")]))
+                       seg(1, "user", 100, f"t{i}")])
+
+    def test_a_stable_marked_prefix_earns_the_figure(self):
+        """Instrumented, because the figure is now costed from those segments.
+
+        This asked for a priced TTL-1 off a `USAGE_ONLY` trace that carried
+        segments anyway -- a shape a loader does not produce, and the one
+        combination in which TTL-1's figure was computed from segment spans
+        while the gate that judges segment quality never looked at it. The claim
+        the test makes is about proven prefix reuse, not about escaping that
+        gate, so the trace now says what it is.
+        """
+        f = self._finding(self._stable(), tier=Tier.INSTRUMENTED)
         self.assertIsNotNone(f.avoidable_usd_month)
         self.assertGreater(f.avoidable_usd_month.raw(), 0)
         self.assertEqual(f.severity, "high")
+
+    def test_the_priced_form_is_gated_by_the_structural_trust_gate(self):
+        """The same trace, unaligned, must not publish the same figure.
+
+        TTL-1 decides which spans matched, and now what share of a write each
+        span accounts for, from `marked_spans` -- so its figure is costed from
+        segment boundaries and sizes exactly like VOL-1's. It carried no
+        `structural` flag, so on a trace whose segmentation nothing had scored
+        it published dollars while VOL-1 beside it withheld them for that reason.
+        """
+        f = self._finding(self._stable(), tier=Tier.USAGE_ONLY)
+        self.assertTrue(f.structural, "the priced form is derived from spans")
+        self.assertFalse(f.avoidable_usd_month.released)
+        self.assertFalse(f.avoidable_usd_window.released)
+        self.assertEqual(f.confidence, "low")
+
+    def test_the_unpriced_form_is_not_marked_structural(self):
+        """The other arm has no segments to be judged on, and says so. Marking
+        it structural would print the report's "these rest on segment boundaries
+        inferred from logged bodies" note above a finding whose own text says
+        the trace carries no segment identity."""
+        f = self._finding(self._reqs(lambda i: []))
+        self.assertFalse(f.structural)
 
     def test_a_drifting_prefix_earns_nothing(self):
         """Each request writes a different span, so no later write is a rewrite
@@ -1377,6 +1412,234 @@ class TestTTLMoneyRequiresProvenPrefixReuse(unittest.TestCase):
                        seg(1, "user", 100, f"t{i}")]))
         if f is not None:
             self.assertIsNone(f.avoidable_usd_month)
+
+
+class TestTTLRecoveryIsProportionalToTheSpanThatMatched(unittest.TestCase):
+    """A request with nested markers writes one billed total, and TTL-1 credited
+    all of it to whichever span matched.
+
+    `earlier.append((sent_at, span, tokens))` stored the whole request's
+    `cache_write_5m` against every one of its spans, so when the lookback window
+    rejected the outer marker and an inner one matched instead, `min(match[1],
+    tokens)` handed the inner span the outer span's write. That is not a corner
+    case: it is what a tool-calling agent looks like, because appending turns
+    pushes the previous outermost marker out of the provider's lookback while
+    leaving the stable inner prefix reachable.
+
+    SYNTHETIC fixture. Three traces identical in every respect -- same billed
+    writes, same block counts, same cadence, same segment total -- differing
+    only in how much of the cached prefix sits inside the inner marker. The
+    defect makes all three produce the same figure, because the credit never
+    looked at the span. The fix makes them ordered.
+
+    Written as a comparison rather than as an expected dollar amount on purpose:
+    an assertion computed from the multipliers is a restatement of the code
+    under test, and would go on passing if the same mistake were made twice.
+    """
+
+    N = 10
+    STRIDE = 22          # blocks appended per turn, past the recorded lookback of 20
+    PREFIX = 100_000     # tokens in the cached prefix, and the billed write
+
+    def _reqs(self, inner_share, segment_scale=1):
+        """`inner_share` of the prefix sits inside the inner marker.
+
+        Turn blocks carry no tokens, so the outermost span is exactly the
+        segment total in every request and the share the fix computes is exactly
+        `inner_share`. Block *counts* are identical across the three traces, so
+        the lookback rejects the outer marker in all of them alike.
+
+        `segment_scale` multiplies the segment sizes and leaves the billed write
+        alone, which is how the two get told apart.
+        """
+        sized = self.PREFIX * segment_scale
+        inner = int(sized * inner_share)
+        out = []
+        for i in range(self.N):
+            segs = [seg(0, "system", inner, "inner", "sys", marked=True, ttl="5m"),
+                    seg(1, "system", sized - inner, "mid", "sys"),
+                    # The outer marker exists only on the first request; later
+                    # ones mark the end of their appended history instead, which
+                    # is what makes the outer span unreachable by lookback.
+                    seg(2, "user", 0, "tail", "hist",
+                        marked=(i == 0), ttl="5m" if i == 0 else None)]
+            idx = 3
+            for turn in range(i):
+                for k in range(self.STRIDE):
+                    last = (turn == i - 1 and k == self.STRIDE - 1)
+                    segs.append(seg(idx, "user", 0, f"t{turn}_{k}", "hist",
+                                    marked=last, ttl="5m" if last else None))
+                    idx += 1
+            out.append(Request(
+                request_id=f"r{i}", sent_at=T0 + timedelta(seconds=600 * i),
+                model="claude-opus-5", target_id="anthropic/direct",
+                tenant="t", session="s", agent="a", ttl_requested="5m",
+                usage={"input_tokens": 0, "cache_read_input_tokens": 0,
+                       "cache_creation_input_tokens": self.PREFIX},
+                segments=segs))
+        return out
+
+    def _recovered(self, inner_share, segment_scale=1):
+        a = analyze(TraceSet(requests=self._reqs(inner_share, segment_scale),
+                             tier=Tier.INSTRUMENTED), allow_unreconciled=True)
+        f = next((x for x in a.findings if x.code == "TTL-1"), None)
+        self.assertIsNotNone(f, f"TTL-1 did not fire at share {inner_share}")
+        self.assertIsNotNone(f.avoidable_usd_window,
+                             f"TTL-1 published no figure at share {inner_share}")
+        return f.avoidable_usd_window.raw()
+
+    def test_the_fixture_makes_an_inner_span_the_only_match(self):
+        """Guard the guard. If the outer marker were still reachable, the outer
+        span would match, the share would be 1.0, and every assertion below
+        would pass while testing nothing at all."""
+        from cacheeconomics import registry
+        from cacheeconomics.trace import marked_spans, span_is_reusable_by
+        reqs = self._reqs(0.5)
+        lookback = registry.capability("anthropic/direct", "lookback_blocks")
+        prev, cur = marked_spans(reqs[0].segments), marked_spans(reqs[1].segments)
+        inner, outer = prev[0], prev[-1]
+        self.assertNotEqual(inner, outer, "fixture has only one marker")
+        self.assertFalse(span_is_reusable_by(outer, cur, lookback, 512),
+                         "the outer span is still reachable, so nothing forces "
+                         "the inner match this class is about")
+        self.assertTrue(span_is_reusable_by(inner, cur, lookback, 512))
+
+    def test_a_smaller_matched_span_recovers_strictly_less(self):
+        """The whole finding. Under the defect these three are equal, because
+        the credit was the writing request's total however little of it the
+        matched span covered."""
+        quarter, half, whole = (self._recovered(0.25), self._recovered(0.5),
+                                self._recovered(1.0))
+        self.assertLess(quarter, half,
+                        f"a quarter-sized match recovered as much as a "
+                        f"half-sized one ({quarter} vs {half}): the credit is "
+                        f"not reading the span that matched")
+        self.assertLess(half, whole,
+                        f"a half-sized match recovered as much as a whole-prefix "
+                        f"one ({half} vs {whole})")
+
+    def test_the_share_is_a_ratio_rather_than_the_estimate_itself(self):
+        """The control, and the reason the fix is a ratio and not a substitution.
+
+        Bounding recovery by the raw segment estimate is the obvious repair and
+        it is wrong: the estimate is a split of the billed total, not a second
+        opinion on it, and using it cut a fixture writing 200,000 tokens down to
+        its 7,000-token segment sum and silenced the rule. A ratio of two
+        estimates cancels, so multiplying every segment by ten -- while the
+        provider still reports the same billed write -- must not move the figure
+        at all, at any nesting.
+        """
+        for share in (0.25, 0.5, 1.0):
+            with self.subTest(inner_share=share):
+                self.assertAlmostEqual(
+                    self._recovered(share), self._recovered(share, segment_scale=10),
+                    places=9,
+                    msg="the figure tracks the segment estimate rather than the "
+                        "billed write it is a split of")
+
+
+class TestTTLRecoveryReadsTheEntrySizeNotTheWriteSize(unittest.TestCase):
+    """A read refreshes the entry it read, so a small write can leave a large
+    live entry.
+
+    `earlier` stored the size of the *write* that touched a span. A request that
+    reads a 100k prefix back and writes a 1k appended suffix leaves a live 101k
+    entry while writing 1,000 tokens, so the later TTL miss on that entry was
+    credited with recovering 1,000 tokens instead of 101,000. The cold-write
+    premium is charged against the real write, so the netting came out negative
+    and TTL-1 went silent altogether -- the recommendation, which is correct and
+    worth roughly $3 over this window, never reached the client at all.
+
+    SYNTHETIC. Refresh-then-miss cycles: a refresh two minutes after the last
+    write (inside the five-minute lifetime, so the entry is alive and gets
+    extended), then a miss ten minutes later (outside it, so a five-minute entry
+    is gone and a one-hour one would not have been).
+
+    Not a regression from the proportional-share fix in the class above:
+    measured with that share reverted, this fixture was equally silent. It is
+    invisible in the shipped fixtures because none of their cache-writing rows
+    carries a read -- 0 of 136 in demo-traces.jsonl -- which is both why it
+    survived and why closing it moves no published figure.
+    """
+
+    PREFIX = 100_000
+    SUFFIX = 1_000
+    CYCLES = 6
+
+    def _req(self, rid, when, read, write, marks):
+        segs = [seg(0, "system", self.PREFIX, "sys", "sys", marked=True, ttl="5m")]
+        if marks > 1:
+            segs.append(seg(1, "user", self.SUFFIX, "suffix", "hist",
+                            marked=True, ttl="5m"))
+        return Request(request_id=rid, sent_at=when, model="claude-opus-5",
+                       target_id="anthropic/direct", tenant="t", session="s",
+                       agent="a", ttl_requested="5m",
+                       usage={"input_tokens": 0, "cache_read_input_tokens": read,
+                              "cache_creation_input_tokens": write},
+                       segments=segs)
+
+    def _reqs(self, refresh_read):
+        """`refresh_read` is how much the refreshing request reads back.
+
+        Zero turns each refresh into an ordinary small cold write, which is the
+        control: with no read the entry really is only as big as the write, and
+        the figure must not move.
+        """
+        out, t = [self._req("r0", T0, 0, self.PREFIX, 1)], T0
+        for c in range(self.CYCLES):
+            t += timedelta(seconds=120)
+            out.append(self._req(f"refresh{c}", t, refresh_read, self.SUFFIX, 2))
+            t += timedelta(seconds=600)
+            out.append(self._req(f"miss{c}", t, 0, self.PREFIX + self.SUFFIX, 2))
+        return out
+
+    def _ttl(self, refresh_read):
+        a = analyze(TraceSet(requests=self._reqs(refresh_read),
+                             tier=Tier.INSTRUMENTED), allow_unreconciled=True)
+        return next((f for f in a.findings if f.code == "TTL-1"), None)
+
+    def test_a_refreshed_entry_is_recovered_at_its_own_size(self):
+        f = self._ttl(self.PREFIX)
+        self.assertIsNotNone(
+            f, "TTL-1 stayed silent on a workload a one-hour lifetime would "
+               "genuinely help: the recommendation never reaches the client")
+        self.assertIsNotNone(f.avoidable_usd_window, "fired without a figure")
+        self.assertGreater(f.avoidable_usd_window.raw(), 0)
+
+    def test_the_recovery_scales_with_what_was_refreshed(self):
+        """The claim, stated as a comparison rather than as an expected dollar
+        amount. Reading a hundred times more back must recover more, and under
+        the defect both read the write size and come out identical."""
+        small = self._ttl(self.SUFFIX)
+        large = self._ttl(self.PREFIX)
+        self.assertIsNotNone(large.avoidable_usd_window)
+        small_usd = (small.avoidable_usd_window.raw()
+                     if small is not None and small.avoidable_usd_window else 0.0)
+        self.assertLess(
+            small_usd, large.avoidable_usd_window.raw(),
+            "the credit is reading the write size, not the entry size")
+
+    def test_a_write_with_no_read_is_unchanged(self):
+        """The control, and the property that keeps this from moving published
+        figures: with no read the entry is exactly the write, so every trace in
+        which nothing reads back -- which is every cache-writing row in the
+        shipped fixtures -- prices identically."""
+        self.assertIsNone(
+            self._ttl(0),
+            "a trace whose refreshes read nothing back has no reuse for a "
+            "longer lifetime to recover, and TTL-1 should stay silent on it")
+
+    def test_recovery_never_exceeds_what_the_later_request_wrote(self):
+        """The bound that keeps entry size from becoming an over-credit. A
+        longer lifetime can only save what was actually paid to write again,
+        however large the entry behind it was."""
+        from cacheeconomics import registry
+        f = self._ttl(self.PREFIX)
+        m = registry.multipliers("anthropic/direct")
+        rate = registry.base_rate("claude-opus-5", "2026-01-01", "anthropic/direct")
+        ceiling = (self.CYCLES * (self.PREFIX + self.SUFFIX)
+                   * (rate / 1e6) * (m["write_5m"] - m["read"]))
+        self.assertLessEqual(f.avoidable_usd_window.raw(), ceiling)
 
 
 class TestVolatileFindingRespectsCachePools(unittest.TestCase):
@@ -1878,15 +2141,23 @@ class TestStructuralClaimsNeedMeasuredSegmentation(unittest.TestCase):
         self.assertFalse(v.avoidable_usd_month.released)
         self.assertIn("72%", v.avoidable_usd_month.withheld_because)
 
+    # `avoidable_usd_window`, not `_month`, in every positive control below.
+    # This fixture is twelve requests over eleven minutes, which is far under
+    # the one-day projection floor, so its monthly figures are withheld for a
+    # reason that has nothing to do with segmentation and asserting them here
+    # would test the wrong gate. The window figure is the one this class is
+    # about: it is what the structural gate releases or withholds, and it is
+    # not an extrapolation. The negative controls still read `_month`, because
+    # withholding is withholding whichever figure carries the reason.
     def test_inferred_at_or_above_the_floor_releases(self):
         v = self._vol(self._analyse(Tier.INFERRED, 0.95))
-        self.assertTrue(v.avoidable_usd_month.released)
+        self.assertTrue(v.avoidable_usd_window.released)
         self.assertEqual(v.severity, "high")
 
     def test_instrumented_releases_without_an_alignment_score(self):
         """There is nothing to align against when the ids came from source."""
         self.assertTrue(self._vol(self._analyse(Tier.INSTRUMENTED, None))
-                        .avoidable_usd_month.released)
+                        .avoidable_usd_window.released)
 
     def test_usage_derived_findings_are_unaffected(self):
         """EFF-1 reads usage counters, not structure, so unmeasured
@@ -1894,7 +2165,28 @@ class TestStructuralClaimsNeedMeasuredSegmentation(unittest.TestCase):
         a = self._analyse(Tier.INFERRED, None)
         eff = next(f for f in a.findings if f.code == "EFF-1")
         self.assertFalse(eff.structural)
-        self.assertTrue(eff.avoidable_usd_month.released)
+        self.assertTrue(eff.avoidable_usd_window.released)
+
+    def test_the_structural_gate_reaches_the_window_figure_too(self):
+        """The migration above is only honest if this gate reaches both figures.
+
+        Were the window figure left released while the monthly one was withheld
+        for segmentation, the positive controls above would be reporting a pass
+        from a figure the structural gate had never touched -- and the report
+        would print the window amount for a finding it had just refused to
+        cost. That is the fix-one-site-leave-the-rest shape this whole suite
+        exists to catch, occurring inside the fix for it.
+        """
+        for alignment in (None, 0.72):
+            with self.subTest(alignment=alignment):
+                v = self._vol(self._analyse(Tier.INFERRED, alignment))
+                self.assertFalse(v.avoidable_usd_window.released,
+                                 "structural money escaped through the window "
+                                 "figure")
+                self.assertEqual(v.avoidable_usd_month.withheld_because,
+                                 v.avoidable_usd_window.withheld_because,
+                                 "the two figures give different reasons for "
+                                 "one refusal")
 
     def test_the_reason_is_stated_in_the_notes(self):
         a = self._analyse(Tier.INFERRED, None)
@@ -2009,14 +2301,27 @@ class TestStructuralCoverageGatesStructuralMoney(unittest.TestCase):
         self.assertFalse(self._vol(a).avoidable_usd_month.released)
         self.assertIn("carry prompt structure", self._vol(a).avoidable_usd_month.withheld_because)
 
+    # `avoidable_usd_window` in the positive controls: this fixture is ten
+    # requests over nine minutes, so its monthly figures are withheld by the
+    # projection floor regardless of coverage, and asserting them would test a
+    # gate this class is not about. The window figure is what coverage gates.
     def test_fully_covered_releases(self):
         a = analyze(self._ts(1.0, structured=10), allow_unreconciled=True)
-        self.assertTrue(self._vol(a).avoidable_usd_month.released)
+        self.assertTrue(self._vol(a).avoidable_usd_window.released)
 
     def test_usage_derived_findings_are_unaffected_by_coverage(self):
         a = analyze(self._ts(0.5), allow_unreconciled=True)
         eff = next(f for f in a.findings if f.code == "EFF-1")
-        self.assertTrue(eff.avoidable_usd_month.released)
+        self.assertTrue(eff.avoidable_usd_window.released)
+
+    def test_partial_coverage_withholds_the_window_figure_too(self):
+        """The other half of the pair above. A gate that reached the monthly
+        figure and not the window one would put the withheld amount straight
+        back on the page, because the report falls back to the window figure
+        exactly when the monthly one is missing."""
+        v = self._vol(analyze(self._ts(0.5), allow_unreconciled=True))
+        self.assertFalse(v.avoidable_usd_window.released)
+        self.assertIn("carry prompt structure", v.avoidable_usd_window.withheld_because)
 
     def test_affected_requests_counts_only_rows_that_contributed(self):
         a = analyze(self._ts(1.0, structured=10), allow_unreconciled=True)

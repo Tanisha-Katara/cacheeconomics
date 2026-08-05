@@ -131,6 +131,57 @@ def _usd(v):
     return f"${v:,.2f}"
 
 
+def _finding_amount(f) -> tuple:
+    """A finding's dollar claim, as `(text_cell, html_amount, html_caption)`.
+
+    One function, called from the text table and the HTML card. *Which* figure
+    a finding publishes is one decision and it is made here; how each surface
+    prints it is not -- the text table has a narrow column and no room for a
+    caption, the HTML card has a caption line and no column width. Splitting it
+    that way is the point: these two renderers have disagreed about which
+    figures they show before, and the tests meant to compare them were reading
+    two similar-looking blocks rather than one shared call.
+
+    The monthly figure is preferred where it is published and the window figure
+    is the fallback. That is an order of usefulness, not of confidence -- the
+    window figure is the better-evidenced of the two, because nothing was
+    extrapolated to produce it. A trace below the projection floor has a real,
+    reconciled, publishable amount and no defensible month to scale it to, and
+    printing nothing at all there discards the measurement in order to avoid the
+    extrapolation. Measured before this existed: once the projection floor
+    reached the per-finding figures, a fully reconciled one-hour trace rendered
+    no dollar amount anywhere in either report.
+
+    Neither figure released is "withheld"; neither figure existing at all is
+    "not costed". Different states, different remedies, and the legend under the
+    table says which is which.
+    """
+    month = getattr(f, "avoidable_usd_month", None)
+    window = getattr(f, "avoidable_usd_window", None)
+    if month is not None and month.released:
+        # `,.0f` in the text cell rather than `str`, which switches to cents
+        # below $100: a monthly figure is the window scaled by 30/window and so
+        # is large by construction, and three tests match `~\$[\d,]+/mo`.
+        fig, caption, cell = month, "avoidable / month", f"~${month:,.0f}/mo"
+    elif window is not None and window.released:
+        # Through `str`, which keeps the cents. An hour of traffic can honestly
+        # be worth $0.75, and `,.0f` would print that as "~$1".
+        fig, caption = window, "avoidable over the observed window"
+        cell = f"~{window}/window"
+    elif month is None and window is None:
+        return "not costed", "", ""
+    else:
+        fig = month if month is not None else window
+        caption = ("avoidable / month" if fig is month
+                   else "avoidable over the observed window")
+        cell = "withheld"
+    # `_usd` on the figure itself, so the HTML amount is byte-identical to what
+    # it was for every case that already existed. A withheld figure still
+    # renders as "[withheld: ...]" here, which is the gate doing its job rather
+    # than this function's choice.
+    return cell, f"~{_usd(fig)}", caption
+
+
 def _is_draft(a: Analysis) -> bool:
     """Does this analysis carry figures released without an invoice?
 
@@ -313,6 +364,29 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
         parts.insert(4, f"<div class=gate><strong>DRAFT — not for external "
                         f"use.</strong> {e(_draft_reason(a))}</div>")
 
+    # The caveats that qualify a published figure go above the fold too, for the
+    # same reason and after the same mistake.
+    #
+    # They lived in the Standing block at section 04, behind the Input spend KPI
+    # in 02 and every finding in 03, so a reader met the whole document's money
+    # before the sentence saying what it rests on -- and the sharpest of those
+    # sentences says the surface it was all priced against was assumed rather
+    # than stated. The text renderer had the same ordering and is fixed in the
+    # same change; this is the pair that has diverged over caveat placement
+    # before.
+    #
+    # Above the hero rather than in section 01, which was the first attempt: the
+    # lede itself carries "Caching saved $X" and the reconciliation card echoes
+    # the invoice, so a caveat inside 01 still trails two dollar figures. The
+    # test that pins this compares offsets and caught exactly that.
+    #
+    # Inserted after the DRAFT banner in source order but at the same index, so
+    # the banner stays first: it says do not forward this document, which
+    # outranks any single caveat about what is in it.
+    for note in reversed(spend_caveats(a)):
+        parts.insert(4 + (1 if _is_draft(a) else 0),
+                     f"<div class=gate><strong>Caveat.</strong> {e(note)}</div>")
+
     parts.append("<section class=verdict><div>")
     parts.append("<div class=label>Executive readout</div>")
     parts.append(f"<strong>{verdict}</strong>")
@@ -378,9 +452,13 @@ def render_html(a: Analysis, client: str = "", window_label: str = "") -> str:
         parts.append("<p>No material cache-related waste identified. That is a valid outcome "
                      "and it means there is nothing here worth changing.</p>")
     for f in a.findings:
-        money = ("<div class=finding-money><b>"
-                 f"~{e(_usd(f.avoidable_usd_month))}</b><span>avoidable / month</span></div>"
-                 if f.avoidable_usd_month else "")
+        # Through the same call the text table makes. This used to format
+        # `avoidable_usd_month` directly, so the day a second figure was added
+        # the two renderers would have shown different money for one finding --
+        # the divergence this file's history is entirely made of.
+        _cell, amount, caption = _finding_amount(f)
+        money = (f"<div class=finding-money><b>{e(amount)}</b>"
+                 f"<span>{e(caption)}</span></div>" if caption else "")
         basis_class = "measured" if f.evidence_class == "measured" else "modeled"
         parts.append(
             f"<article class='finding {e(f.severity)}'><div class=finding-head><div>"
@@ -489,12 +567,7 @@ def _impact(f) -> str:
     and have different remedies, so they read differently and the legend under
     the table says which is which.
     """
-    fig = f.avoidable_usd_month
-    if fig is None:
-        return "not costed"
-    if fig.released:
-        return f"~${fig:,.0f}/mo"
-    return "withheld"
+    return _finding_amount(f)[0]
 
 
 def _headline(a: Analysis) -> str:
@@ -658,6 +731,19 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
                      "publishing money, not a doubt about the analysis. Step 1 "
                      "at the end turns the numbers on.", _WIDTH, "  ")
         out.append("")
+    # Caveats before the figures they qualify, not after them.
+    #
+    # These sat below the table and the TOTAL, so a reader met every number
+    # first and the sentence saying what qualifies them afterwards -- and the
+    # sharpest of them says the surface those numbers were priced against was
+    # assumed rather than stated. Measured on a trace carrying one such note:
+    # the first "$" landed at character 2,213 and the caveat at 3,013. A caveat
+    # a reader reaches after the number is doing very little, which is the same
+    # complaint this file already records about the DRAFT banner arriving 8,000
+    # characters into the HTML report.
+    for note in spend_caveats(a):
+        out += _wrap(f"caveat: {note}", _WIDTH, "  ")
+        out.append("")
     if not a.findings:
         out += _wrap("Nothing to act on. No rule here fired on this data.",
                      _WIDTH, "  ")
@@ -685,24 +771,28 @@ def render_text(a: Analysis, *, detail: bool = False) -> str:
     # The two blanks in the cost column mean different things and have different
     # remedies. Printed only where they appear, so this is a legend rather than
     # boilerplate.
+    # Read off what the money column actually printed, rather than recomputed
+    # from the figures. Two conditions describing one string is how a legend
+    # comes to explain a state the table is no longer in.
+    shown = {_impact(f) for f in a.findings}
     legend = []
-    if any(f.avoidable_usd_month is None for f in a.findings):
+    if "not costed" in shown:
         legend.append("'not costed' — this rule names a mechanism and does not "
                       "produce a dollar amount at this depth. Section 1 says "
                       "what depth you gave it.")
-    if any(f.avoidable_usd_month is not None and not f.avoidable_usd_month.released
-           for f in a.findings):
+    if "withheld" in shown:
         legend.append("'withheld' — a figure exists and has not passed the "
                       "reconciliation gate. Step 1 below releases it.")
+    if any(s.endswith("/window") for s in shown):
+        legend.append("'/window' — the amount over the window that was actually "
+                      "observed, which is what the evidence supports. No "
+                      "per-month figure is shown because this window is too "
+                      "short to scale to one; the note above says by how much.")
     for line in legend:
         out += _wrap(line, _WIDTH, "  ")
-    # Caveats on the numbers directly above them. These used to sit in the
-    # notes block at the very bottom, so a figure and the sentence saying what
-    # it excludes were four sections apart, and folding that block away would
-    # have separated them entirely.
-    for note in spend_caveats(a):
-        out.append("")
-        out += _wrap(f"caveat: {note}", _WIDTH, "  ")
+    # (The caveats these numbers carry are printed above the table, not here.
+    # They used to sit at the very bottom of the report, then directly under the
+    # table; both put the qualification after the number it qualifies.)
     if not detail and a.findings:
         out.append("")
         out += _wrap("Every row above is the short version. Re-run with "
