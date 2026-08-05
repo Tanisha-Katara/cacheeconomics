@@ -1,0 +1,41 @@
+name: Registry or provider surface
+description: Request or correct support for a provider surface, model, TTL, rate, or cache behavior
+title: "[registry] "
+labels: ["registry"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Registry facts need dated sources. If a source is ambiguous, say that
+        directly; cacheeconomics should abstain rather than guess.
+  - type: input
+    id: target
+    attributes:
+      label: Provider surface
+      placeholder: "anthropic/direct, amazon-bedrock/converse, openai/direct"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model or model family
+      placeholder: "claude-opus-5"
+  - type: textarea
+    id: fact
+    attributes:
+      label: Fact to add or correct
+      description: Include TTLs, minimums, breakpoints, rates, counters, or serveability details.
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Source
+      description: Link to provider docs, billing docs, canary output, or another dated source.
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes or uncertainty
+      description: Mention any conflicting docs, region-specific pricing, or unsupported surfaces.

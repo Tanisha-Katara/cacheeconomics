@@ -554,6 +554,10 @@ pytest installed, so an accidental dependency fails the build rather than
 shipping. `pip install "cacheeconomics[litellm]"` only if you are mounting the
 live proxy plugin.
 
+Before contributing, read [CONTRIBUTING.md](CONTRIBUTING.md). Security reports
+and accidental egress concerns belong in the private flow described in
+[SECURITY.md](SECURITY.md), not in public issues.
+
 ## License
 
 Apache-2.0. Copyright 2026 KCG Consulting LLC.

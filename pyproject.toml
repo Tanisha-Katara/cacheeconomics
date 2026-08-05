@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,14 +7,14 @@ name = "cacheeconomics"
 description = "Prompt-cache cost analysis: a dated provider registry, a cost model that separates the four token classes, and an analyzer that turns a trace into a report you can forward."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "Tanisha Katara", email = "tanisha.bk@gmail.com" }]
 keywords = ["prompt-caching", "llm", "cost", "anthropic", "finops", "litellm"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -36,10 +36,11 @@ litellm = ["litellm>=1.0"]
 [project.scripts]
 cacheeconomics = "cacheeconomics.cli:main"
 
-# No [project.urls]. The repository is private, so Homepage/Source/Issues would
-# ship as links that 404 for everyone who installs this. A version on PyPI can
-# never be re-uploaded, so a dead link here is permanent for 0.2.0. Add them back
-# when there is a public URL that resolves.
+[project.urls]
+Homepage = "https://github.com/Tanisha-Katara/cacheeconomics"
+Source = "https://github.com/Tanisha-Katara/cacheeconomics"
+Issues = "https://github.com/Tanisha-Katara/cacheeconomics/issues"
+Changelog = "https://github.com/Tanisha-Katara/cacheeconomics/blob/main/CHANGELOG.md"
 
 [tool.setuptools.dynamic]
 # One source of truth. A version in both this file and `__init__.py` drifts, and

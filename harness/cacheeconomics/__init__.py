@@ -13,4 +13,4 @@ from .trace import Tier, TraceSet, load_jsonl                    # noqa: F401
 from .analyzer import Analysis, Finding, analyze                 # noqa: F401
 from .monitor import Alert, Monitor                              # noqa: F401
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"

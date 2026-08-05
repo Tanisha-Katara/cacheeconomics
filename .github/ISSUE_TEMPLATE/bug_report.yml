@@ -1,0 +1,48 @@
+name: Bug report
+description: Report incorrect behavior in cacheeconomics
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please do not paste private prompts,
+        credentials, invoices, or customer traces into a public issue.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `cacheeconomics --version`, or the git commit.
+      placeholder: "cacheeconomics 0.2.1"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command or API call
+      description: The minimal command, flags, or API call that shows the issue.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: private-data
+    attributes:
+      label: Does this involve private prompt, trace, invoice, or credential data?
+      options:
+        - "No"
+        - "Yes, but I have redacted it"
+        - "Yes, and I need a private security channel"
+    validations:
+      required: true
