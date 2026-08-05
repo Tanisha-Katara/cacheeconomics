@@ -690,6 +690,185 @@ class TestEveryNamedModelHasARate(unittest.TestCase):
                 self.assertAlmostEqual(usd(cache_read=1_000_000), base * 0.1)
 
 
+class TestPerModelLifetimeNarrowingCannotBeSilentlyDropped(unittest.TestCase):
+    """`supported_ttls` is the surface's maximum; `supported_ttls_by_model`
+    narrows it where a lifetime is not GA for every model. Absence of the map
+    means "no narrowing recorded", which is the documented reading and true of
+    seven of the eight shipped rows -- so `registry.supported_ttls` reads it as
+    an optional field rather than alerting on it.
+
+    That is right, and it leaves a gap: absence is not answer-neutral when the
+    field is needed. Deleting the map from the Bedrock row widens
+    `claude-opus-5` from `['5m']` to `['5m', '1h']`, and every reader --
+    the allocator, the tier planner, RT-TTL's recommendation -- silently starts
+    treating a rejected lifetime as available. A schema drift or a careless
+    edit re-enables it with nothing watching.
+
+    So the narrowing is pinned here rather than alerted on at runtime, and
+    pinned as a set of *effects* -- `(target, model, lifetime)` triples the
+    registry withholds -- compared for equality against what the shipped rows
+    actually produce.
+
+    Equality, not containment, and against effects rather than row ids. The
+    first version of this class registered *targets*: it asked which rows
+    carry a narrowing map and whether each was in the table. That treated a
+    row already in the table as fully covered, so `amazon-bedrock/converse`
+    could grow a second narrowed lifetime -- a surface-wide 30m the map
+    withholds, say -- and nothing would require the expectation to change.
+    Drift inside a registered row was silent, which is the same mistake as
+    checking the mechanism instead of the effect, one level in.
+    """
+
+    # Source: `amazon-bedrock/converse`'s own provenance note -- 1h went GA on
+    # 2026-01-26 for these three models only.
+    #
+    # `default_withholds` is what the row's `_default` keeps from any model the
+    # row does not name. `named` must list exactly the models the row does
+    # name, each with the lifetimes withheld from it specifically.
+    #
+    # The split exists because the first version drew both sides of the
+    # comparison from `registry.pricing()`. That did not merely risk going
+    # stale, it silently self-updated: adding a model to the rate card rewrote
+    # the expectation and the derivation identically, so nobody was ever asked
+    # whether the new model's lifetimes were intended. A model the row names
+    # explicitly now has to be classified explicitly; only models falling to
+    # `_default` are covered by a rule, and that rule is written down here
+    # rather than inferred.
+    NARROWED = {
+        "amazon-bedrock/converse": {
+            "default_withholds": {"1h"},
+            "named": {
+                "claude-sonnet-4-5": set(),
+                "claude-haiku-4-5": set(),
+                "claude-opus-4-5": set(),
+            },
+        },
+    }
+
+    def _model_universe(self):
+        """Every model any part of the registry names.
+
+        The union matters. Drawing it from the rate card alone meant a
+        `supported_ttls_by_model` key for an unpriced model was a real
+        narrowing that the derivation never walked -- invisible to a
+        comparison whose whole job is to see narrowings.
+        """
+        from cacheeconomics import registry
+        models = set(registry.pricing()["models"])
+        for row in registry.providers()["targets"]:
+            models.update(row.get("min_cacheable_tokens") or {})
+            by_model = (row.get("capabilities") or {}).get(
+                "supported_ttls_by_model")
+            if isinstance(by_model, dict):
+                models.update(k for k in by_model
+                              if not k.startswith("_"))
+        models.discard("_default")
+        return sorted(models)
+
+    def _row_named_models(self, target):
+        """Models a row's per-model map names, `_default` and comments aside."""
+        from cacheeconomics import registry
+        for row in registry.providers()["targets"]:
+            if row["id"] != target:
+                continue
+            by_model = (row.get("capabilities") or {}).get(
+                "supported_ttls_by_model")
+            if not isinstance(by_model, dict):
+                return set()
+            return {k for k in by_model if not k.startswith("_")}
+        return set()
+
+    def _expected_effects(self):
+        """`(target, model, lifetime)` this class says the registry withholds."""
+        out = set()
+        universe = self._model_universe()
+        for target, spec in self.NARROWED.items():
+            named = spec["named"]
+            for model in universe:
+                withheld = (named[model] if model in named
+                            else spec["default_withholds"])
+                for ttl in withheld:
+                    out.add((target, model, ttl))
+        return out
+
+    def _actual_effects(self):
+        """The same triples, derived from the shipped registry."""
+        from cacheeconomics import registry
+        out = set()
+        for row in registry.providers()["targets"]:
+            target = row["id"]
+            try:
+                surface = set(registry.supported_ttls(
+                    target, allow_contested=True))
+            except registry.RegistryError:
+                continue
+            for model in self._model_universe():
+                try:
+                    offered = set(registry.supported_ttls(
+                        target, model, allow_contested=True))
+                except registry.RegistryError:
+                    continue
+                for ttl in surface - offered:
+                    out.add((target, model, ttl))
+        return out
+
+    def test_the_table_is_not_vacuous(self):
+        self.assertTrue(self._model_universe())
+        self.assertTrue(self._expected_effects(),
+                        "no narrowing expected, so the comparison below would "
+                        "pass by describing nothing")
+
+    def test_every_model_a_row_names_is_classified_here(self):
+        """The rate card must not be able to move the expectation on its own.
+
+        A model the row names explicitly is a judgement somebody made about
+        that model, and it has to be met by a judgement here. Models the row
+        does not name fall to `_default`, which is a rule rather than a
+        judgement and is recorded once as `default_withholds`.
+        """
+        for target, spec in self.NARROWED.items():
+            with self.subTest(target=target):
+                self.assertEqual(
+                    self._row_named_models(target), set(spec["named"]),
+                    f"{target}'s per-model lifetime map and this table name "
+                    f"different models. Every model the row singles out needs "
+                    f"an entry here saying which lifetimes it is denied.")
+
+    def test_the_registry_withholds_exactly_what_is_pinned_here(self):
+        """Enforcement and sync in one assertion, because they are one fact.
+
+        Deleting the map drops triples from the derived side. Narrowing a new
+        lifetime, on this row or any other, adds triples the table does not
+        claim. Widening a model that should be narrowed does the first;
+        withholding from a model that should have it does the second. All four
+        land here.
+        """
+        expected, actual = self._expected_effects(), self._actual_effects()
+        self.assertEqual(
+            expected, actual,
+            "the per-model lifetime narrowing the registry performs is not "
+            "what is pinned here.\n"
+            "  no longer withheld (a reader will now treat these as "
+            "available): " + repr(sorted(expected - actual)) + "\n"
+            "  newly withheld (real, but nothing pins it, so deleting the map "
+            "would widen it silently): " + repr(sorted(actual - expected)))
+
+    def test_a_named_model_still_gets_what_it_is_not_denied(self):
+        """Spelled out separately so the equality above cannot be satisfied by
+        withholding the lifetime from everybody."""
+        from cacheeconomics import registry
+        for target, spec in self.NARROWED.items():
+            surface = set(registry.supported_ttls(target))
+            for model, withheld in sorted(spec["named"].items()):
+                with self.subTest(target=target, model=model):
+                    offered = set(registry.supported_ttls(target, model))
+                    self.assertEqual(
+                        surface - withheld, offered,
+                        f"{target}+{model} is offered {sorted(offered)}, but "
+                        f"this table says it should get "
+                        f"{sorted(surface - withheld)}")
+
+
 class TestAnUnknownCacheLifetimeIsNotFree(unittest.TestCase):
     """`trace.write_tokens` sums every positive value under `cache_creation`,
     because for detection the provider saying it wrote is enough. Pricing needs

@@ -759,6 +759,40 @@ def default_agent_from(data: dict) -> str:
 # adapter lives behind an optional dependency and this path must not acquire
 # one. The field list is the thing that has to agree, and a test asserts it
 # does.
+def over_breakpoint_budget(body: dict, target_id: str):
+    """`(markers, budget)` if `body` carries more cache breakpoints than
+    `target_id` allows, or None if it does not.
+
+    Split out of the live hook so it can be tested for what it actually
+    compares. Inline, the only way to reach it was through the whole
+    `async_pre_call_hook`, where `_decide` enforces the same rule earlier
+    against its own view of the body and answers first -- so a test could only
+    move the marker count by changing the prompt, which changes its shape and
+    its text at the same time. Seven versions of that test each proved
+    something *correlated* with the marker count. A guard comparing
+    `len(body["messages"])` would have passed all of them.
+
+    Counted on the body actually handed to LiteLLM. `_decide` sees a different
+    object: markers can reach the wire through `system` or `tools` without
+    passing through the placement plan, which is the miscount this exists to
+    catch.
+
+    An unrecorded or null budget is not a licence -- it is a surface this
+    package cannot bound, and `_decide` has already refused to place against
+    it. A recorded zero is likewise not "no limit". Both return None here
+    because there is no budget to exceed, and inventing one would veto traffic
+    on a guess.
+    """
+    try:
+        budget = registry.capability(target_id, "max_breakpoints")
+    except registry.RegistryError:
+        return None
+    if not budget:
+        return None
+    markers = marker_count(body)
+    return (markers, budget) if markers > budget else None
+
+
 def _tenant_of(user_api_key_dict, data) -> str | None:
     """Whose traffic this is. Delegates, so the live hook and the loader cannot
     answer differently for one row -- they did, and tenant is part of the cache
@@ -1026,45 +1060,42 @@ def litellm_handler(plugin: CachePlugin, *, base=None, session_from=None,
                     patched[extra] = out[extra]
             # Re-checked against the dict actually handed to LiteLLM, because
             # the budget check inside `_decide` saw a different object.
-            try:
-                # The resolved surface, not a literal. Bedrock and Vertex do not
-                # necessarily share Anthropic's breakpoint budget, and this
-                # guard is the last thing standing between a miscount and a
-                # request the provider rejects.
-                budget = registry.capability(target_id, "max_breakpoints")
-            except registry.RegistryError:
-                budget = None
-            if budget:
-                on_wire = marker_count(patched)
-                if on_wire > budget:
-                    # The original body goes out, so nothing may still be
-                    # recorded as applied. `_pending` was written above, and
-                    # `async_log_success_event` hands whatever is there to
-                    # `on_response`, which credits the response's cache reads and
-                    # writes to this decision's placements -- markers that in
-                    # this branch never left the process. That is a metric
-                    # attributing provider behaviour to a request nobody sent,
-                    # and it feeds the next placement decision.
-                    #
-                    # Replaced rather than deleted: a missing key makes
-                    # `on_response` return silently, which loses the usage the
-                    # monitor's rebuild and fan-out checks need. What has to go
-                    # is the claim that markers were applied, not the
-                    # observation that a request happened.
-                    # Into `proposed`, which exists for this exact distinction:
-                    # "what would have been placed" is worth keeping, and the
-                    # field's own docstring records that reporting it as
-                    # `placements` is what once had the effectiveness counters
-                    # crediting markers that never reached the provider.
-                    vetoed = replace(
-                        decision, applied=False, placements={},
-                        proposed=dict(decision.placements or {}),
-                        reason=(f"the patched request would carry {on_wire} markers "
-                                f"against a budget of {budget}, counted on the body "
-                                f"handed to LiteLLM"))
-                    if key is not None:
-                        self._pending[key] = vetoed
-                    return data
+            #
+            # `target_id` is the resolved surface, not a literal. Bedrock and
+            # Vertex do not necessarily share Anthropic's breakpoint budget,
+            # and this guard is the last thing standing between a miscount and
+            # a request the provider rejects.
+            over = over_breakpoint_budget(patched, target_id)
+            if over:
+                on_wire, budget = over
+                # The original body goes out, so nothing may still be
+                # recorded as applied. `_pending` was written above, and
+                # `async_log_success_event` hands whatever is there to
+                # `on_response`, which credits the response's cache reads and
+                # writes to this decision's placements -- markers that in
+                # this branch never left the process. That is a metric
+                # attributing provider behaviour to a request nobody sent,
+                # and it feeds the next placement decision.
+                #
+                # Replaced rather than deleted: a missing key makes
+                # `on_response` return silently, which loses the usage the
+                # monitor's rebuild and fan-out checks need. What has to go
+                # is the claim that markers were applied, not the
+                # observation that a request happened.
+                # Into `proposed`, which exists for this exact distinction:
+                # "what would have been placed" is worth keeping, and the
+                # field's own docstring records that reporting it as
+                # `placements` is what once had the effectiveness counters
+                # crediting markers that never reached the provider.
+                vetoed = replace(
+                    decision, applied=False, placements={},
+                    proposed=dict(decision.placements or {}),
+                    reason=(f"the patched request would carry {on_wire} markers "
+                            f"against a budget of {budget}, counted on the body "
+                            f"handed to LiteLLM"))
+                if key is not None:
+                    self._pending[key] = vetoed
+                return data
             return patched
 
         async def async_log_success_event(self, kwargs, response_obj,

@@ -149,10 +149,164 @@ class _ScopeState:
     # request -- where a longer lifetime recovers nothing, because there is no
     # second write of anything to turn into a read -- got told to switch to one
     # hour while the report refused to make that claim from the same trace.
-    last_marked_at: OrderedDict = field(default_factory=OrderedDict)
-    rewrite_gaps: deque = field(default_factory=lambda: deque(maxlen=WINDOW))
+    #
+    # The value is `(when, lifetime)`, and the lifetime half is load-bearing.
+    # Gaps are partitioned by the lifetime in force, because RT-TTL's question
+    # is "at this cadence, would a different lifetime be cheaper" and the
+    # answer is only supportable from rewrites that actually ran under the
+    # lifetime being argued about. Pooling them let a run of 30m traffic --
+    # which RT-TTL cannot evaluate at all -- fill the window, and then a single
+    # 5m request fired the alert off ten gaps of 30m evidence, reporting a
+    # median it had no 5m observation of. Gating the *wording* on the lifetime
+    # and leaving the *state* pooled is the worse half of that bug: the
+    # original was silence, this was a live alert computed from evidence the
+    # rule says it cannot read.
+    #
+    # Partitioned by lifetime, like the gaps it feeds. One shared map meant a
+    # lifetime the rule refuses could overwrite a span's timestamp and destroy
+    # the evidence for one it can evaluate -- the mirror image of the pooled
+    # window that let it invent evidence.
+    last_marked_at: dict = field(default_factory=lambda: {
+        name: OrderedDict() for name in TTL_SECONDS})
+    # One bucket per lifetime RT-TTL can evaluate, created once and never
+    # added to -- `_ttl_rt_ttl_can_read` returns a member of TTL_SECONDS or
+    # None, so no other key can be written and the map cannot grow.
+    rewrite_gaps: dict = field(default_factory=lambda: {
+        name: deque(maxlen=WINDOW) for name in TTL_SECONDS})
     rebuilds: deque = field(default_factory=lambda: deque(maxlen=WINDOW))
     firing: OrderedDict = field(default_factory=OrderedDict)
+
+
+# Why a lookup went unanswered, and what the operator does about it.
+#
+# These are flags, not alternatives, and that is the whole point. A row can be
+# contested *and* not record the key, and the shipped `openai/bedrock` is
+# exactly that: flagged contested, with `capabilities: {"_unknown": true}`, so
+# `max_breakpoints` and `lookback_blocks` are absent as well.
+#
+# Both halves have been got wrong here in turn. `ContestedRow` subclasses
+# `RegistryError`, so one `except registry.RegistryError` reported a disputed
+# row as missing data and sent the reader to add a value already on file --
+# against this project's rule that a contested row is never treated as fact.
+# Catching `ContestedRow` first then reported an absent key as present-but-
+# disputed and emitted only the settle remedy, so the one shipped surface that
+# genuinely presents both causes was told about one of them. Settling a row and
+# recording a value are different jobs in different places; a surface needing
+# both has to be told both.
+_CONTESTED = "contested"
+_NOT_RECORDED = "absent"
+_RECORDED_NULL = "null"
+_UNINSPECTED = "uninspected"
+
+# Ordered so a cause reads row-level fact first, then the key-level one.
+_CAUSE_TEXT = (
+    (_CONTESTED, "the row is flagged contested, so nothing on it may be "
+                 "treated as fact"),
+    (_NOT_RECORDED, "not recorded for this surface"),
+    (_RECORDED_NULL, "recorded as null"),
+    # Not a cause so much as the limit of what was checked, said out loud
+    # rather than resolved by guessing in either direction.
+    (_UNINSPECTED, "whether it is recorded at all was not inspected, because "
+                   "this lookup has no contested-inspecting form"),
+)
+
+_RECORD_IT = ("record the missing limits in the registry with a dated source, "
+              "or name a surface on the stream that has them")
+_REMEDIES = {
+    _CONTESTED: "settle the contested row against a dated source, or leave it "
+                "contested and accept that these checks stay off",
+    _NOT_RECORDED: _RECORD_IT,
+    _RECORDED_NULL: _RECORD_IT,
+}
+
+
+class _RegistryReads:
+    """Every registry lookup one request's checks made, and which of them the
+    registry could not answer.
+
+    The seam exists so that the announcement follows the *actual* dependency
+    instead of a hardcoded probe. RT-NOSURFACE used to test
+    `min_cacheable_tokens` and nothing else, so a surface that recorded a
+    minimum and no breakpoint budget disabled the marker-budget check in
+    silence -- and `lookback_blocks`, which nobody had thought to list at all,
+    did the same to RT-TTL's rewrite timeline. A check that reads a new key
+    through `get` is announced from the moment it is written; one that calls
+    `registry` directly is not, and INV-5 in the test suite is what catches
+    that, by watching which keys the module actually reads.
+
+    Ways a lookup goes unanswered, all reaching the same silent state: the
+    surface records no such key, the surface is contested, the key is recorded
+    as `None` -- and any combination of those, which is why the cause is a set
+    of flags rather than one label. A recorded *zero* is an answer --
+    `deepseek/direct` allows no explicit breakpoints, which is a fact about the
+    surface and not a gap in the registry -- so `is None` is the test, never
+    falsiness.
+
+    Bounded by construction: one entry per literal key named in this file, a
+    fixed set of cause flags, and one `needed_for` string per call site. All
+    fixed at import time.
+    """
+    __slots__ = ("unanswered",)
+
+    def __init__(self):
+        self.unanswered: dict = {}
+
+    def get(self, key, fn, *, needed_for, inspect=None):
+        """Read `key` from the registry, recording it when the answer is not
+        there. Returns None in that case, and the caller decides what to do --
+        abstain, or carry on unbounded -- because that differs per check.
+
+        `inspect` is the same lookup in its contested-inspecting form, where
+        the registry offers one. It is called only when the row turns out to
+        be contested, and only to find out whether the key is *also* absent --
+        never to obtain a value the checks then use. `allow_contested=True` is
+        the registry's own affordance for looking without publishing, and this
+        is the looking.
+
+        `needed_for` may be None, meaning this request reads the value but no
+        check here can act on its absence. The value is still read and still
+        used; it is simply not announced, because an alert naming a cause that
+        is not the reason the operator is getting no answer is an alert that
+        fires on ordinary traffic -- and one that fires on ordinary traffic
+        gets switched off, which ends in the same silence this class exists to
+        break.
+        """
+        try:
+            value = fn()
+        except registry.ContestedRow:
+            # Before the base class, which it subclasses. Reversing these two
+            # clauses is the defect, not a style choice.
+            causes = {_CONTESTED} | self._also(inspect)
+        except registry.RegistryError:
+            causes = {_NOT_RECORDED}
+        else:
+            if value is not None:
+                return value
+            causes = {_RECORDED_NULL}
+        if needed_for:
+            entry = self.unanswered.setdefault(key, (set(), set()))
+            entry[0].update(causes)
+            entry[1].add(needed_for)
+        return None
+
+    @staticmethod
+    def _also(inspect):
+        """What a contested row holds, looked at without publishing from it.
+
+        Returning the empty set means the key is there and the dispute is the
+        only problem. Where the registry exposes no contested-inspecting form
+        -- `min_cacheable_tokens` takes no `allow_contested` -- this says so
+        rather than guessing, because guessing "present" understates a row that
+        needs values recorded and guessing "absent" invents a gap. Reproducing
+        the registry's own inheritance walk here to answer it anyway would be a
+        second copy of that logic, which is how the two drift.
+        """
+        if inspect is None:
+            return {_UNINSPECTED}
+        try:
+            return set() if inspect() is not None else {_RECORDED_NULL}
+        except registry.RegistryError:
+            return {_NOT_RECORDED}
 
 
 class Monitor:
@@ -226,9 +380,13 @@ class Monitor:
         rebuild_st = self._scope(rebuild_scope)
         shape_st = self._scope(shape_scope) if shape_scope != pool_scope else pool_st
         alerts: list[Alert] = []
+        # One per request, drained at the bottom. Every registry lookup any
+        # check makes goes through it, so what gets announced is whatever was
+        # actually asked for rather than a list somebody maintained by hand.
+        reads = _RegistryReads()
 
         if shape:
-            self._track_shape(shape_st, request)
+            self._track_shape(shape_st, request, reads)
         if usage:
             self._track_usage(pool_st, request)
         shape_checks = []
@@ -256,55 +414,102 @@ class Monitor:
                 subject="blind", at=request.sent_at,
                 fix="Capture through the recorder, or export request bodies, to turn "
                     "the structural checks on.")
-            if ("RT-BLIND", "blind") not in shape_st.firing:
-                shape_st.firing[("RT-BLIND", "blind")] = True
-                alerts.append(blind)
-        # The surface equivalent of RT-BLIND, and for the same reason: three
-        # checks read the registry for this target and `return` when it does
-        # not know it -- RT-BLOCKED and RT-MIN need the minimum cacheable
-        # prefix, RT-BUDGET needs the breakpoint budget. Measured: a 200-token
-        # marker below the 512-token minimum raises RT-MIN on
-        # `anthropic/direct` and *nothing at all* on an unnamed surface. The
-        # operator sees a quiet dashboard and reads it as healthy.
-        #
-        # Said once per scope, like RT-BLIND, through the same `firing` table
-        # rather than a second dedup mechanism.
-        try:
-            registry.min_cacheable_tokens(request.target_id, request.model)
-        except registry.RegistryError:
-            if ("RT-NOSURFACE", "nosurface") not in shape_st.firing:
-                shape_st.firing[("RT-NOSURFACE", "nosurface")] = True
-                alerts.append(Alert(
-                    "RT-NOSURFACE", "low", shape_scope,
-                    f"no recorded limits for {request.target_id!r}, so several "
-                    f"checks are inactive",
-                    "The prefix-minimum, blocked-prefix and marker-budget checks "
-                    "all need this surface's recorded limits, and there are none "
-                    "on file for it. Their silence means unmeasured, not healthy: "
-                    "a marker below the minimum caches nothing and the provider "
-                    "returns no error either. Cadence, drift, fan-out and rebuild "
-                    "are unaffected -- they do not depend on the surface.",
-                    subject="nosurface", at=request.sent_at,
-                    fix="Name the surface on the stream, or add its limits to "
-                        "the registry with a dated source."))
+            self._fire(shape_st, blind, alerts)
         for st, scope, checks in (
             (shape_st, shape_scope, shape_checks),
             (pool_st, pool_scope, usage_checks),
             (rebuild_st, rebuild_scope, rebuild_checks),
         ):
             for check in checks:
-                for a in check(st, request, scope) or ():
-                    # Once per subject until it clears, so a drifting prefix does
-                    # not alert on every request forever -- while a *second*
-                    # drifting segment is still its own alert.
-                    key = (a.code, a.subject)
-                    if key in st.firing:
-                        continue
-                    st.firing[key] = True
-                    while len(st.firing) > MAX_FIRING:
-                        st.firing.popitem(last=False)
-                    alerts.append(a)
+                # `reads` is handed to every check, including the four that do
+                # not currently touch the registry. A check that grows a lookup
+                # later gets the announcing seam without anyone editing this
+                # loop, which is the whole point of the change.
+                for a in check(st, request, scope, reads) or ():
+                    self._fire(st, a, alerts)
+        # The surface equivalent of RT-BLIND, and for the same reason: several
+        # checks read the registry for this target and abstain when it cannot
+        # answer. Measured: a 200-token marker below the 512-token minimum
+        # raises RT-MIN on `anthropic/direct` and *nothing at all* on an
+        # unnamed surface. The operator sees a quiet dashboard and reads it as
+        # healthy.
+        #
+        # Emitted after the checks, not before, because the checks are what
+        # establishes which lookups this request actually needed. Said once per
+        # scope through the same `firing` table as every other alert rather
+        # than a second dedup mechanism -- keyed on the *set* of unanswered
+        # lookups, so fixing one of them and leaving another still gets
+        # reported instead of being swallowed as a repeat.
+        if reads.unanswered:
+            self._fire(shape_st,
+                       self._nosurface(request, shape_scope, reads), alerts)
         return alerts
+
+    @staticmethod
+    def _nosurface(r, scope, reads: _RegistryReads) -> Alert:
+        """One alert naming every registry lookup this request could not get.
+
+        Composed from what was asked, so the text cannot drift out of date the
+        way the hardcoded version did: it named three checks and omitted
+        RT-TTL, whose rewrite timeline silently loses its lookback bound when
+        `lookback_blocks` is missing and over-credits as a result.
+        """
+        missing = sorted(reads.unanswered)
+        parts = []
+        for key, (causes, users) in sorted(reads.unanswered.items()):
+            # Ordered by `_CAUSE_TEXT`, not by set iteration, so the same pair
+            # of causes always reads the same way round.
+            why = ", ".join(text for flag, text in _CAUSE_TEXT
+                            if flag in causes)
+            parts.append(f"{key} ({why}) -- needed by "
+                         f"{', '.join(sorted(users))}")
+        detail = "; ".join(parts)
+        what = (f"the {missing[0]} lookup" if len(missing) == 1
+                else f"{len(missing)} of the registry lookups")
+        # The illustration is attached to the dependency it illustrates. The
+        # hardcoded version carried it unconditionally, so a surface missing
+        # only `lookback_blocks` was told about sub-minimum markers, which is
+        # the same defect as the hardcoded probe wearing different clothes.
+        example = (" A marker below the minimum caches nothing and the "
+                   "provider returns no error either."
+                   if "min_cacheable_tokens" in reads.unanswered else "")
+        # The remedy follows the cause too, for the same reason the detail
+        # does. Adding a value and settling a disputed one are different jobs
+        # in different files, and a surface can present both at once --
+        # `openai/bedrock` is contested *and* records none of these keys, so it
+        # gets both remedies rather than whichever one was matched first.
+        seen = set()
+        for causes, _ in reads.unanswered.values():
+            seen |= causes
+        fix = "; ".join(sorted({_REMEDIES[c] for c in seen if c in _REMEDIES}))
+        return Alert(
+            "RT-NOSURFACE", "low", scope,
+            f"{r.target_id!r} cannot answer {what} these checks make, so they "
+            f"are inactive or unbounded",
+            f"The registry could not answer: {detail}. Their silence means "
+            f"unmeasured, not healthy.{example} Only the checks named here are "
+            f"affected -- the rest read nothing from the registry.",
+            subject="nosurface:" + ",".join(missing), at=r.sent_at,
+            fix=fix[:1].upper() + fix[1:] + ".")
+
+    def _fire(self, st: _ScopeState, a: Alert, into: list) -> None:
+        """Emit an alert once per `(code, subject)` for this scope.
+
+        The one suppression table. RT-BLIND and RT-NOSURFACE wrote to `firing`
+        by hand and skipped the eviction the check loop does, which was
+        harmless while both used a constant subject and is not once a subject
+        varies -- and RT-NOSURFACE's now does.
+        """
+        key = (a.code, a.subject)
+        if key in st.firing:
+            return
+        # Once per subject until it clears, so a drifting prefix does not alert
+        # on every request forever -- while a *second* drifting segment is
+        # still its own alert.
+        st.firing[key] = True
+        while len(st.firing) > MAX_FIRING:
+            st.firing.popitem(last=False)
+        into.append(a)
 
     def clear(self, scope: tuple, code: str, subject: str | None = None) -> None:
         """Let a code fire again for this scope once it has been dealt with.
@@ -390,7 +595,7 @@ class Monitor:
             self._scopes.move_to_end(scope)
         return st
 
-    def _track_shape(self, st: _ScopeState, r) -> None:
+    def _track_shape(self, st: _ScopeState, r, reads: _RegistryReads) -> None:
         """State derived from what was sent. Disjoint from `_track_usage`, so
         the two can run at different moments without double-counting.
 
@@ -428,22 +633,52 @@ class Monitor:
         # up. Any earlier marked span that is a prefix of this request has its
         # hash among them, by construction.
         #
-        # Bounded exactly as before: `int -> datetime`, capped at MAX_FIRING.
-        # Cost is one hash per segment per request.
-        seen_before = None
-        for boundary in self._prefix_hashes(r):
-            when = st.last_marked_at.get(boundary)
-            if when is not None and (seen_before is None or when > seen_before):
-                seen_before = when
-        if seen_before is not None:
-            rewrite_gap = (r.sent_at - seen_before).total_seconds()
-            if rewrite_gap >= 0:
-                st.rewrite_gaps.append(rewrite_gap)
-        for span_hash in self._marked_hashes(r):
-            st.last_marked_at[span_hash] = r.sent_at
-            st.last_marked_at.move_to_end(span_hash)
-        while len(st.last_marked_at) > MAX_FIRING:
-            st.last_marked_at.popitem(last=False)
+        # Bounded exactly as before: `int -> (datetime, str|None)`, capped at
+        # MAX_FIRING. Cost is one hash per segment per request.
+        #
+        # Collected only for a lifetime RT-TTL can actually argue about, and
+        # filed under that lifetime. This is the same predicate the check and
+        # the RT-NOSURFACE wording read, so the evidence, the rule and the
+        # announcement now all agree about which requests count -- and the
+        # registry lookups inside `_prefix_hashes` are not made at all on
+        # traffic whose lifetime the check will refuse, which is why they are
+        # no longer announced there either.
+        lifetime, _offered = self._ttl_rt_ttl_can_read(r, reads)
+        # Everything below is per evaluable lifetime, timeline included.
+        #
+        # Partitioning the *gaps* alone left one shared span->timestamp map
+        # that every marked request wrote to, so a 30m write on a span
+        # overwrote the 5m timestamp sitting there and the next 5m request
+        # found nothing to measure from. Measured: a 5m stream that fires
+        # RT-TTL with 19 gaps recorded zero gaps and never fired once
+        # identical 30m writes were interleaved between the same requests.
+        # The first version of this fix let an unevaluable lifetime invent
+        # evidence; that one let it destroy evidence instead. A lifetime the
+        # rule refuses now touches none of this state at all.
+        #
+        # Not an early return: `last_sent` below is the scope's request
+        # cadence, which every lifetime contributes to and the plugin reads.
+        # Only the per-lifetime rewrite timeline is skipped.
+        if lifetime is not None:
+            marks = st.last_marked_at[lifetime]
+            seen_before = None
+            for boundary in self._prefix_hashes(r, reads):
+                when = marks.get(boundary)
+                if when is not None and (seen_before is None
+                                         or when > seen_before):
+                    seen_before = when
+            if seen_before is not None:
+                rewrite_gap = (r.sent_at - seen_before).total_seconds()
+                if rewrite_gap >= 0:
+                    st.rewrite_gaps[lifetime].append(rewrite_gap)
+            for span_hash in self._marked_hashes(r):
+                marks[span_hash] = r.sent_at
+                marks.move_to_end(span_hash)
+            # Capped per lifetime, so the whole map is bounded by
+            # len(TTL_SECONDS) * MAX_FIRING and neither bucket can evict the
+            # other.
+            while len(marks) > MAX_FIRING:
+                marks.popitem(last=False)
         # Only forward. A negative gap was already dropped, but `last_sent` moved
         # backwards anyway, so the *next* request measured from the regressed
         # clock and recorded a gap inflated by however far time had gone back --
@@ -500,7 +735,7 @@ class Monitor:
                           if s.index <= top))
 
     @staticmethod
-    def _prefix_hashes(r) -> list:
+    def _prefix_hashes(r, reads: _RegistryReads) -> list:
         """One hash per prefix boundary this request could actually read from.
 
         The read side of the containment test. An entry past every marker this
@@ -518,18 +753,39 @@ class Monitor:
         marked = [s.index for s in r.segments if s.cache_marked]
         if not marked:
             return []
-        try:
-            window = registry.capability(r.target_id, "lookback_blocks")
-        except registry.RegistryError:
-            window = None
+        # Both lookups abstain into "no narrowing" rather than into silence,
+        # which over-credits rather than under-reporting -- so RT-NOSURFACE has
+        # to say the timeline is unbounded, not merely that a check is off.
+        #
+        # Reached only for a lifetime RT-TTL can argue about: `_track_shape`
+        # applies that predicate before calling, so this builds no timeline and
+        # makes no registry lookup on traffic the check will refuse. That is
+        # why `openai/direct`, which advertises 30m only, is no longer told its
+        # missing lookback unbounds a check that was quiet for an unrelated
+        # reason -- the gap is not read here at all rather than read and then
+        # not mentioned.
+        window = reads.get(
+            "lookback_blocks",
+            lambda: registry.capability(r.target_id, "lookback_blocks"),
+            inspect=lambda: registry.capability(r.target_id, "lookback_blocks",
+                                                allow_contested=True),
+            needed_for="RT-TTL (its rewrite timeline is then unbounded and "
+                       "credits rewrites the provider could not have read back)")
         # Below the provider's minimum no entry is written, so a boundary
         # shorter than it can never be read back. The batch helper applies this
         # and this side did not, so RT-TTL fired on a sub-minimum marker where
         # TTL-1 refuses -- a divergence introduced by fixing one side.
-        try:
-            floor = registry.min_cacheable_tokens(r.target_id, r.model)
-        except registry.RegistryError:
-            floor = None
+        #
+        # A missing minimum still gets announced on a marked request, by
+        # RT-MIN's own call site in `_below_minimum`, with RT-MIN named as the
+        # consequence. Gating here drops a second attribution, never the alert.
+        floor = reads.get(
+            "min_cacheable_tokens",
+            lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            inspect=lambda: registry.min_cacheable_tokens(
+                r.target_id, r.model, allow_contested=True),
+            needed_for="RT-TTL (rewrites of a prefix too short to cache are "
+                       "then counted as recoverable)")
         top = max(marked)
         ordered = sorted(r.segments, key=lambda s: s.index)
         # Marker positions as lengths in this sequence, which is the unit
@@ -549,6 +805,88 @@ class Monitor:
                 continue
             out.append(hash(tuple(seq)))
         return out
+
+    @staticmethod
+    def _offered_ttls(r, allow_contested=False):
+        """Lifetimes this surface accepts for this model, or None if it does
+        not say.
+
+        `registry.supported_ttls` collapses a null capability into `[]`, and
+        `[]` is also what `deepseek/direct` legitimately records to mean the
+        surface offers no lifetime control at all. Those two need opposite
+        answers here -- the first is a registry gap to announce, the second is
+        a fact RT-TTL should simply respect -- so presence is asked separately.
+        The narrowing itself is still the registry's, including the per-model
+        map that keeps a 1h recommendation off a Bedrock model where 1h never
+        went GA.
+        """
+        if registry.capability(r.target_id, "supported_ttls",
+                               allow_contested) is None:
+            return None
+        return registry.supported_ttls(r.target_id, r.model, allow_contested)
+
+    @staticmethod
+    def _ttl_rt_ttl_can_read(r, reads: _RegistryReads):
+        """`(lifetime, offered)` -- what RT-TTL may reason about here.
+
+        `lifetime` is the one in force, or None when this request is not
+        something RT-TTL can argue about. `offered` is every lifetime the
+        surface accepts for this model, because the *destination* of a switch
+        needs checking as much as its source.
+
+        One definition, read by `_cadence_vs_ttl` to decide whether to speak
+        and what it may recommend, by `_track_shape` to decide whether to
+        collect evidence at all, and by `_prefix_hashes` for its registry
+        lookups. Restating the condition in any of them is how the
+        announcement, the evidence and the check drift apart -- which is the
+        shape of defect this file has already paid for three times.
+
+        Two conditions, and the second was missing. `TTL_SECONDS` is what this
+        module can *reason* about; `registry.supported_ttls` is what the
+        surface will *accept*. Checking only the first told an operator to
+        "set a one-hour TTL" on `openai/direct`, whose row advertises 30m and
+        nothing else -- a recommendation the provider would reject, produced
+        with full confidence from twenty perfectly good observations. Both
+        halves have to hold: a lifetime this module cannot model is not
+        actionable, and a lifetime the surface does not offer is not available.
+
+        Returning the set rather than just the verdict is the other half of
+        that. Proving the *current* lifetime is offered says nothing about the
+        one being recommended, and on `amazon-bedrock/converse` +
+        `claude-opus-5`, where only 5m is offered, a 5m stream still advised
+        switching to 1h. The caller needs the set to check the destination.
+        """
+        lifetimes = r.marker_lifetimes
+        # Two lifetimes in one request is a deliberate pattern -- a durable
+        # prefix under an advancing turn -- and which one a cadence argument
+        # is about is genuinely ambiguous. Abstaining beats guessing at the
+        # operator's expense.
+        if len(lifetimes) > 1:
+            return None, ()
+        # The lifetime on the prefix this advice is about, not the row's.
+        #
+        # Preferring `ttl_requested` told an operator to "set a one-hour TTL on
+        # the stable prefix" on a request whose stable prefix was already 1h and
+        # whose trailing turn was 5m -- the row field cannot express a mixed
+        # request, so it reported the wrong one and the recommendation was a
+        # no-op the operator would have had to disprove themselves.
+        ttl = next(iter(lifetimes), None) or r.ttl_requested
+        if ttl not in TTL_SECONDS:
+            return None, ()
+        # Through the seam, so a surface that cannot answer this is announced
+        # rather than quietly treated as permissive. Defaulting to "supported"
+        # is how the false recommendation above would come back.
+        offered = reads.get(
+            "supported_ttls",
+            lambda: Monitor._offered_ttls(r),
+            inspect=lambda: Monitor._offered_ttls(r, allow_contested=True),
+            needed_for="RT-TTL (inactive: without the surface's lifetimes it "
+                       "cannot tell a switch the provider would accept from "
+                       "one it would reject)")
+        if offered is None:
+            return None, ()
+        offered = tuple(offered)
+        return (ttl if ttl in offered else None), offered
 
     @staticmethod
     def _marked_hashes(r) -> list:
@@ -574,7 +912,11 @@ class Monitor:
 
     # --- checks -----------------------------------------------------------
 
-    def _drift(self, st: _ScopeState, r, scope):
+    # Every check takes `reads` whether or not it uses one, so that adding a
+    # registry lookup to any of them is a one-line change that is announced
+    # from the moment it is written.
+
+    def _drift(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Positions inside the cached prefix that keep changing."""
         marked = [s.index for s in r.segments if s.cache_marked]
         if not marked:
@@ -610,7 +952,7 @@ class Monitor:
                 subject=f"seg{s.index}", at=r.sent_at,
                 fix="Move that section below the last cache marker, or stop varying it.")
 
-    def _rebuild(self, st: _ScopeState, r, scope):
+    def _rebuild(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """The prefix is being thrown away and paid for again.
 
         The only check here that needs no prompt structure at all -- three usage
@@ -745,7 +1087,7 @@ class Monitor:
                 "rotating identifier and reordered tool definitions are the usual "
                 "three, and a model switch is a separate cache pool by design.")
 
-    def _blocked(self, st: _ScopeState, r, scope):
+    def _blocked(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Nothing is cached here, and this position is the reason.
 
         `_drift` reports a marked prefix being invalidated, which means it can
@@ -759,9 +1101,13 @@ class Monitor:
         if any(s.cache_marked for s in r.segments):
             return
         segs = sorted(r.segments, key=lambda s: s.index)
-        try:
-            minimum = registry.min_cacheable_tokens(r.target_id, r.model)
-        except registry.RegistryError:
+        minimum = reads.get(
+            "min_cacheable_tokens",
+            lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            inspect=lambda: registry.min_cacheable_tokens(
+                r.target_id, r.model, allow_contested=True),
+            needed_for="RT-BLOCKED (inactive)")
+        if minimum is None:
             return
         for pos, s in enumerate(segs):
             seen = st.seg_values.get(s.index)
@@ -793,7 +1139,7 @@ class Monitor:
                     "behavioural eval before it ships.")
             return
 
-    def _below_minimum(self, st: _ScopeState, r, scope):
+    def _below_minimum(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """A marker on a prefix too short to cache, which fails silently."""
         # Every marker, through the same walk MIN-1 uses. This summed to the
         # outermost marker only, so a 200-token marker under a 30k one read as
@@ -802,9 +1148,13 @@ class Monitor:
         prefixes = marked_prefixes(r.segments)
         if not prefixes:
             return
-        try:
-            minimum = registry.min_cacheable_tokens(r.target_id, r.model)
-        except registry.RegistryError:
+        minimum = reads.get(
+            "min_cacheable_tokens",
+            lambda: registry.min_cacheable_tokens(r.target_id, r.model),
+            inspect=lambda: registry.min_cacheable_tokens(
+                r.target_id, r.model, allow_contested=True),
+            needed_for="RT-MIN (inactive)")
+        if minimum is None:
             return
         short = [p for p in prefixes if p < minimum]
         if not short:
@@ -818,13 +1168,28 @@ class Monitor:
             subject=str(minimum), at=r.sent_at,
             fix=f"Lengthen the cached prefix past {minimum:,} tokens, or drop the marker.")
 
-    def _marker_budget(self, st: _ScopeState, r, scope):
+    def _marker_budget(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Marker count creeping toward the limit, which errors at the limit."""
         count = sum(1 for s in r.segments if s.cache_marked)
-        try:
-            budget = registry.capability(r.target_id, "max_breakpoints")
-        except registry.RegistryError:
+        # Before the lookup, not after. Zero markers cannot exhaust any
+        # non-negative budget, so this request is answered without the registry
+        # and reading first raised RT-NOSURFACE on ordinary unmarked traffic to
+        # `openai/direct` -- a coverage warning about a check that was not
+        # abstaining, it was concluding. Worse, the subject it burned is the
+        # one a later marked request on the same scope would have used, so the
+        # genuine abstention was then suppressed as a repeat.
+        if not count:
             return
+        budget = reads.get(
+            "max_breakpoints",
+            lambda: registry.capability(r.target_id, "max_breakpoints"),
+            inspect=lambda: registry.capability(r.target_id, "max_breakpoints",
+                                                allow_contested=True),
+            needed_for="RT-BUDGET (inactive)")
+        # A recorded zero is an answer, not a gap: `deepseek/direct` allows no
+        # explicit breakpoints and there is no budget to run out of. Only the
+        # `None` from `reads.get` above is unanswered, and that one has already
+        # been recorded for RT-NOSURFACE by the time it gets here.
         if not budget or count < budget:
             return
         yield Alert(
@@ -836,7 +1201,7 @@ class Monitor:
             subject="budget", at=r.sent_at,
             fix="Merge sections that change at similar rates until markers are free.")
 
-    def _cadence_vs_ttl(self, st: _ScopeState, r, scope):
+    def _cadence_vs_ttl(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Request spacing that the configured lifetime does not suit."""
         # Gaps between rewrites of one prefix, not gaps between requests. TTL-1
         # walks a per-prefix timeline for the same reason: a longer lifetime
@@ -845,39 +1210,40 @@ class Monitor:
         # spaced. Reading the scope's median gap fired on a workload marking a
         # fresh prefix every request, recommending a change worth nothing, while
         # the report refused to make the same claim from the same trace.
-        if len(st.rewrite_gaps) < self.min_samples:
-            return
-        # The lifetime on the prefix this advice is about, not the row's.
         #
-        # Preferring `ttl_requested` told an operator to "set a one-hour TTL on
-        # the stable prefix" on a request whose stable prefix was already 1h and
-        # whose trailing turn was 5m -- the row field cannot express a mixed
-        # request, so it reported the wrong one and the recommendation was a
-        # no-op the operator would have had to disprove themselves.
-        lifetimes = r.marker_lifetimes
-        if len(lifetimes) > 1:
-            # Two lifetimes in one request is a deliberate pattern -- a durable
-            # prefix under an advancing turn -- and which one this cadence
-            # argues about is genuinely ambiguous. Abstaining beats guessing at
-            # the operator's expense.
+        # Which lifetime this advice is about, resolved first, because it also
+        # selects the evidence. Shared with `_track_shape`, which files each
+        # gap under the lifetime that was in force when it was observed.
+        ttl, offered = self._ttl_rt_ttl_can_read(r, reads)
+        if ttl is None:
             return
-        ttl = next(iter(lifetimes), None) or r.ttl_requested
-        if ttl not in TTL_SECONDS:
+        # This lifetime's own rewrites, never the scope's pooled history. A
+        # median taken across lifetimes describes a workload that does not
+        # exist, and the recommendation it produces is about traffic the
+        # operator would have to disprove themselves.
+        observed = st.rewrite_gaps[ttl]
+        if len(observed) < self.min_samples:
             return
-        gaps = sorted(st.rewrite_gaps)
+        gaps = sorted(observed)
         median = gaps[len(gaps) // 2]
-        if ttl == "5m" and 300 < median < 3600:
+        # The destination, not only the source. Proving the lifetime in force
+        # is offered says nothing about the one being recommended, and on
+        # `amazon-bedrock/converse` + `claude-opus-5` -- offered 5m and
+        # nothing else -- a ten-minute 5m rewrite cadence still advised
+        # switching to 1h. Every fix line below names a specific lifetime, so
+        # every one of them has to clear the same bar the current one did.
+        if ttl == "5m" and 300 < median < 3600 and "1h" in offered:
             yield Alert(
                 "RT-TTL", "medium", scope,
                 "requests arrive after the five-minute cache has expired",
                 f"Median gap between rewrites of this prefix, over the last "
-                f"{len(st.rewrite_gaps)}, is {median/60:.1f} "
+                f"{len(observed)} at this lifetime, is {median/60:.1f} "
                 f"minutes, inside the window where a one-hour lifetime reads instead of "
                 f"rewriting. Outside that window the five-minute default is cheaper, so "
                 f"this is not a blanket change.",
                 subject="to-1h", at=r.sent_at,
                 fix="Set a one-hour TTL on the stable prefix for this workload.")
-        elif ttl == "1h" and median >= 3600:
+        elif ttl == "1h" and median >= 3600 and "5m" in offered:
             yield Alert(
                 "RT-TTL", "medium", scope,
                 "one-hour cache is expiring before the next request anyway",
@@ -887,7 +1253,7 @@ class Monitor:
                 subject="to-5m", at=r.sent_at,
                 fix="Drop back to the five-minute default for this workload.")
 
-    def _cold_fanout(self, st: _ScopeState, r, scope):
+    def _cold_fanout(self, st: _ScopeState, r, scope, reads: _RegistryReads):
         """Concurrent requests each paying to write the same prefix."""
         if st.concurrent_writers < 2:
             return

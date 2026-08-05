@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from cacheeconomics import monitor  # noqa: E402
+from cacheeconomics import monitor, registry  # noqa: E402
 from cacheeconomics.monitor import WINDOW, Monitor  # noqa: E402
 from cacheeconomics.trace import Request, Segment  # noqa: E402
 
@@ -367,6 +367,214 @@ class TestCadenceAgainstLifetime(unittest.TestCase):
         self.assertEqual([a for a in fired if a.code == "RT-TTL"], [])
 
 
+class TestTheCadenceEvidenceIsTheLifetimesOwn(unittest.TestCase):
+    """RT-TTL evaluates 5m and 1h. It abstains on any other lifetime -- but the
+    rewrite-gap window it reads was filled by every marked request regardless.
+
+    Measured: ten 30m requests ten minutes apart on `anthropic/direct` built
+    nine gaps, and the very next 5m request emitted RT-TTL reporting a median
+    "over the last 10" -- off ten observations of traffic the rule says it
+    cannot read, and zero observations at 5m. Gating the wording on the
+    lifetime while leaving the state pooled is the worse half of the original
+    defect: silence became a confident number.
+    """
+
+    def _at(self, i, ttl, minutes):
+        return req(i, [sg(0, "system", 8000, "sys", marked=True, ttl=ttl),
+                       sg(1, "user", 100, f"t{i}")],
+                   ttl=ttl, at=T0 + timedelta(minutes=minutes), session="s")
+
+    def test_a_lifetime_it_cannot_evaluate_builds_no_evidence(self):
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(10):
+            fired += m.observe(self._at(i, "30m", minutes))
+            minutes += 10
+        late = m.observe(self._at(99, "5m", minutes))
+        self.assertEqual([], [a for a in fired + late if a.code == "RT-TTL"])
+
+    def test_the_buckets_stay_empty_for_an_unevaluable_lifetime(self):
+        m = Monitor()
+        minutes = 0
+        for i in range(10):
+            m.observe(self._at(i, "30m", minutes))
+            minutes += 10
+        st = next(s for k, s in m._scopes.items() if len(k) > 3)
+        self.assertEqual({k: len(v) for k, v in st.rewrite_gaps.items()},
+                         {"5m": 0, "1h": 0})
+
+    def test_one_lifetimes_history_does_not_answer_for_another(self):
+        """A scope can legitimately carry both -- a durable prefix under an
+        advancing turn is a documented pattern -- so the fix is to partition
+        the evidence, not to refuse a mixed scope."""
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(14):            # sparse 1h traffic: fires the 1h way
+            fired += m.observe(self._at(i, "1h", minutes))
+            minutes += 70
+        for i in range(14):            # in-band 5m traffic: fires the 5m way
+            fired += m.observe(self._at(100 + i, "5m", minutes))
+            minutes += 10
+        by_subject = {a.subject for a in fired if a.code == "RT-TTL"}
+        self.assertEqual({"to-5m", "to-1h"}, by_subject)
+
+    def test_the_alert_says_how_many_observations_at_that_lifetime(self):
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(14):
+            fired += m.observe(self._at(i, "5m", minutes))
+            minutes += 10
+        a = next(x for x in fired if x.code == "RT-TTL")
+        self.assertIn("at this lifetime", a.detail)
+
+    def test_a_lifetime_the_surface_does_not_offer_is_not_recommended(self):
+        """`TTL_SECONDS` is what this module can reason about;
+        `registry.supported_ttls` is what the surface will accept. Checking
+        only the first told an operator to set a one-hour TTL on
+        `openai/direct`, whose row advertises 30m and nothing else -- a switch
+        the provider would reject, recommended with full confidence off twenty
+        good observations."""
+        self.assertEqual(["30m"],
+                         registry.supported_ttls("openai/direct", "claude-opus-5"))
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(20):
+            fired += m.observe(req(
+                i, [sg(0, "system", 8000, "sys", marked=True, ttl="5m"),
+                    sg(1, "user", 100, f"t{i}")],
+                ttl="5m", target="openai/direct",
+                at=T0 + timedelta(minutes=minutes), session="s"))
+            minutes += 10
+        self.assertEqual([], [a for a in fired if a.code == "RT-TTL"])
+
+    def test_a_surface_that_offers_it_still_gets_the_recommendation(self):
+        """The gate must not silence the check everywhere. `anthropic/direct`
+        offers both lifetimes."""
+        self.assertIn("1h", registry.supported_ttls("anthropic/direct",
+                                                    "claude-opus-5"))
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(14):
+            fired += m.observe(self._at(i, "5m", minutes))
+            minutes += 10
+        self.assertIn("RT-TTL", [a.code for a in fired])
+
+    def test_the_lifetime_it_recommends_must_also_be_offered(self):
+        """Proving the lifetime in force is supported says nothing about the
+        one being recommended. `amazon-bedrock/converse` + `claude-opus-5` is
+        offered 5m and nothing else -- 1h never went GA for that model -- and
+        a ten-minute 5m rewrite cadence there still emitted `subject='to-1h'`
+        with `fix='Set a one-hour TTL...'`, advice pointing at a combination
+        the registry says is rejected.
+
+        Third round in a row where the fix covered one direction of a two-sided
+        thing: wording not state, invent not destroy, source not destination.
+        """
+        self.assertEqual(["5m"], registry.supported_ttls(
+            "amazon-bedrock/converse", "claude-opus-5"))
+        self.assertEqual([], self._cadence("amazon-bedrock/converse",
+                                           "claude-opus-5"))
+
+    def test_a_model_that_is_offered_the_destination_still_gets_it(self):
+        """The control, so the gate is not a blanket silence. Same surface,
+        same cadence, a model for which 1h did go GA."""
+        self.assertIn("1h", registry.supported_ttls(
+            "amazon-bedrock/converse", "claude-haiku-4-5"))
+        fired = self._cadence("amazon-bedrock/converse", "claude-haiku-4-5")
+        self.assertEqual(["to-1h"], [a.subject for a in fired])
+
+    def _cadence(self, target, model, ttl="5m", step=10, n=16):
+        """A rewrite cadence inside the window RT-TTL argues about."""
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(n):
+            fired += m.observe(req(
+                i, [sg(0, "system", 8000, "sys", marked=True, ttl=ttl),
+                    sg(1, "user", 100, f"t{i}")],
+                ttl=ttl, target=target, model=model,
+                at=T0 + timedelta(minutes=minutes), session="s"))
+            minutes += step
+        return [a for a in fired if a.code == "RT-TTL"]
+
+    def test_a_surface_that_cannot_answer_reports_the_gap(self):
+        """Abstaining is right; abstaining silently is the defect this whole
+        seam exists for. An unnamed surface cannot say which lifetimes it
+        takes, so RT-TTL goes quiet and RT-NOSURFACE has to say why."""
+        m, fired = Monitor(), []
+        minutes = 0
+        for i in range(14):
+            fired += m.observe(req(
+                i, [sg(0, "system", 8000, "sys", marked=True, ttl="5m"),
+                    sg(1, "user", 100, f"t{i}")],
+                ttl="5m", target=registry.UNATTRIBUTED,
+                at=T0 + timedelta(minutes=minutes), session="s"))
+            minutes += 10
+        self.assertEqual([], [a for a in fired if a.code == "RT-TTL"])
+        a = next(x for x in fired if x.code == "RT-NOSURFACE")
+        self.assertIn("supported_ttls", a.detail)
+        self.assertIn("RT-TTL", a.detail)
+
+    def test_an_unevaluable_lifetime_cannot_erase_evaluable_evidence(self):
+        """Partitioning the gaps while leaving one shared span->timestamp map
+        moved the defect rather than removing it: a 30m write on a span
+        overwrote the 5m timestamp, so the next 5m request had nothing to
+        measure from. Measured: a 5m stream that records 19 gaps and fires
+        recorded 0 and never fired once identical 30m writes were interleaved
+        between the same requests."""
+        def run(interleave):
+            m, fired = Monitor(), []
+            minutes, i = 0, 0
+            for _ in range(20):
+                fired += m.observe(self._at(i, "5m", minutes))
+                i += 1
+                minutes += 10
+                if interleave:
+                    fired += m.observe(self._at(i, "30m", minutes))
+                    i += 1
+                    minutes += 10
+            st = next(s for k, s in m._scopes.items() if len(k) > 3)
+            return ([a.code for a in fired].count("RT-TTL"),
+                    len(st.rewrite_gaps["5m"]))
+
+        self.assertEqual(run(False), run(True))
+        self.assertEqual(1, run(True)[0])
+
+    def test_the_timeline_map_is_partitioned_and_capped_per_lifetime(self):
+        """Bounded by `len(TTL_SECONDS) * MAX_FIRING`, and neither bucket may
+        evict the other."""
+        m = Monitor()
+        minutes = 0
+        for i in range(monitor.MAX_FIRING * 3):
+            # A fresh span every request, so the cap is actually exercised.
+            m.observe(req(i, [sg(0, "system", 8000, f"sys{i}", marked=True,
+                                 ttl="5m"),
+                              sg(1, "user", 100, f"t{i}")],
+                          ttl="5m", at=T0 + timedelta(minutes=minutes),
+                          session="s"))
+            minutes += 10
+        st = next(s for k, s in m._scopes.items() if len(k) > 3)
+        self.assertEqual(sorted(monitor.TTL_SECONDS), sorted(st.last_marked_at))
+        for name, marks in st.last_marked_at.items():
+            with self.subTest(lifetime=name):
+                self.assertLessEqual(len(marks), monitor.MAX_FIRING)
+
+    def test_the_bucket_map_cannot_grow(self):
+        """Keys come only from `_ttl_rt_ttl_can_read`, which returns a member
+        of TTL_SECONDS or None. A lifetime nobody evaluates must not create a
+        bucket, or a long-lived process grows one per string it ever sees."""
+        m = Monitor()
+        minutes = 0
+        for i, ttl in enumerate(["30m", "12h", "1d", "5m", "1h", None] * 6):
+            m.observe(self._at(i, ttl, minutes))
+            minutes += 10
+        for k, st in m._scopes.items():
+            with self.subTest(scope=k):
+                self.assertEqual(sorted(monitor.TTL_SECONDS),
+                                 sorted(st.rewrite_gaps))
+                self.assertEqual(sorted(monitor.TTL_SECONDS),
+                                 sorted(st.last_marked_at))
+
+
 class TestColdFanOut(unittest.TestCase):
 
     def test_concurrent_writers_of_one_prefix_fire(self):
@@ -662,6 +870,439 @@ class TestEveryAlertCanBeRendered(unittest.TestCase):
         for a in fired:
             with self.subTest(code=a.code):
                 self.assertIsInstance(str(a), str)
+
+
+class TestARegistryLookupItCannotMakeIsSaidAloud(unittest.TestCase):
+    """A check that abstains because the registry could not answer must say so.
+
+    RT-NOSURFACE existed for this, and probed exactly one key --
+    `min_cacheable_tokens`. Measured before the fix, over 30 requests on a
+    surface where one lookup at a time was made to fail:
+
+        min_cacheable_tokens unavailable      -> RT-NOSURFACE, 1 alert
+        capability('max_breakpoints') missing -> 0 alerts
+        capability('lookback_blocks') missing -> 0 alerts
+
+    A surface can answer the minimum and not the budget, so the one probe did
+    not imply the other two. `lookback_blocks` was in no review; it was found
+    by asking the code which keys it reads. So the tests below discover the
+    dependency set the same way -- by watching the reads -- rather than naming
+    the three that are known today.
+    """
+
+    def _spy(self, on_capability, on_minimum):
+        """Swap both registry entry points, restoring them in a `finally`.
+
+        A leaked monkeypatch corrupts every test that runs afterwards and the
+        failure surfaces somewhere unrelated, so nothing here patches without
+        this wrapper.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def patched():
+            real_cap = registry.capability
+            real_min = registry.min_cacheable_tokens
+            registry.capability = on_capability(real_cap)
+            registry.min_cacheable_tokens = on_minimum(real_min)
+            try:
+                yield
+            finally:
+                registry.capability = real_cap
+                registry.min_cacheable_tokens = real_min
+        return patched()
+
+    def _stream(self, target="anthropic/direct", n=30, marked=True, ttl="5m"):
+        m, fired = Monitor(), []
+        for i in range(n):
+            fired += m.observe(req(i, [sg(0, "system", 8000, "sys",
+                                          "instructions", marked=marked,
+                                          ttl=ttl if marked else None),
+                                       sg(1, "user", 100, f"t{i}", "user_turn")],
+                                   target=target, ttl=ttl, session="s"))
+        return m, fired
+
+    def _notices(self, **kw):
+        return [a for a in self._stream(**kw)[1] if a.code == "RT-NOSURFACE"]
+
+    def _dependencies(self):
+        """Which registry keys the checks actually read, discovered by
+        watching them read, so a key added later is covered here without
+        anyone editing this file."""
+        asked = set()
+
+        def cap(real):
+            def f(target_id, name, allow_contested=False):
+                asked.add(("capability", name))
+                return real(target_id, name, allow_contested)
+            return f
+
+        def mn(real):
+            def f(target_id, model):
+                asked.add(("min_cacheable_tokens", None))
+                return real(target_id, model)
+            return f
+
+        with self._spy(cap, mn):
+            self._stream()
+        return sorted(asked, key=lambda d: (d[0], d[1] or ""))
+
+    def _with_unavailable(self, kind, name, *, as_null=False):
+        """One stream where exactly one lookup cannot be answered.
+
+        `as_null` picks the second route into the same silence: the capability
+        *is* recorded, as JSON null. `amazon-bedrock/converse` and
+        `openai/direct` both ship that way, so this is not a hypothetical.
+        """
+        def cap(real):
+            def f(target_id, cname, allow_contested=False):
+                if kind == "capability" and cname == name:
+                    if as_null:
+                        return None
+                    raise registry.RegistryError(f"test: {cname} unavailable")
+                return real(target_id, cname, allow_contested)
+            return f
+
+        def mn(real):
+            def f(target_id, model):
+                if kind == "min_cacheable_tokens":
+                    if as_null:
+                        return None
+                    raise registry.RegistryError("test: minimum unavailable")
+                return real(target_id, model)
+            return f
+
+        with self._spy(cap, mn):
+            return self._stream()[1]
+
+    def test_there_are_dependencies_to_check(self):
+        """Guard the guard: if the discovery finds nothing, every assertion
+        below is vacuously true."""
+        self.assertTrue(self._dependencies())
+
+    def test_an_unanswerable_lookup_is_announced(self):
+        silent = []
+        for kind, name in self._dependencies():
+            with self.subTest(dependency=f"{kind}:{name}"):
+                fired = self._with_unavailable(kind, name)
+                if "RT-NOSURFACE" not in {a.code for a in fired}:
+                    silent.append(f"{kind}({name})")
+        self.assertEqual([], silent,
+                         "these disable or unbound a check with no alert: "
+                         + ", ".join(silent))
+
+    def test_a_lookup_answered_with_null_is_announced_too(self):
+        """The second route to the same silence. `capability()` returning None
+        never raised, so the `except RegistryError` guard never saw it and
+        `if not budget: return` swallowed it."""
+        silent = []
+        for kind, name in self._dependencies():
+            with self.subTest(dependency=f"{kind}:{name}"):
+                fired = self._with_unavailable(kind, name, as_null=True)
+                if "RT-NOSURFACE" not in {a.code for a in fired}:
+                    silent.append(f"{kind}({name})")
+        self.assertEqual([], silent,
+                         "these are recorded as null and disable a check with "
+                         "no alert: " + ", ".join(silent))
+
+    def test_the_alert_names_the_key_and_what_it_costs(self):
+        """"Some checks are inactive" is not actionable. The reader needs the
+        key to record and the check they are currently not getting."""
+        fired = self._with_unavailable("capability", "max_breakpoints")
+        a = next(x for x in fired if x.code == "RT-NOSURFACE")
+        self.assertIn("max_breakpoints", a.detail)
+        self.assertIn("RT-BUDGET", a.detail)
+        self.assertIn("unmeasured, not healthy", a.detail)
+        self.assertNotIn("lookback_blocks", a.detail,
+                         "only the lookup that failed may be named")
+
+    def test_a_fully_recorded_surface_is_not_nagged(self):
+        self.assertNotIn("RT-NOSURFACE",
+                         {a.code for a in self._stream()[1]})
+
+    def test_it_is_said_once_per_scope_not_once_per_request(self):
+        fired = self._with_unavailable("capability", "max_breakpoints")
+        self.assertEqual(1, [a.code for a in fired].count("RT-NOSURFACE"))
+
+    def test_fixing_one_lookup_still_reports_the_others(self):
+        """The dedup is keyed on the *set* of unanswered lookups, so a surface
+        that gains one recorded key and still lacks another is reported again
+        rather than swallowed as a repeat of an alert about a different gap."""
+        state = {"deny": {"max_breakpoints", "lookback_blocks"}}
+
+        def cap(real):
+            def f(target_id, name, allow_contested=False):
+                if name in state["deny"]:
+                    raise registry.RegistryError(f"test: {name} unavailable")
+                return real(target_id, name, allow_contested)
+            return f
+
+        fired = []
+        with self._spy(cap, lambda real: real):
+            m = Monitor()
+            for i in range(20):
+                if i == 10:
+                    state["deny"] = {"lookback_blocks"}
+                fired += m.observe(req(i, STABLE, session="s"))
+        subjects = [a.subject for a in fired if a.code == "RT-NOSURFACE"]
+        self.assertEqual(2, len(subjects), subjects)
+        self.assertNotEqual(subjects[0], subjects[1])
+
+    def test_the_suppression_table_stays_bounded(self):
+        """RT-NOSURFACE's subject now varies, and the two hand-rolled dedup
+        sites it and RT-BLIND used wrote to `firing` without the eviction the
+        check loop does. Same table, same cap, one code path."""
+        m, _ = self._stream()
+        st = m._scopes[(None, "anthropic/direct", "claude-opus-5")]
+        for i in range(monitor.MAX_FIRING * 4):
+            m._fire(st, monitor.Alert("RT-SYNTHETIC", "low", ("x",), "s", "d",
+                                      subject=f"n{i}"), [])
+        self.assertLessEqual(len(st.firing), monitor.MAX_FIRING)
+
+    def test_a_recorded_zero_is_an_answer_not_a_gap(self):
+        """`deepseek/direct` records `max_breakpoints: 0` -- it allows no
+        explicit breakpoints. That is a fact about the surface, so RT-BUDGET
+        is correctly quiet and there is nothing to announce. Testing the value
+        with `not budget` rather than `is None` would have reported it as
+        missing registry data and sent somebody to fix a file that is right."""
+        fired = self._stream(target="deepseek/direct")[1]
+        a = next(x for x in fired if x.code == "RT-NOSURFACE")
+        self.assertNotIn("max_breakpoints", a.detail)
+
+    def test_a_shipped_surface_with_a_null_capability_says_so(self):
+        """No monkeypatching at all: these are rows in the registry as it
+        ships, and both reach the silent path this class is about."""
+        for target, key in (("amazon-bedrock/converse", "lookback_blocks"),
+                            ("openai/direct", "max_breakpoints")):
+            with self.subTest(target=target):
+                fired = self._stream(target=target)[1]
+                a = next((x for x in fired if x.code == "RT-NOSURFACE"), None)
+                self.assertIsNotNone(a, f"{target} abstains in silence")
+                self.assertIn(key, a.detail)
+
+    def test_the_notice_carries_no_dollar_figure(self):
+        for target in ("deepseek/direct", "openai/direct"):
+            for a in self._stream(target=target)[1]:
+                with self.subTest(target=target, code=a.code):
+                    self.assertNotIn("$", a.summary + a.detail + a.fix)
+
+
+class TestTheNoticeNamesTheRealCause(unittest.TestCase):
+    """An alert that fires on ordinary traffic gets switched off, and then it
+    protects nothing -- the same end state as the silence it was added to fix.
+
+    Three ways the seam announced a lookup that was not actually the reason
+    the operator was getting no answer. All three measured on the registry as
+    it ships, no monkeypatching.
+    """
+
+    _stream = TestARegistryLookupItCannotMakeIsSaidAloud._stream
+    _notices = TestARegistryLookupItCannotMakeIsSaidAloud._notices
+
+    def test_unmarked_traffic_is_not_told_the_budget_check_is_off(self):
+        """`openai/direct` records `max_breakpoints: null`. A request carrying
+        no markers is answered without it -- zero cannot exhaust any
+        non-negative budget -- so RT-BUDGET is concluding, not abstaining.
+
+        Measured before the fix: 1 RT-NOSURFACE on 20 ordinary unmarked
+        requests, claiming RT-BUDGET was inactive."""
+        self.assertEqual([], self._notices(target="openai/direct",
+                                           marked=False, ttl="30m"))
+
+    def test_the_marked_request_that_follows_is_still_reported(self):
+        """The sharper half. The subject is keyed on the set of unanswered
+        lookups, so the false notice on unmarked traffic burned the very slot
+        the genuine one needed and the real abstention was then suppressed as
+        a repeat."""
+        m, fired = Monitor(), []
+        for i in range(10):
+            fired += m.observe(req(i, [sg(0, "system", 8000, "sys")],
+                                   target="openai/direct", ttl="30m",
+                                   session="s"))
+        self.assertEqual([], [a for a in fired if a.code == "RT-NOSURFACE"])
+        for i in range(10, 20):
+            fired += m.observe(req(i, [sg(0, "system", 8000, "sys",
+                                          marked=True, ttl="30m"),
+                                       sg(1, "user", 100, f"t{i}")],
+                                   target="openai/direct", ttl="30m",
+                                   session="s"))
+        notices = [a for a in fired if a.code == "RT-NOSURFACE"]
+        self.assertEqual(1, len(notices), "the genuine abstention was swallowed")
+        self.assertIn("max_breakpoints", notices[0].detail)
+
+    def test_a_contested_row_is_reported_as_contested(self):
+        """`ContestedRow` subclasses `RegistryError`, so one `except` clause
+        reported a disputed row as missing data and sent the reader to add a
+        value already on file. This repo's standing rule is that a contested
+        row is never fact, so the dispute has to be named and the settle
+        remedy has to appear.
+
+        This test asserted the opposite exclusion in its first form -- that a
+        contested row says *nothing* about absence -- which encoded the very
+        collapse the next review found: contested and absent are independent,
+        and `openai/bedrock` is both. Naming the dispute is the requirement;
+        suppressing the other half never was."""
+        for target in ("openai/bedrock", "google/gemini-explicit"):
+            with self.subTest(target=target):
+                a = next(iter(self._notices(target=target)), None)
+                self.assertIsNotNone(a, f"{target} abstains in silence")
+                self.assertIn("contested", a.detail)
+                self.assertIn("settle the contested row", a.fix.lower())
+
+    def test_a_genuinely_absent_row_still_says_so(self):
+        """The other direction, so the fix above cannot be "call everything
+        contested"."""
+        a = next(iter(self._notices(target=registry.UNATTRIBUTED)))
+        self.assertIn("not recorded for this surface", a.detail)
+        self.assertNotIn("contested", a.detail)
+        self.assertIn("record the missing limits", a.fix.lower())
+
+    def test_a_lifetime_rt_ttl_cannot_evaluate_does_not_blame_the_lookback(self):
+        """`openai/direct` advertises 30m; RT-TTL evaluates 5m and 1h. It
+        abstains on the lifetime before the lookback bound can matter, so
+        filling that registry gap would change nothing and naming it names a
+        cause that is not the real one."""
+        self.assertNotIn("30m", monitor.TTL_SECONDS)
+        for a in self._notices(target="openai/direct", ttl="30m"):
+            self.assertNotIn("lookback_blocks", a.detail)
+            self.assertNotIn("RT-TTL", a.detail)
+
+    def test_a_lifetime_rt_ttl_can_evaluate_still_blames_the_lookback(self):
+        """The gate must not become a blanket silence: on a lifetime RT-TTL
+        does act on, the unbounded timeline is the real consequence and has to
+        be said. `amazon-bedrock/converse` ships `lookback_blocks: null`.
+
+        The lifetimes swept here come from the registry rather than being
+        written out, because they are per model on this surface: 1h went GA on
+        Bedrock for three models and `claude-opus-5` is not one of them, so
+        hard-coding "5m and 1h" would assert the check speaks about a lifetime
+        the provider would reject."""
+        offered = registry.supported_ttls("amazon-bedrock/converse",
+                                          "claude-opus-5")
+        self.assertTrue(offered)
+        for ttl in offered:
+            with self.subTest(ttl=ttl):
+                a = next(iter(self._notices(
+                    target="amazon-bedrock/converse", ttl=ttl)), None)
+                self.assertIsNotNone(a, f"{ttl} abstains in silence")
+                self.assertIn("lookback_blocks", a.detail)
+                self.assertIn("unbounded", a.detail)
+
+    def test_a_lifetime_the_model_cannot_use_is_not_argued_about(self):
+        """The per-model narrowing, end to end. `claude-opus-5` on Bedrock is
+        offered 5m only, so a 1h request there must not produce cadence advice
+        even though the surface as a whole lists 1h."""
+        self.assertNotIn("1h", registry.supported_ttls(
+            "amazon-bedrock/converse", "claude-opus-5"))
+        self.assertIn("1h", registry.supported_ttls(
+            "amazon-bedrock/converse", "claude-haiku-4-5"))
+        m = Monitor()
+        r = req(0, [sg(0, "system", 8000, "sys", marked=True, ttl="1h")],
+                ttl="1h", target="amazon-bedrock/converse")
+        self.assertIsNone(
+            m._ttl_rt_ttl_can_read(r, monitor._RegistryReads())[0])
+
+    def test_the_gate_and_the_check_share_one_definition(self):
+        """The announcement is gated on whether RT-TTL can read the lifetime.
+        Two copies of that condition would drift, and a drifted copy is how
+        the alert starts describing a check that no longer behaves that way."""
+        m = Monitor()
+        for ttl, expected in (("5m", "5m"), ("1h", "1h"), ("30m", None),
+                              (None, None)):
+            with self.subTest(ttl=ttl):
+                r = req(0, [sg(0, "system", 8000, "sys", marked=True, ttl=ttl)],
+                        ttl=ttl)
+                ttl, offered = m._ttl_rt_ttl_can_read(
+                    r, monitor._RegistryReads())
+                self.assertEqual(expected, ttl)
+
+    def test_a_contested_row_that_also_lacks_the_key_says_both(self):
+        """Contested and absent are flags, not alternatives. Shipped
+        `openai/bedrock` is flagged contested AND carries
+        `capabilities: {"_unknown": true}`, so the keys are missing too.
+
+        Catching ContestedRow first fixed the label and introduced a second
+        collapse: every key on a contested row was reported present-but-
+        disputed without checking, and only the settle remedy was emitted. An
+        operator was told to settle a row that also needs values recorded."""
+        a = next(iter(self._notices(target="openai/bedrock")))
+        self.assertIn("contested", a.detail)
+        self.assertIn("not recorded for this surface", a.detail)
+        self.assertIn("settle the contested row", a.fix.lower())
+        self.assertIn("record the missing limits", a.fix.lower())
+
+    def test_a_contested_row_that_does_record_the_key_says_only_that(self):
+        """The other direction, inspected rather than assumed. Nothing may
+        report a key as absent without having looked."""
+        from cacheeconomics import registry as reg
+        real = reg.capability
+        real_min = reg.min_cacheable_tokens
+
+        def cap(target_id, name, allow_contested=False):
+            if not allow_contested:
+                raise reg.ContestedRow("test: contested")
+            # On file, and inspectable without publishing. Real shapes per
+            # key, so the narrowing the registry does on the way back still
+            # gets something it can work with.
+            return real(target_id, name, allow_contested=True)
+
+        def mn(target_id, model, allow_contested=False):
+            if not allow_contested:
+                raise reg.ContestedRow("test: contested")
+            return real_min(target_id, model, allow_contested=True)
+
+        reg.capability, reg.min_cacheable_tokens = cap, mn
+        try:
+            a = next(iter(self._notices(target="anthropic/direct")))
+        finally:
+            reg.capability, reg.min_cacheable_tokens = real, real_min
+        self.assertIn("contested", a.detail)
+        self.assertNotIn("not recorded for this surface", a.detail)
+        self.assertNotIn("record the missing limits", a.fix.lower())
+
+    def test_the_minimum_on_a_contested_row_is_now_inspected(self):
+        """`min_cacheable_tokens` used to take no `allow_contested`, so its
+        presence on a contested row was reported as "not inspected" -- true,
+        but it left an operator able to settle the contest and find the same
+        checks still off for an unreported second reason. `openai/bedrock`
+        records no minimum and no `inherits_minimums_from`, and now says so.
+
+        The registry grew the parameter rather than the monitor growing a copy
+        of the inheritance walk."""
+        a = next(iter(self._notices(target="openai/bedrock")))
+        part = next(p for p in a.detail.split("; ")
+                    if p.startswith("min_cacheable_tokens ("))
+        self.assertIn("contested", part)
+        self.assertIn("not recorded for this surface", part)
+        self.assertNotIn("was not inspected", part)
+
+    def test_a_lookup_with_no_inspecting_form_still_says_it_did_not_look(self):
+        """Every read site now passes an inspecting form, so this is about the
+        seam's default rather than a live surface: a site added later without
+        one must report that it did not look, not guess in either direction.
+        Guessing "present" understates a row that needs values recorded;
+        guessing "absent" invents a gap."""
+        reads = monitor._RegistryReads()
+
+        def raises():
+            raise registry.ContestedRow("test: contested")
+
+        reads.get("some_future_key", raises, needed_for="RT-FUTURE")
+        causes, _ = reads.unanswered["some_future_key"]
+        self.assertIn(monitor._UNINSPECTED, causes)
+        self.assertNotIn(monitor._NOT_RECORDED, causes)
+
+    def test_two_lifetimes_in_one_request_are_still_ambiguous(self):
+        """`_cadence_vs_ttl` abstains when a request carries a durable prefix
+        under an advancing turn. The shared helper has to keep that, or the
+        refactor quietly turned an abstention into a guess."""
+        m = Monitor()
+        r = req(0, [sg(0, "system", 8000, "sys", marked=True, ttl="1h"),
+                    sg(1, "user", 4000, "turn", marked=True, ttl="5m")],
+                ttl="5m")
+        self.assertEqual(2, len(r.marker_lifetimes))
+        self.assertIsNone(
+            m._ttl_rt_ttl_can_read(r, monitor._RegistryReads())[0])
 
 
 if __name__ == "__main__":
