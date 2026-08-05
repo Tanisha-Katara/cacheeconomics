@@ -18,18 +18,51 @@ to an invoice.
 In one sentence: **cacheeconomics turns a vague "input token" bill into a
 local, evidence-backed fix list for prompt-cache waste.**
 
+A useful run answers four questions:
+
+- Which tokens were fresh input, cache reads, five-minute writes and one-hour
+  writes?
+- Which cache behaviour is wasting money: expiry, rebuilds, bad marker
+  placement, model switches, tiny prefixes or something else?
+- What is the first change to make?
+- Can the dollar figure be tied to an invoice, or is it only safe to treat as a
+  DRAFT?
+
 ## Who it helps
 
 cacheeconomics is for teams whose LLM agents run often enough that prompt-cache
 behaviour has become real money, real latency, or both. It is most useful when
 you already have traces or proxy logs and need to know what to change next.
 
-| who you are | what cacheeconomics gives you |
-|---|---|
-| Agent engineers | A diagnosis of why caching is missing: prefixes below the model minimum, cache entries expiring before reuse, volatile prompt sections rebuilding the prefix, model switches that split reuse, or too many breakpoints. Each finding carries a "do this" line instead of stopping at a chart. |
-| Platform and gateway teams | A local audit path for Claude Code transcripts, LiteLLM logs, request-body exports, Bedrock, Vertex and custom gateways. Surfaces, tenants and tokenizer identities are kept explicit so one customer's traffic does not quietly borrow another surface's assumptions. |
-| FinOps and engineering leadership | Dollar figures only when they reconcile against an invoice, or DRAFT figures clearly labelled as unreconciled. That lets you ask "what can we save?" without handing around numbers that never matched money leaving the account. |
-| Framework maintainers and auditors | Reproducible evidence for cache-marker, token-accounting and TTL bugs in agent frameworks. The repo keeps live experiments, per-call evidence and disclosure verifiers beside the code that produced the claims. |
+It is also for individual Claude Code power users and small agent builders: if
+you are vibe-coding across long sessions, running coding agents on loops, or
+building on the Claude API, you already have cache behaviour worth inspecting.
+
+- **Claude Code power users and vibe coders** get a zero-instrumentation way to
+  inspect their own Claude Code history: why usage spiked, whether caching is
+  working, whether compaction or model switches are rebuilding prefixes, and
+  which session pattern to fix first.
+- **Claude API agent builders** get pre-ship and post-ship cache feedback for
+  coding agents, research agents, browser agents and internal tools: minimum
+  checks, TTL choice, marker-placement bake-offs, volatile prompt sections and
+  optional conservative live placement.
+- **Agent engineers** get a diagnosis of why caching is missing: prefixes below
+  the model minimum, cache entries expiring before reuse, volatile prompt
+  sections rebuilding the prefix, model switches that split reuse, or too many
+  breakpoints. Each finding carries a "do this" line instead of stopping at a
+  chart.
+- **Platform and gateway teams** get a local audit path for Claude Code
+  transcripts, LiteLLM logs, request-body exports, Bedrock, Vertex and custom
+  gateways. Surfaces, tenants and tokenizer identities stay explicit, so one
+  customer's traffic does not quietly borrow another surface's assumptions.
+- **FinOps and engineering leadership** get dollar figures only when they
+  reconcile against an invoice, or DRAFT figures clearly labelled as
+  unreconciled. That lets you ask "what can we save?" without handing around
+  numbers that never matched money leaving the account.
+- **Framework maintainers and auditors** get reproducible evidence for
+  cache-marker, token-accounting and TTL bugs in agent frameworks. The repo
+  keeps live experiments, per-call evidence and disclosure verifiers beside the
+  code that produced the claims.
 
 The payoff is concrete: it can tell you that a cron agent is rebuilding a
 five-minute cache every seven minutes, that a marker is below the provider's
@@ -56,6 +89,54 @@ observe-first and opt-in for mutation: it stands down on cold data, existing
 markers, unsafe wire positions, near-minimum token estimates and anything that
 would require moving prompt content. Automatic placement is available; guessing
 on live traffic is not the design.
+
+## What it supports, and what it refuses
+
+cacheeconomics is strongest on Claude/Anthropic-style prompt caching, where the
+provider exposes separate cache read/write counters, prices the token classes
+differently, and gives developers some control over cache markers or TTLs. It
+also understands adjacent surfaces through the registry: Bedrock and Vertex have
+different billing surfaces, OpenAI and DeepSeek have different cache control
+models, and a custom gateway has to say which surface it is fronting.
+
+It does **not** claim to support every model or every kind of caching. Unknown
+models, missing provider facts, unsupported lifetimes, unpriced partner
+surfaces, contested registry rows and self-hosted models with no cache-hit
+accounting are refused or reported as abstentions. That is deliberate: a tool
+that guesses here can publish a beautiful dollar figure no invoice will ever
+match.
+
+DeepSeek is the shape of extension that makes sense. DeepSeek's direct API has
+implicit prefix caching and reports cache-hit and cache-miss input tokens, but
+it does not expose Anthropic-style `cache_control` markers or 5m/1h write
+premiums. So DeepSeek support means hit/miss economics, ordering, routing
+affinity and trace coverage; it does **not** mean placing breakpoints or running
+the Anthropic TTL allocator on that surface.
+
+For open-weight and self-hosted models, support is about the serving stack, not
+the model license. A vLLM, SGLang or custom gateway deployment belongs in the
+registry only when it exposes stable cache semantics, usage counters and rates
+worth auditing.
+
+## Similar projects, and the narrow claim
+
+cacheeconomics is not the first LLM cost tool, and it is not the first LLM
+caching project. [Langfuse](https://langfuse.com/docs/observability/features/token-and-cost-tracking),
+[Helicone](https://docs.helicone.ai/guides/cookbooks/cost-tracking) and
+[Phoenix](https://arize.com/docs/phoenix/tracing/how-to-tracing/cost-tracking)
+already track token usage and cost. [LiteLLM](https://docs.litellm.ai/docs/tutorials/prompt_caching)
+and [Portkey](https://portkey.ai/docs/product/open-source) sit in gateways where
+teams route, price and cache requests. [GPTCache](https://github.com/zilliztech/gptcache)
+and gateway caches can store whole responses or semantic matches.
+
+The narrower claim is the useful one: cacheeconomics is purpose-built for
+provider-side prompt-cache economics. It starts from traces on disk, separates
+fresh input, cache reads, five-minute writes and one-hour writes, refuses
+unsupported registry facts, ties dollars to invoices, and turns marker, TTL,
+minimum-prefix and cadence problems into specific fixes. Use it beside
+observability and gateway tools when the question is not "what happened in
+production?" but **which cache behaviour made this bill worse, and what exact
+prompt-cache change should we try first?**
 
 To be precise about the network, because "runs locally" is the kind of claim
 that quietly stops being true: **the installed package opens no sockets.** It
@@ -249,9 +330,13 @@ eight probes matching predictions written down before the run.
 | what you have | how to run it | what you get |
 |---|---|---|
 | Claude Code transcripts | `cacheeconomics claude-code` | spend, ratios, rebuild and lifetime findings |
-| LiteLLM proxy logs | `analyze log.jsonl --from litellm` | the same, across every model your proxy sees |
-| request bodies from your gateway | `analyze bodies.jsonl --from bodies` | plus *which part* of the prompt costs you |
+| LiteLLM proxy logs | `cacheeconomics analyze log.jsonl --from litellm` | the same, across every model your proxy sees |
+| request bodies from your gateway | `cacheeconomics analyze bodies.jsonl --from bodies` | plus *which part* of the prompt costs you |
 | an agent you did not write | `tier-b/capture_proxy.py` | the same as bodies, no code change |
+
+`--from bodies` needs `CACHEECONOMICS_HMAC_KEY` or `--key-file`, because segment
+ids are keyed hashes of prompt content. That is a privacy boundary, not a setup
+tax: the tool refuses to write bare prompt digests.
 
 The last row is how the browser-use measurement was done. Most agents let you
 point them at a different base URL, because that is how people use gateways, and
@@ -277,7 +362,7 @@ confidence than it earns.
 cacheeconomics bakeoff trace.jsonl --by-agent
 
 # check a cache config before you ship it. works as a CI gate
-cacheeconomics checks --prefix-tokens 900 --model claude-opus-5 --breakpoints 5
+cacheeconomics checks --target-id anthropic/direct --prefix-tokens 900 --model claude-opus-5 --breakpoints 5
 
 # what does this build actually know about pricing?
 cacheeconomics registry
@@ -460,7 +545,7 @@ deciding to rewrite somebody's live traffic, and that second decision is yours.
 git clone https://github.com/Tanisha-Katara/cacheeconomics.git
 cd cacheeconomics && pip install .
 
-python3 -m pytest -q          # no dependencies
+python3 -m pytest -q          # no services or API keys
 python3 web/build_bundle.py   # after changing anything under harness/cacheeconomics
 ```
 
