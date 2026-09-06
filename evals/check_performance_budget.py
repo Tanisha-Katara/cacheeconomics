@@ -41,29 +41,41 @@ def main(argv: list[str] | None = None) -> int:
 
     checks = {
         "ingestion median events/second": (
-            result["ingestion"]["median_events_per_second"]
-            >= budget["limits"]["ingestion_median_events_per_second_min"]
+            result["ingestion"]["median_events_per_second"],
+            ">=",
+            budget["limits"]["ingestion_median_events_per_second_min"],
         ),
         "ingestion p95 batch latency": (
-            result["ingestion"]["p95_batch_latency_ms"]
-            <= budget["limits"]["ingestion_p95_batch_latency_ms_max"]
+            result["ingestion"]["p95_batch_latency_ms"],
+            "<=",
+            budget["limits"]["ingestion_p95_batch_latency_ms_max"],
         ),
         "analysis p95 latency": (
-            result["analysis"]["p95_latency_ms"]
-            <= budget["limits"]["analysis_p95_latency_ms_max"]
+            result["analysis"]["p95_latency_ms"],
+            "<=",
+            budget["limits"]["analysis_p95_latency_ms_max"],
         ),
         "dashboard raw bytes": (
-            result["dashboard"]["raw_bytes"]
-            <= budget["limits"]["dashboard_raw_bytes_max"]
+            result["dashboard"]["raw_bytes"],
+            "<=",
+            budget["limits"]["dashboard_raw_bytes_max"],
         ),
         "dashboard gzip bytes": (
-            result["dashboard"]["gzip_bytes"]
-            <= budget["limits"]["dashboard_gzip_bytes_max"]
+            result["dashboard"]["gzip_bytes"],
+            "<=",
+            budget["limits"]["dashboard_gzip_bytes_max"],
         ),
     }
-    failed = [name for name, passed in checks.items() if not passed]
-    for name, passed in checks.items():
-        print(f"{'PASS' if passed else 'FAIL'}: {name}")
+    outcomes = {
+        name: measured >= limit if comparator == ">=" else measured <= limit
+        for name, (measured, comparator, limit) in checks.items()
+    }
+    failed = [name for name, passed in outcomes.items() if not passed]
+    for name, (measured, comparator, limit) in checks.items():
+        print(
+            f"{'PASS' if outcomes[name] else 'FAIL'}: {name} "
+            f"(measured={measured:.3f}, required {comparator} {limit})"
+        )
     if failed:
         print("Budget failure: " + ", ".join(failed))
         return 1

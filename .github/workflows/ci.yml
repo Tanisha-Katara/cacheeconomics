@@ -223,11 +223,16 @@ jobs:
       - name: Measure the synthetic hosted regression workload
         env:
           PYTHONPATH: services/control_plane/src:harness:collectors/src
-        run: |
-          python evals/benchmark_hosted.py --output /tmp/cacheeconomics-benchmark.json
-          python evals/check_performance_budget.py --result /tmp/cacheeconomics-benchmark.json
+        run: >-
+          python evals/benchmark_hosted.py
+          --samples 20
+          --output /tmp/cacheeconomics-benchmark.json
+
+      - name: Enforce the synthetic performance budget
+        run: python evals/check_performance_budget.py --result /tmp/cacheeconomics-benchmark.json
 
       - name: Upload the measured benchmark evidence
+        if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: synthetic-local-benchmark

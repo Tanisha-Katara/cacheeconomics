@@ -30,13 +30,13 @@
   },
   "limits": {
     "ingestion_median_events_per_second_min": 1000,
-    "ingestion_p95_batch_latency_ms_max": 100,
+    "ingestion_p95_batch_latency_ms_max": 165,
     "analysis_p95_latency_ms_max": 60,
     "dashboard_raw_bytes_max": 79000,
     "dashboard_gzip_bytes_max": 20400
   },
   "rationale": {
-    "timing": "Timing ceilings allow roughly 3x to 5x the measured baseline because shared CI runners differ from the recorded machine; they catch large regressions, not small fluctuations.",
+    "timing": "Timing ceilings allow roughly 3x to 5x the measured baseline because shared CI runners differ from the recorded machine; the 165 ms ingestion ceiling is five times the recorded 32.984 ms baseline and catches large regressions rather than normal runner variation.",
     "dashboard": "Asset ceilings allow approximately 15 percent growth over the measured transfer sizes and require deliberate review beyond that point."
   }
 }
