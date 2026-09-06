@@ -86,6 +86,7 @@ def test_four_runtime_container_roles_are_explicit():
     assert 'ENTRYPOINT ["cacheeconomics-collector"]' in collector
     assert "USER collector" in collector
     assert "USER nginx" in dashboard
+    assert "libuuid=2.42.3-r1" in dashboard
     for dockerfile in (control_plane, collector, dashboard):
         assert "FROM " in dockerfile
         assert "@sha256:" in dockerfile

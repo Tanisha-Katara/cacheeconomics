@@ -11,6 +11,11 @@ ENV DASHBOARD_CONNECT_SRC="'self'" \
     DASHBOARD_API_ORIGIN="http://api:8000" \
     NGINX_ENVSUBST_FILTER="DASHBOARD_(CONNECT_SRC|API_ORIGIN)"
 
+# The pinned upstream image currently carries libuuid 2.42.1-r0. Pin the
+# Alpine security update as well so rebuilding this image cannot regress to
+# the seven fixed util-linux vulnerabilities detected by the image scan.
+RUN apk add --no-cache --upgrade 'libuuid=2.42.3-r1'
+
 COPY apps/dashboard/nginx.conf /etc/nginx/nginx.conf
 COPY apps/dashboard/default.conf.template /etc/nginx/templates/default.conf.template
 COPY apps/dashboard/index.html /usr/share/nginx/html/index.html
