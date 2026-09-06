@@ -2,6 +2,32 @@
 
 All notable user-facing changes are recorded here.
 
+## Unreleased
+
+- Selected a free-friendly portfolio staging architecture using GitHub
+  Actions, Google Cloud Run, Neon PostgreSQL, and Auth0 without changing the
+  socket-free installed package.
+- Added Google infrastructure bootstrap, short-lived GitHub workload identity,
+  secret-scoped runtime accounts, a digest-only manual deployment workflow,
+  scheduled worker execution, and a provider-specific operator runbook.
+- Made the dashboard's upstream API configurable for a separate HTTPS Cloud Run
+  service while preserving the local Compose default.
+- Kept OpenTelemetry export disabled until a staging trace privacy review is
+  recorded; no deployed environment or cloud metrics are claimed yet.
+- Added the configured API audience to dashboard OIDC authorization requests,
+  serialized concurrent collector outbox flushes, and classified JSON decoder
+  safety-limit failures as invalid client input.
+
+## 0.3.0 - 2026-09-05
+
+- Added the dependency-free analysis contracts required by the separately
+  installed hosted control plane, and aligned the collector on the same core
+  release.
+- Kept authentication, ingestion, and every network dependency outside the
+  local `cacheeconomics` package.
+- Scoped default pytest discovery to the dependency-free core suite; hosted
+  application suites remain explicit CI jobs.
+
 ## 0.2.1 - 2026-08-05
 
 - Prepared the repository for a broader public announcement.

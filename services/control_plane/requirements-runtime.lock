@@ -1,0 +1,33 @@
+# Runtime-only lock for the networked control plane. Keep this separate from
+# the dependency-free cacheeconomics package and regenerate deliberately after
+# reviewing dependency release notes.
+Mako==1.4.1
+MarkupSafe==3.0.3
+PyJWT==2.13.0
+PyYAML==6.0.3
+SQLAlchemy==2.0.52
+alembic==1.19.2
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anyio==4.15.0
+cffi==2.1.1
+click==8.5.0
+cryptography==50.0.1
+fastapi==0.141.1
+h11==0.16.0
+httptools==0.8.0
+idna==3.19
+psycopg-binary==3.3.5
+psycopg==3.3.5
+pycparser==3.0
+pydantic-settings==2.15.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+python-dotenv==1.2.3
+starlette==1.6.0
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.52.4
+uvloop==0.22.1
+watchfiles==1.2.0
+websockets==17.1

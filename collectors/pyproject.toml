@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cacheeconomics-collector"
+description = "Network-enabled collectors for the separate cacheeconomics control plane"
+requires-python = ">=3.10"
+dependencies = ["cacheeconomics==0.3.0"]
+dynamic = ["version"]
+
+[project.scripts]
+cacheeconomics-collector = "cacheeconomics_collector.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "cacheeconomics_collector.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

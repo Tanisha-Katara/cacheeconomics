@@ -1,0 +1,596 @@
+{
+  "checks": {
+    "accepted_events": 286,
+    "all_monetary_figures_withheld": true,
+    "analysis_event_count": 286,
+    "duplicate_events": 1,
+    "finding_codes": [
+      "TTL-1",
+      "EFF-1",
+      "CAC-1",
+      "MIN-1"
+    ],
+    "rejected_events": 1,
+    "stored_prompt_fields": 0
+  },
+  "claim_scope": "Synthetic local demonstration only; not production traffic, capacity, availability, or realized savings.",
+  "demo_access": {
+    "organization_id": "00000000-0000-0000-0000-000000000502",
+    "read_only": true,
+    "source_id": "00000000-0000-0000-0000-000000000503",
+    "token": "synthetic-demo-only"
+  },
+  "generated_at": "2026-09-05T12:00:00Z",
+  "provenance": {
+    "builder": "demo/build_portfolio_packet.py",
+    "flow": [
+      "collector normalization",
+      "prompt-free API validation",
+      "idempotent database ingestion",
+      "leased analysis worker",
+      "versioned analysis result",
+      "bounded dashboard aggregates"
+    ],
+    "golden_result": {
+      "path": "evals/fixtures/golden-analysis-v1.json",
+      "sha256": "701451d644a7a99b20dfb2f708569baaeabdb9909d864e657447fd8ffd33925f"
+    },
+    "normalization": "Random IDs, database timestamps, and job runtime are replaced with stable demo values after the real in-process flow runs.",
+    "trace": {
+      "path": "harness/fixtures/demo-traces.jsonl",
+      "rows": 286,
+      "sha256": "44ee45e7fe38eaa7c542e34232e98b64324d39a69f431ccdbd102d6b7068b603"
+    }
+  },
+  "responses": {
+    "analysis": {
+      "created_at": "2026-09-05T12:00:00Z",
+      "event_count": 286,
+      "id": "00000000-0000-0000-0000-000000000505",
+      "job_id": "00000000-0000-0000-0000-000000000504",
+      "result": {
+        "analysis": {
+          "caveats": [],
+          "coverage": {
+            "analysed": 286,
+            "excluded": {},
+            "fraction": 1.0,
+            "total": 286
+          },
+          "draft": false,
+          "findings": [
+            {
+              "affected_requests": 126,
+              "avoidable_usd_month": {
+                "amount_usd": null,
+                "basis": "modeled",
+                "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+                "projected": true,
+                "release_state": "withheld",
+                "released": false,
+                "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+              },
+              "avoidable_usd_window": {
+                "amount_usd": null,
+                "basis": "modeled",
+                "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+                "projected": false,
+                "release_state": "withheld",
+                "released": false,
+                "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+              },
+              "code": "TTL-1",
+              "confidence": "medium",
+              "detail": "100% of gaps between requests fall between five minutes and one hour (median 11.2 min across 126 requests). In that band a five-minute cache expires before the next request and rewrites at 1.25x, while a one-hour cache would have read at 0.1x.",
+              "evidence_class": "modeled",
+              "fix": "Set a one-hour TTL on the static prefix for this agent. Outside the five-minute-to-one-hour band the five-minute default is cheaper, so this is not a blanket change.",
+              "quality_risk": "low",
+              "severity": "high",
+              "structural": true,
+              "title": "'research-agent' request cadence sits inside the one-hour window"
+            },
+            {
+              "affected_requests": 136,
+              "avoidable_usd_month": {
+                "amount_usd": null,
+                "basis": "modeled",
+                "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+                "projected": true,
+                "release_state": "withheld",
+                "released": false,
+                "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+              },
+              "avoidable_usd_window": {
+                "amount_usd": null,
+                "basis": "modeled",
+                "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+                "projected": false,
+                "release_state": "withheld",
+                "released": false,
+                "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+              },
+              "code": "EFF-1",
+              "confidence": "high",
+              "detail": "Prefix efficiency is 17%: of every 100 tokens written to cache, 17 are later read. A write bills above the standard input rate, so the unread remainder is a pure premium paid for nothing.",
+              "evidence_class": "measured",
+              "fix": "Find what invalidates the prefix between requests before changing any TTL. A longer lifetime on an unstable prefix buys nothing.",
+              "quality_risk": "low",
+              "severity": "high",
+              "structural": false,
+              "title": "Cache writes are largely not being read"
+            },
+            {
+              "affected_requests": 286,
+              "avoidable_usd_month": null,
+              "avoidable_usd_window": null,
+              "code": "CAC-1",
+              "confidence": "high",
+              "detail": "Cache reads and writes are 99% of input spend across 286 priced requests. That share on its own says nothing about whether caching is working -- reads bill at a tenth of the input rate, so they dominate a bill only when the volume behind them is large. The counterfactual is what settles it: the same traffic sent uncached would cost 1.0x what it does now, so caching is adding 5% to input spend. Of the cache spend itself, 2% is reads. A session that extends its prefix rather than rebuilding it tends to run near 75%, so a lower share is worth looking into -- but it is a hint and not a finding, because a workload whose turns add a lot relative to the prefix (large tool results) moves toward even without rebuilding anything. REB-1 counts rebuilds directly and is what settles it.",
+              "evidence_class": "measured",
+              "fix": "Stop writing caches that nothing reads before tuning anything else.",
+              "quality_risk": "low",
+              "severity": "high",
+              "structural": false,
+              "title": "Caching costs more here than sending the prompts uncached"
+            },
+            {
+              "affected_requests": 40,
+              "avoidable_usd_month": null,
+              "avoidable_usd_window": null,
+              "code": "MIN-1",
+              "confidence": "high",
+              "detail": "40 requests carry a cache marker on a prefix shorter than the 4,096-token minimum for claude-haiku-4-5, and returned zero cached tokens in both directions. The provider processes these uncached and reports no error, so nothing surfaces this in normal monitoring.",
+              "evidence_class": "measured",
+              "fix": "Either lengthen the cached prefix past 4,096 tokens or drop the marker. Minimums are not monotonic across model generations, so this must be looked up per model rather than reasoned about.",
+              "quality_risk": "low",
+              "severity": "medium",
+              "structural": true,
+              "title": "Cache markers on prefixes below the model minimum"
+            }
+          ],
+          "has_withheld_figures": true,
+          "notes": [
+            "Analyzed from the prompt-free cacheeconomics ingest contract; no prompt or completion content was stored by the service."
+          ],
+          "ratios": {
+            "cache_read_tokens": 913000,
+            "cache_write_tokens": 4390940,
+            "input_from_cache": 0.16676469191456095,
+            "prefix_efficiency": 0.1721361855526269,
+            "requests": 286,
+            "uncached_tokens": 170840
+          },
+          "reconciliation": null,
+          "source": "Synthetic Normalized Trace",
+          "spend": {
+            "caching_saved_usd": {
+              "amount_usd": null,
+              "basis": "measured",
+              "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+              "projected": false,
+              "release_state": "withheld",
+              "released": false,
+              "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+            },
+            "if_uncached_usd": {
+              "amount_usd": null,
+              "basis": "modeled",
+              "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+              "projected": false,
+              "release_state": "withheld",
+              "released": false,
+              "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+            },
+            "input_usd": {
+              "amount_usd": null,
+              "basis": "measured",
+              "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+              "projected": false,
+              "release_state": "withheld",
+              "released": false,
+              "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+            },
+            "monthly_input_usd": {
+              "amount_usd": null,
+              "basis": "modeled",
+              "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+              "projected": true,
+              "release_state": "withheld",
+              "released": false,
+              "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+            },
+            "window_days": 1.7011921296296297
+          },
+          "tier": "instrumented",
+          "tokens_counted": true,
+          "total_avoidable_usd_month": {
+            "amount_usd": null,
+            "basis": "modeled",
+            "display": "[withheld: no invoice was supplied, so nothing here has been reconciled against money actually spent]",
+            "projected": true,
+            "release_state": "withheld",
+            "released": false,
+            "withheld_because": "no invoice was supplied, so nothing here has been reconciled against money actually spent"
+          },
+          "window_days": 1.7011921296296297
+        },
+        "engine": {
+          "name": "cacheeconomics",
+          "version": "0.3.0"
+        },
+        "registry": {
+          "pricing_generated": "2026-07-29",
+          "providers_generated": "2026-07-29",
+          "sha256": "ce584739eda21b1c6ba090990609d9b1bc0cea939757881b936e724fd50adf65"
+        },
+        "schema": "cacheeconomics.analysis-result",
+        "schema_version": 1
+      },
+      "source_id": "00000000-0000-0000-0000-000000000503"
+    },
+    "config": {
+      "allow_development_token": true,
+      "audience": null,
+      "authorization_endpoint": null,
+      "client_id": null,
+      "oidc_enabled": false,
+      "redirect_uri": null,
+      "scopes": "openid profile email",
+      "token_endpoint": null
+    },
+    "health": {
+      "accepted_events": 286,
+      "consecutive_failures": 0,
+      "duplicate_events": 1,
+      "last_error_at": null,
+      "last_error_type": null,
+      "last_event_sent_at": "2026-09-05T11:00:00Z",
+      "last_ingest_lag_seconds": 2.0,
+      "last_job_duration_ms": null,
+      "last_received_at": "2026-09-05T11:00:02Z",
+      "last_success_at": "2026-09-05T12:00:00Z",
+      "rejected_events": 1,
+      "source_id": "00000000-0000-0000-0000-000000000503"
+    },
+    "jobs": [
+      {
+        "attempt": 1,
+        "created_at": "2026-09-05T11:59:55Z",
+        "error_type": null,
+        "finished_at": "2026-09-05T12:00:02Z",
+        "id": "00000000-0000-0000-0000-000000000504",
+        "kind": "analyze_source",
+        "max_attempts": 3,
+        "scheduled_for": "2026-09-05T12:00:00Z",
+        "source_id": "00000000-0000-0000-0000-000000000503",
+        "started_at": "2026-09-05T12:00:01Z",
+        "state": "succeeded"
+      }
+    ],
+    "me": {
+      "organizations": [
+        {
+          "id": "00000000-0000-0000-0000-000000000502",
+          "name": "Synthetic Demo Organization",
+          "role": "owner",
+          "slug": "synthetic-demo-organization"
+        }
+      ],
+      "user": {
+        "display_name": "Synthetic Demo User",
+        "email": "demo@example.invalid",
+        "id": "00000000-0000-0000-0000-000000000501"
+      }
+    },
+    "operations": {
+      "168": {
+        "bucket_minutes": 360,
+        "buckets": [
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 64,
+            "started_at": "2026-09-03T18:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 64,
+            "started_at": "2026-09-04T00:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 63,
+            "started_at": "2026-09-04T06:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 40,
+            "started_at": "2026-09-04T12:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 19,
+            "started_at": "2026-09-04T18:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 18,
+            "started_at": "2026-09-05T00:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 18,
+            "started_at": "2026-09-05T06:00:00Z",
+            "unknown": 0
+          }
+        ],
+        "errors": [],
+        "events_examined": 286,
+        "first_received_at": "2026-09-03T18:10:19Z",
+        "generated_at": "2026-09-05T12:00:00Z",
+        "invalid_events": 0,
+        "last_received_at": "2026-09-05T11:00:02Z",
+        "latency": {
+          "count": 286,
+          "p50_ms": 1380.0,
+          "p95_ms": 1860.0
+        },
+        "source_id": "00000000-0000-0000-0000-000000000503",
+        "status": {
+          "cancelled": 0,
+          "error": 0,
+          "success": 286,
+          "unknown": 0
+        },
+        "time_to_first_token": {
+          "count": 286,
+          "p50_ms": 260.0,
+          "p95_ms": 340.0
+        },
+        "truncated": false,
+        "valid_events": 286,
+        "window_hours": 168
+      },
+      "24": {
+        "bucket_minutes": 60,
+        "buckets": [
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 19,
+            "started_at": "2026-09-04T12:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 6,
+            "started_at": "2026-09-04T13:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 1,
+            "started_at": "2026-09-04T14:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 5,
+            "started_at": "2026-09-04T15:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 8,
+            "started_at": "2026-09-04T16:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 1,
+            "started_at": "2026-09-04T17:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 5,
+            "started_at": "2026-09-04T18:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 5,
+            "started_at": "2026-09-04T19:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 4,
+            "started_at": "2026-09-04T21:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 5,
+            "started_at": "2026-09-04T22:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 4,
+            "started_at": "2026-09-05T00:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 5,
+            "started_at": "2026-09-05T01:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 5,
+            "started_at": "2026-09-05T03:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 4,
+            "started_at": "2026-09-05T04:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 5,
+            "started_at": "2026-09-05T06:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 4,
+            "started_at": "2026-09-05T07:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 4,
+            "started_at": "2026-09-05T09:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 4,
+            "started_at": "2026-09-05T10:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 1,
+            "started_at": "2026-09-05T11:00:00Z",
+            "unknown": 0
+          }
+        ],
+        "errors": [],
+        "events_examined": 95,
+        "first_received_at": "2026-09-04T12:03:19Z",
+        "generated_at": "2026-09-05T12:00:00Z",
+        "invalid_events": 0,
+        "last_received_at": "2026-09-05T11:00:02Z",
+        "latency": {
+          "count": 95,
+          "p50_ms": 1380.0,
+          "p95_ms": 1860.0
+        },
+        "source_id": "00000000-0000-0000-0000-000000000503",
+        "status": {
+          "cancelled": 0,
+          "error": 0,
+          "success": 95,
+          "unknown": 0
+        },
+        "time_to_first_token": {
+          "count": 95,
+          "p50_ms": 260.0,
+          "p95_ms": 340.0
+        },
+        "truncated": false,
+        "valid_events": 95,
+        "window_hours": 24
+      },
+      "720": {
+        "bucket_minutes": 1440,
+        "buckets": [
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 64,
+            "started_at": "2026-09-03T00:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 186,
+            "started_at": "2026-09-04T00:00:00Z",
+            "unknown": 0
+          },
+          {
+            "cancelled": 0,
+            "errors": 0,
+            "requests": 36,
+            "started_at": "2026-09-05T00:00:00Z",
+            "unknown": 0
+          }
+        ],
+        "errors": [],
+        "events_examined": 286,
+        "first_received_at": "2026-09-03T18:10:19Z",
+        "generated_at": "2026-09-05T12:00:00Z",
+        "invalid_events": 0,
+        "last_received_at": "2026-09-05T11:00:02Z",
+        "latency": {
+          "count": 286,
+          "p50_ms": 1380.0,
+          "p95_ms": 1860.0
+        },
+        "source_id": "00000000-0000-0000-0000-000000000503",
+        "status": {
+          "cancelled": 0,
+          "error": 0,
+          "success": 286,
+          "unknown": 0
+        },
+        "time_to_first_token": {
+          "count": 286,
+          "p50_ms": 260.0,
+          "p95_ms": 340.0
+        },
+        "truncated": false,
+        "valid_events": 286,
+        "window_hours": 720
+      }
+    },
+    "sources": [
+      {
+        "created_at": "2026-09-05T10:00:00Z",
+        "enabled": true,
+        "id": "00000000-0000-0000-0000-000000000503",
+        "kind": "normalized_trace",
+        "name": "Synthetic Normalized Trace",
+        "organization_id": "00000000-0000-0000-0000-000000000502"
+      }
+    ]
+  },
+  "schema": "cacheeconomics.portfolio-demo-packet",
+  "schema_version": 1
+}

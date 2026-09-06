@@ -1,0 +1,23 @@
+groups:
+  - name: cacheeconomics-recording
+    rules:
+      - record: cacheeconomics:http_request_duration_seconds:p95_5m
+        expr: histogram_quantile(0.95, sum by (le, method, route) (rate(cacheeconomics_http_request_duration_seconds_bucket[5m])))
+
+  - name: cacheeconomics-alerts
+    rules:
+      - alert: CacheeconomicsAPI5xxObserved
+        expr: sum(increase(cacheeconomics_http_requests_total{status=~"5.."}[10m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The cacheeconomics API returned a server error
+          description: At least one API 5xx response was observed in the last ten minutes. Inspect structured logs by request ID.
+
+      - alert: CacheeconomicsIngestEventRejected
+        expr: increase(cacheeconomics_ingest_events_total{outcome="rejected"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: The cacheeconomics API rejected an ingest event
+          description: At least one event failed prompt-free schema or size validation in the last ten minutes. Check collector compatibility without copying event bodies into logs.

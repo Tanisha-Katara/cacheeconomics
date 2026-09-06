@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="theme-color" content="#173c36">
+    <meta
+      name="description"
+      content="The hosted cacheeconomics dashboard for evidence-backed LLM cache operations."
+    >
+    <title>cacheeconomics control room</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div id="toast-region" class="toast-region" aria-live="polite"></div>
+
+    <main id="auth-view" class="auth-view">
+      <section class="auth-story" aria-labelledby="auth-title">
+        <a class="wordmark wordmark-light" href="/" aria-label="cacheeconomics home">
+          <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>cacheeconomics</span>
+        </a>
+        <div class="auth-copy">
+          <p class="eyebrow eyebrow-light">LLM CACHE CONTROL ROOM</p>
+          <h1 id="auth-title">Find the waste.<br>Protect the evidence.</h1>
+          <p>
+            Follow ingestion health, cost evidence, and cache recommendations
+            without sending prompt or completion bodies to this service.
+          </p>
+        </div>
+        <div class="boundary-card">
+          <span class="boundary-icon" aria-hidden="true">◎</span>
+          <div>
+            <strong>The local boundary stays intact</strong>
+            <span>The installed Python package remains offline and socket-free.</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="auth-panel" aria-labelledby="sign-in-title">
+        <div class="auth-panel-inner">
+          <p class="eyebrow">SECURE WORKSPACE</p>
+          <h2 id="sign-in-title">Sign in to your organization</h2>
+          <p class="muted">
+            Your identity provider handles authentication. Access is restricted
+            again by organization membership and role inside the API.
+          </p>
+
+          <div id="auth-loading" class="loading-block" role="status">
+            <span class="spinner" aria-hidden="true"></span>
+            Loading sign-in configuration…
+          </div>
+
+          <div id="auth-actions" hidden>
+            <button id="oidc-sign-in" class="button button-primary button-wide" type="button" hidden>
+              Continue with identity provider
+              <span aria-hidden="true">→</span>
+            </button>
+
+            <form id="development-token-form" class="development-token" hidden>
+              <div class="dev-label">
+                <span>Development access</span>
+                <span class="badge badge-warning">LOCAL ONLY</span>
+              </div>
+              <label for="development-token">OIDC bearer token</label>
+              <input
+                id="development-token"
+                name="token"
+                type="password"
+                required
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Paste a test token"
+              >
+              <button class="button button-secondary button-wide" type="submit">
+                Open development workspace
+              </button>
+              <p>The token is held in memory only and is cleared on refresh.</p>
+            </form>
+
+            <div id="auth-unconfigured" class="empty-inline" hidden>
+              <strong>No sign-in method is configured.</strong>
+              <span>Ask the deployment operator to configure dashboard OIDC.</span>
+            </div>
+          </div>
+
+          <div id="auth-error" class="error-box" role="alert" hidden></div>
+
+          <div class="auth-assurance">
+            <div><span aria-hidden="true">✓</span> Authorization enforced by the API</div>
+            <div><span aria-hidden="true">✓</span> No browser token persistence</div>
+            <div><span aria-hidden="true">✓</span> Prompt-free hosted schema</div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div id="workspace" class="workspace" hidden>
+      <aside class="sidebar">
+        <a class="wordmark wordmark-light" href="/" aria-label="cacheeconomics home">
+          <span class="mark" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span>cacheeconomics</span>
+        </a>
+
+        <div class="workspace-context">
+          <label for="organization-select">Organization</label>
+          <select id="organization-select"></select>
+          <label for="source-select">Data source</label>
+          <select id="source-select"></select>
+        </div>
+
+        <nav class="primary-nav" aria-label="Workspace">
+          <button type="button" class="nav-item is-active" data-view="overview" aria-current="page">
+            <span class="nav-icon" aria-hidden="true">◫</span>
+            Overview
+          </button>
+          <button type="button" class="nav-item" data-view="recommendations">
+            <span class="nav-icon" aria-hidden="true">↗</span>
+            Recommendations
+            <span id="finding-count" class="nav-count" hidden></span>
+          </button>
+          <button type="button" class="nav-item" data-view="operations">
+            <span class="nav-icon" aria-hidden="true">⌁</span>
+            Operations
+          </button>
+          <button type="button" class="nav-item" data-view="jobs">
+            <span class="nav-icon" aria-hidden="true">◷</span>
+            Jobs &amp; health
+            <span id="job-alert-count" class="nav-count nav-count-alert" hidden></span>
+          </button>
+        </nav>
+
+        <div class="sidebar-foot">
+          <div class="privacy-note">
+            <span aria-hidden="true">◎</span>
+            <div><strong>Prompt-free view</strong><small>Operational metadata only</small></div>
+          </div>
+          <button id="sign-out" class="sign-out" type="button">Sign out</button>
+        </div>
+      </aside>
+
+      <div class="content-shell">
+        <header class="topbar">
+          <div>
+            <p id="view-kicker" class="eyebrow">CONTROL ROOM</p>
+            <h1 id="view-title">Overview</h1>
+          </div>
+          <div class="topbar-actions">
+            <div id="global-status" class="global-status" role="status">
+              <span class="status-dot"></span>
+              <span>Loading workspace</span>
+            </div>
+            <button id="refresh-dashboard" class="button button-secondary" type="button">
+              Refresh
+            </button>
+            <button id="run-analysis" class="button button-primary" type="button" hidden>
+              Run analysis
+            </button>
+            <div class="user-chip">
+              <span id="user-avatar" class="avatar" aria-hidden="true">?</span>
+              <div><strong id="user-name">—</strong><span id="user-role">—</span></div>
+            </div>
+          </div>
+        </header>
+
+        <div id="workspace-notice" class="notice" role="alert" hidden></div>
+
+        <section id="view-overview" class="view-panel" aria-labelledby="view-title">
+          <div id="overview-content"></div>
+        </section>
+
+        <section id="view-recommendations" class="view-panel" aria-labelledby="view-title" hidden>
+          <div id="recommendations-content"></div>
+        </section>
+
+        <section id="view-operations" class="view-panel" aria-labelledby="view-title" hidden>
+          <div class="view-tools">
+            <div>
+              <strong>Received request signals</strong>
+              <span>Times use the collector timestamps; buckets use API receipt time.</span>
+            </div>
+            <label class="window-control" for="window-select">
+              Window
+              <select id="window-select">
+                <option value="24">24 hours</option>
+                <option value="168" selected>7 days</option>
+                <option value="720">30 days</option>
+              </select>
+            </label>
+          </div>
+          <div id="operations-content"></div>
+        </section>
+
+        <section id="view-jobs" class="view-panel" aria-labelledby="view-title" hidden>
+          <div id="jobs-content"></div>
+        </section>
+      </div>
+    </div>
+  </body>
+</html>

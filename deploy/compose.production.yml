@@ -1,0 +1,80 @@
+name: cacheeconomics-production
+
+# This file runs immutable images after a release workflow has published them.
+# PostgreSQL, TLS termination, DNS, secret injection, OIDC, and telemetry are
+# deployment-provider concerns and intentionally are not invented here.
+services:
+  migrate:
+    image: ${CACHEECONOMICS_API_IMAGE:?set the API image including its sha256 digest}
+    command: ["alembic", "-c", "/app/alembic.ini", "upgrade", "head"]
+    environment:
+      CACHEECONOMICS_DATABASE_URL: ${CACHEECONOMICS_MIGRATION_DATABASE_URL:?required}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+
+  api:
+    image: ${CACHEECONOMICS_API_IMAGE:?set the API image including its sha256 digest}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment: &api_environment
+      CACHEECONOMICS_ENVIRONMENT: production
+      CACHEECONOMICS_DATABASE_URL: ${CACHEECONOMICS_APP_DATABASE_URL:?required}
+      CACHEECONOMICS_OIDC_ISSUER: ${CACHEECONOMICS_OIDC_ISSUER:?required}
+      CACHEECONOMICS_OIDC_AUDIENCE: ${CACHEECONOMICS_OIDC_AUDIENCE:?required}
+      CACHEECONOMICS_OIDC_JWKS_URL: ${CACHEECONOMICS_OIDC_JWKS_URL:?required}
+      CACHEECONOMICS_ALLOWED_HOSTS: ${CACHEECONOMICS_ALLOWED_HOSTS:?required JSON list}
+      CACHEECONOMICS_DASHBOARD_OIDC_AUTHORIZATION_ENDPOINT: ${CACHEECONOMICS_DASHBOARD_OIDC_AUTHORIZATION_ENDPOINT:?required}
+      CACHEECONOMICS_DASHBOARD_OIDC_TOKEN_ENDPOINT: ${CACHEECONOMICS_DASHBOARD_OIDC_TOKEN_ENDPOINT:?required}
+      CACHEECONOMICS_DASHBOARD_OIDC_CLIENT_ID: ${CACHEECONOMICS_DASHBOARD_OIDC_CLIENT_ID:?required}
+      CACHEECONOMICS_DASHBOARD_REDIRECT_URI: ${CACHEECONOMICS_DASHBOARD_REDIRECT_URI:?required}
+      CACHEECONOMICS_DASHBOARD_ALLOW_DEVELOPMENT_TOKEN: "false"
+      CACHEECONOMICS_METRICS_BEARER_TOKEN: ${CACHEECONOMICS_METRICS_BEARER_TOKEN:?required}
+      OTEL_SERVICE_NAME: cacheeconomics-api
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-none}
+      OTEL_LOGS_EXPORTER: ${OTEL_LOGS_EXPORTER:-none}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    expose: ["8000"]
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  worker:
+    image: ${CACHEECONOMICS_WORKER_IMAGE:?set the worker image including its sha256 digest}
+    command: ["opentelemetry-instrument", "python", "-m", "cacheeconomics_control_plane.worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *api_environment
+      CACHEECONOMICS_DATABASE_URL: ${CACHEECONOMICS_WORKER_DATABASE_URL:?required}
+      OTEL_SERVICE_NAME: cacheeconomics-worker
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+
+  dashboard:
+    image: ${CACHEECONOMICS_DASHBOARD_IMAGE:?set the dashboard image including its sha256 digest}
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      DASHBOARD_CONNECT_SRC: ${DASHBOARD_CONNECT_SRC:-'self'}
+      DASHBOARD_API_ORIGIN: ${DASHBOARD_API_ORIGIN:-http://api:8000}
+    ports:
+      - "127.0.0.1:${CACHEECONOMICS_DASHBOARD_PORT:-8080}:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:uid=101,gid=101,mode=1777
+      - /etc/nginx/conf.d:uid=101,gid=101,mode=0755
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped

@@ -1,0 +1,83 @@
+{
+  "case": "demo-traces-reconciled-invoice",
+  "fixture": "harness/fixtures/demo-traces.jsonl",
+  "fixture_sha256": "44ee45e7fe38eaa7c542e34232e98b64324d39a69f431ccdbd102d6b7068b603",
+  "invoice_usd": 17.45,
+  "source": "golden:demo-traces",
+  "expected": {
+    "schema": "cacheeconomics.analysis-result",
+    "schema_version": 1,
+    "registry_sha256": "ce584739eda21b1c6ba090990609d9b1bc0cea939757881b936e724fd50adf65",
+    "tier": "instrumented",
+    "coverage": {
+      "analysed": 286,
+      "excluded": {},
+      "fraction": 1.0,
+      "total": 286
+    },
+    "ratios": {
+      "cache_read_tokens": 913000,
+      "cache_write_tokens": 4390940,
+      "input_from_cache": 0.16676469191456095,
+      "prefix_efficiency": 0.1721361855526269,
+      "requests": 286,
+      "uncached_tokens": 170840
+    },
+    "figures": {
+      "input_usd": ["$16.97", 16.97244499999996, "measured", "reconciled"],
+      "if_uncached_usd": ["$16.14", 16.144340000000035, "modeled", "reconciled"],
+      "caching_saved_usd": ["$-0.83", -0.8281049999999262, "measured", "reconciled"],
+      "monthly_input_usd": ["$299", 299.30384765585063, "modeled", "reconciled"],
+      "total_avoidable_usd_month": ["$229", 228.58328182170783, "modeled", "reconciled"]
+    },
+    "findings": [
+      {
+        "code": "TTL-1",
+        "title": "'research-agent' request cadence sits inside the one-hour window",
+        "severity": "high",
+        "confidence": "medium",
+        "evidence_class": "modeled",
+        "quality_risk": "low",
+        "affected_requests": 126,
+        "structural": true,
+        "fix": "Set a one-hour TTL on the static prefix for this agent. Outside the five-minute-to-one-hour band the five-minute default is cheaper, so this is not a blanket change."
+      },
+      {
+        "code": "EFF-1",
+        "title": "Cache writes are largely not being read",
+        "severity": "high",
+        "confidence": "high",
+        "evidence_class": "measured",
+        "quality_risk": "low",
+        "affected_requests": 136,
+        "structural": false,
+        "fix": "Find what invalidates the prefix between requests before changing any TTL. A longer lifetime on an unstable prefix buys nothing."
+      },
+      {
+        "code": "CAC-1",
+        "title": "Caching costs more here than sending the prompts uncached",
+        "severity": "high",
+        "confidence": "high",
+        "evidence_class": "measured",
+        "quality_risk": "low",
+        "affected_requests": 286,
+        "structural": false,
+        "fix": "Stop writing caches that nothing reads before tuning anything else."
+      },
+      {
+        "code": "MIN-1",
+        "title": "Cache markers on prefixes below the model minimum",
+        "severity": "medium",
+        "confidence": "high",
+        "evidence_class": "measured",
+        "quality_risk": "low",
+        "affected_requests": 40,
+        "structural": true,
+        "fix": "Either lengthen the cached prefix past 4,096 tokens or drop the marker. Minimums are not monotonic across model generations, so this must be looked up per model rather than reasoned about."
+      }
+    ],
+    "tokens_counted": true,
+    "draft": false,
+    "has_withheld_figures": false
+  }
+}

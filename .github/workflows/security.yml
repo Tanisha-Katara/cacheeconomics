@@ -1,0 +1,94 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - name: Reject newly introduced vulnerable dependencies
+        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: moderate
+
+  repository-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+        with:
+          fetch-depth: 0
+      - name: Scan dependencies, configuration, and committed secrets
+        uses: aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  container-images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: services/control_plane/Dockerfile
+            target: api
+          - name: worker
+            dockerfile: services/control_plane/Dockerfile
+            target: worker
+          - name: collector
+            dockerfile: collectors/Dockerfile
+            target: ""
+          - name: dashboard
+            dockerfile: apps/dashboard/Dockerfile
+            target: ""
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Build the production role
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          load: true
+          push: false
+          tags: cacheeconomics-${{ matrix.name }}:ci
+          build-args: |
+            VCS_REF=${{ github.sha }}
+      - name: Scan the built image
+        uses: aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b # v0.36.0
+        with:
+          image-ref: cacheeconomics-${{ matrix.name }}:ci
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Generate and retain the software bill of materials
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: cacheeconomics-${{ matrix.name }}:ci
+          format: spdx-json
+          artifact-name: sbom-${{ matrix.name }}.spdx.json
+          output-file: sbom-${{ matrix.name }}.spdx.json
+          upload-artifact: true
+          upload-artifact-retention: 30
+          upload-release-assets: false

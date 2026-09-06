@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cacheeconomics:schema:analysis-result:v1",
+  "title": "cacheeconomics analysis result v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "schema_version", "engine", "registry", "analysis"],
+  "properties": {
+    "schema": {"const": "cacheeconomics.analysis-result"},
+    "schema_version": {"const": 1},
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": {"const": "cacheeconomics"},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "registry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256", "providers_generated", "pricing_generated"],
+      "properties": {
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "providers_generated": {"type": ["string", "null"], "format": "date"},
+        "pricing_generated": {"type": ["string", "null"], "format": "date"}
+      }
+    },
+    "analysis": {
+      "$ref": "#/$defs/analysis"
+    }
+  },
+  "$defs": {
+    "nullableNumber": {"type": ["number", "null"]},
+    "figure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "display",
+        "amount_usd",
+        "basis",
+        "released",
+        "release_state",
+        "projected",
+        "withheld_because"
+      ],
+      "properties": {
+        "display": {"type": "string"},
+        "amount_usd": {"$ref": "#/$defs/nullableNumber"},
+        "basis": {"type": "string"},
+        "released": {"type": "boolean"},
+        "release_state": {"enum": ["withheld", "draft", "reconciled"]},
+        "projected": {"type": "boolean"},
+        "withheld_because": {"type": ["string", "null"]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"released": {"const": false}}},
+          "then": {
+            "properties": {
+              "amount_usd": {"type": "null"},
+              "release_state": {"const": "withheld"},
+              "withheld_because": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"released": {"const": true}}},
+          "then": {
+            "properties": {
+              "amount_usd": {"type": "number"},
+              "release_state": {"enum": ["draft", "reconciled"]},
+              "withheld_because": {"type": "null"}
+            }
+          }
+        }
+      ]
+    },
+    "nullableFigure": {
+      "oneOf": [
+        {"$ref": "#/$defs/figure"},
+        {"type": "null"}
+      ]
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "analysed", "fraction", "excluded"],
+      "properties": {
+        "total": {"type": "integer", "minimum": 0},
+        "analysed": {"type": "integer", "minimum": 0},
+        "fraction": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "excluded": {
+          "type": "object",
+          "additionalProperties": {"type": "integer", "minimum": 0}
+        }
+      }
+    },
+    "ratios": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requests",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "uncached_tokens",
+        "input_from_cache",
+        "prefix_efficiency"
+      ],
+      "properties": {
+        "requests": {"type": "integer", "minimum": 0},
+        "cache_read_tokens": {"type": "integer", "minimum": 0},
+        "cache_write_tokens": {"type": "integer", "minimum": 0},
+        "uncached_tokens": {"type": "integer", "minimum": 0},
+        "input_from_cache": {"$ref": "#/$defs/nullableNumber"},
+        "prefix_efficiency": {"$ref": "#/$defs/nullableNumber"}
+      }
+    },
+    "spend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_usd",
+        "if_uncached_usd",
+        "caching_saved_usd",
+        "monthly_input_usd",
+        "window_days"
+      ],
+      "properties": {
+        "input_usd": {"$ref": "#/$defs/figure"},
+        "if_uncached_usd": {"$ref": "#/$defs/figure"},
+        "caching_saved_usd": {"$ref": "#/$defs/figure"},
+        "monthly_input_usd": {"$ref": "#/$defs/figure"},
+        "window_days": {"$ref": "#/$defs/nullableNumber"}
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "title",
+        "severity",
+        "confidence",
+        "evidence_class",
+        "quality_risk",
+        "detail",
+        "fix",
+        "affected_requests",
+        "structural",
+        "avoidable_usd_window",
+        "avoidable_usd_month"
+      ],
+      "properties": {
+        "code": {"type": "string"},
+        "title": {"type": "string"},
+        "severity": {"type": "string"},
+        "confidence": {"type": "string"},
+        "evidence_class": {"type": "string"},
+        "quality_risk": {"type": "string"},
+        "detail": {"type": "string"},
+        "fix": {"type": "string"},
+        "affected_requests": {"type": "integer", "minimum": 0},
+        "structural": {"type": "boolean"},
+        "avoidable_usd_window": {"$ref": "#/$defs/nullableFigure"},
+        "avoidable_usd_month": {"$ref": "#/$defs/nullableFigure"}
+      }
+    },
+    "reconciliation": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": [
+        "invoice_usd",
+        "computed_usd",
+        "delta_usd",
+        "delta_pct",
+        "within_ship_gate",
+        "unpriced_requests",
+        "invalid_invoice",
+        "blockers",
+        "gate"
+      ],
+      "properties": {
+        "invoice_usd": {"type": ["number", "string", "boolean", "null"]},
+        "computed_usd": {"$ref": "#/$defs/figure"},
+        "delta_usd": {"$ref": "#/$defs/nullableFigure"},
+        "delta_pct": {"$ref": "#/$defs/nullableNumber"},
+        "within_ship_gate": {"type": "boolean"},
+        "unpriced_requests": {"type": "integer", "minimum": 0},
+        "invalid_invoice": {"type": "string"},
+        "blockers": {
+          "type": "object",
+          "additionalProperties": {"type": ["boolean", "integer"]}
+        },
+        "gate": {"type": "string"}
+      }
+    },
+    "analysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tier",
+        "source",
+        "coverage",
+        "window_days",
+        "ratios",
+        "spend",
+        "total_avoidable_usd_month",
+        "reconciliation",
+        "findings",
+        "notes",
+        "caveats",
+        "tokens_counted",
+        "draft",
+        "has_withheld_figures"
+      ],
+      "properties": {
+        "tier": {"enum": ["instrumented", "inferred", "usage_only"]},
+        "source": {"type": ["string", "null"]},
+        "coverage": {"$ref": "#/$defs/coverage"},
+        "window_days": {"$ref": "#/$defs/nullableNumber"},
+        "ratios": {"$ref": "#/$defs/ratios"},
+        "spend": {"$ref": "#/$defs/spend"},
+        "total_avoidable_usd_month": {"$ref": "#/$defs/figure"},
+        "reconciliation": {"$ref": "#/$defs/reconciliation"},
+        "findings": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/finding"}
+        },
+        "notes": {"type": "array", "items": {"type": "string"}},
+        "caveats": {"type": "array", "items": {"type": "string"}},
+        "tokens_counted": {"type": "boolean"},
+        "draft": {"type": "boolean"},
+        "has_withheld_figures": {"type": "boolean"}
+      }
+    }
+  }
+}

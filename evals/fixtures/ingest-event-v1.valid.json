@@ -1,0 +1,46 @@
+{
+  "schema": "cacheeconomics.ingest-event",
+  "schema_version": 1,
+  "event_id": "synthetic-eval-event-1",
+  "request_id": "synthetic-request-1",
+  "sent_at": "2026-01-02T03:04:05+00:00",
+  "first_token_at": "2026-01-02T03:04:05.125000+00:00",
+  "completed_at": "2026-01-02T03:04:06+00:00",
+  "model": "claude-opus-5",
+  "target_id": "anthropic/direct",
+  "agent": "synthetic-eval-agent",
+  "session": "synthetic-session-1",
+  "workload_tenant": "synthetic-workload",
+  "ttl_requested": "5m",
+  "tokens_counted": true,
+  "status": {
+    "outcome": "success",
+    "code": 200,
+    "error_type": null
+  },
+  "usage": {
+    "input_tokens": 100,
+    "cache_read_input_tokens": 50,
+    "cache_creation_input_tokens": 0,
+    "output_tokens": 25,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 70
+    }
+  },
+  "segments": [
+    {
+      "id": "hmac:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "role": "system",
+      "label": "synthetic-policy",
+      "tokens": 220,
+      "cache_marked": true,
+      "index": 0,
+      "ttl": "5m"
+    }
+  ],
+  "collector": {
+    "name": "cacheeconomics-collector",
+    "version": "0.2.1",
+    "source_type": "normalized_trace"
+  }
+}

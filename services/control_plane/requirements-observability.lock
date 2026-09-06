@@ -1,0 +1,25 @@
+-r requirements-runtime.lock
+
+# Generated from requirements-observability.in for Python 3.12 with uv on
+# 2026-09-05. Runtime dependencies remain in their separate base lock.
+asgiref==3.12.1
+certifi==2026.7.22
+charset-normalizer==3.5.1
+googleapis-common-protos==1.75.3
+opentelemetry-api==1.44.0
+opentelemetry-distro==0.65b0
+opentelemetry-exporter-otlp-proto-common==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-instrumentation==0.65b0
+opentelemetry-instrumentation-asgi==0.65b0
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-sqlalchemy==0.65b0
+opentelemetry-proto==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-semantic-conventions==0.65b0
+opentelemetry-util-http==0.65b0
+packaging==26.3
+protobuf==7.36.1
+requests==2.34.2
+urllib3==2.7.0
+wrapt==2.4.0

@@ -29,8 +29,8 @@ jobs:
         # a client's newer interpreter does.
         python-version: ["3.9", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -42,7 +42,10 @@ jobs:
         run: python -m pip install --upgrade pip pytest
 
       - name: Run the suite
-        run: python -m pytest -q
+        # Keep this job dependency-free. The hosted service has its own job and
+        # dependency set so it can never make the local package's imports pass
+        # accidentally.
+        run: python -m pytest -q harness/tests contrib/litellm
 
       - name: Check the browser bundle is not stale
         # test_bundle.py already asserts this, so a failure here means the
@@ -58,8 +61,8 @@ jobs:
     # use. Nothing in the test suite could have caught that.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.9"
 
@@ -106,3 +109,194 @@ jobs:
             echo "a dollar figure escaped the gate in the shipped wheel"; exit 1
           fi
           echo "withheld by default, as shipped"
+
+  hosted-package:
+    # The hosted projects are separately installable distributions. Build and
+    # import them from wheels so an undeclared or stale core dependency cannot
+    # be hidden by PYTHONPATH entries from this checkout.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Build all three Python wheels
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir /tmp/cacheeconomics-wheels .
+          python -m build --wheel --outdir /tmp/cacheeconomics-wheels services/control_plane
+          python -m build --wheel --outdir /tmp/cacheeconomics-wheels collectors
+
+      - name: Install wheel runtime dependencies and the local release set
+        run: |
+          python -m pip install --requirement services/control_plane/requirements-runtime.lock
+          python -m pip install --no-deps /tmp/cacheeconomics-wheels/*.whl
+
+      - name: Import contracts and hosted consumers outside the checkout
+        working-directory: /tmp
+        run: |
+          python -c "
+          import importlib.metadata as metadata
+          import cacheeconomics
+          import cacheeconomics.contracts
+          import cacheeconomics_collector.events
+          import cacheeconomics_control_plane.analysis_engine
+
+          assert cacheeconomics.__version__ == '0.3.0'
+          expected = 'cacheeconomics==0.3.0'
+          assert expected in metadata.requires('cacheeconomics-control-plane')
+          assert expected in metadata.requires('cacheeconomics-collector')
+          print('standalone hosted wheels resolve the contract-bearing core release')
+          "
+
+  control-plane:
+    # Separate on purpose: the networked service has dependencies and a real
+    # PostgreSQL boundary; the installed analysis package has neither.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.11-alpine3.24@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+        env:
+          POSTGRES_DB: cacheeconomics
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres-dev-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d cacheeconomics"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            services/control_plane/requirements-runtime.lock
+            services/control_plane/requirements-test.lock
+            services/control_plane/requirements-observability.lock
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+
+      - name: Install the isolated service dependencies
+        run: |
+          python -m pip install --requirement services/control_plane/requirements-test.lock
+          python -m pip install --requirement services/control_plane/requirements-observability.lock
+
+      - name: Verify optional tracing instrumentation is installed
+        run: |
+          opentelemetry-instrument --version
+          python -c "import opentelemetry.instrumentation.fastapi, opentelemetry.instrumentation.sqlalchemy"
+
+      - name: Create restricted database roles
+        env:
+          PGPASSWORD: postgres-dev-only
+        run: >-
+          psql --host 127.0.0.1 --username postgres --dbname cacheeconomics
+          --set ON_ERROR_STOP=1 --file deploy/postgres/init/001_roles.sql
+
+      - name: Apply migrations as the migration role
+        env:
+          CACHEECONOMICS_DATABASE_URL: postgresql+psycopg://cacheeconomics_migrator:migrator-dev-only@127.0.0.1/cacheeconomics
+          PYTHONPATH: services/control_plane/src
+        run: alembic -c services/control_plane/alembic.ini upgrade head
+
+      - name: Test API authorization and PostgreSQL row isolation
+        env:
+          PYTHONPATH: services/control_plane/src:harness:collectors/src
+          TEST_POSTGRES_APP_URL: postgresql+psycopg://cacheeconomics_app:app-dev-only@127.0.0.1/cacheeconomics
+          TEST_POSTGRES_WORKER_URL: postgresql+psycopg://cacheeconomics_worker:worker-dev-only@127.0.0.1/cacheeconomics
+        run: >-
+          python -m pytest -q
+          services/control_plane/tests collectors/tests apps/dashboard/tests demo/tests evals
+
+      - name: Rebuild the synthetic portfolio packet byte for byte
+        env:
+          PYTHONPATH: services/control_plane/src:harness:collectors/src
+        run: python demo/build_portfolio_packet.py --check
+
+      - name: Measure the synthetic hosted regression workload
+        env:
+          PYTHONPATH: services/control_plane/src:harness:collectors/src
+        run: |
+          python evals/benchmark_hosted.py --output /tmp/cacheeconomics-benchmark.json
+          python evals/check_performance_budget.py --result /tmp/cacheeconomics-benchmark.json
+
+      - name: Upload the measured benchmark evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: synthetic-local-benchmark
+          path: /tmp/cacheeconomics-benchmark.json
+          retention-days: 30
+
+      - name: Check the dependency-free dashboard JavaScript
+        run: node --check apps/dashboard/app.js
+
+      - name: Recheck the offline package boundary
+        run: >-
+          python -m pytest -q
+          harness/tests/test_cli.py::TestNothingHereReachesTheNetwork::test_no_module_in_the_analysis_path_imports_a_network_library
+
+      - name: Exercise migration downgrade and re-upgrade
+        env:
+          CACHEECONOMICS_DATABASE_URL: postgresql+psycopg://cacheeconomics_migrator:migrator-dev-only@127.0.0.1/cacheeconomics
+          PYTHONPATH: services/control_plane/src
+        run: |
+          alembic -c services/control_plane/alembic.ini downgrade base
+          alembic -c services/control_plane/alembic.ini upgrade head
+
+      - name: Seed only synthetic restore-test evidence
+        env:
+          PGPASSWORD: postgres-dev-only
+        run: |
+          psql --host 127.0.0.1 --username postgres --dbname postgres \
+            --set ON_ERROR_STOP=1 \
+            --command "CREATE DATABASE cacheeconomics_restore_test"
+          psql --host 127.0.0.1 --username postgres --dbname cacheeconomics \
+            --set ON_ERROR_STOP=1 \
+            --command "INSERT INTO organizations (id, name, slug) VALUES ('00000000-0000-0000-0000-000000000004', 'Synthetic restore test', 'synthetic-restore-test')"
+
+      - name: Prove a backup can be restored
+        env:
+          SOURCE_DATABASE_URL: postgresql://postgres:postgres-dev-only@127.0.0.1/cacheeconomics
+          RESTORE_DATABASE_URL: postgresql://postgres:postgres-dev-only@127.0.0.1/cacheeconomics_restore_test
+          RESTORE_APP_DATABASE_URL: postgresql://cacheeconomics_app:app-dev-only@127.0.0.1/cacheeconomics_restore_test
+          RESTORE_WORKER_DATABASE_URL: postgresql://cacheeconomics_worker:worker-dev-only@127.0.0.1/cacheeconomics_restore_test
+          CACHEECONOMICS_ALLOW_DESTRUCTIVE_RESTORE_TEST: "yes"
+        run: deploy/scripts/backup_restore_smoke.sh
+
+  container-smoke:
+    # A clean Docker environment must be able to build, migrate, and expose the
+    # API/dashboard without borrowing anything from a developer machine.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - name: Build and start the development topology
+        run: >-
+          docker compose -f deploy/docker-compose.yml
+          up --build --detach api worker dashboard
+      - name: Wait for API readiness and dashboard health
+        run: |
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:8000/readyz >/dev/null \
+              && curl --fail --silent http://127.0.0.1:8080/ >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != "true" ]; then
+            docker compose -f deploy/docker-compose.yml ps
+            docker compose -f deploy/docker-compose.yml logs api worker dashboard
+            exit 1
+          fi
+          docker compose -f deploy/docker-compose.yml ps
+      - name: Remove the disposable stack
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down --volumes
