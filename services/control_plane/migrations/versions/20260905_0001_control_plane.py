@@ -390,6 +390,9 @@ def _grant_application_permissions() -> None:
 
 def downgrade() -> None:
     op.execute("DROP FUNCTION IF EXISTS authenticate_source_credential(text, text)")
+    # This policy reads memberships, so PostgreSQL will not allow that table to
+    # be dropped until the cross-table dependency is removed explicitly.
+    op.execute("DROP POLICY IF EXISTS organizations_select ON organizations")
     for table in (
         "audit_events",
         "jobs",

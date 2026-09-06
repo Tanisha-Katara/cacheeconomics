@@ -83,6 +83,29 @@ def test_collector_bootstrap_lookup_is_narrow_and_not_public():
     assert "source.enabled = true" in source
 
 
+def test_downgrade_removes_cross_table_policy_before_memberships(monkeypatch):
+    migration = load_migration()
+    actions = []
+    monkeypatch.setattr(
+        migration.op,
+        "execute",
+        lambda statement: actions.append(("execute", str(statement))),
+    )
+    monkeypatch.setattr(
+        migration.op,
+        "drop_table",
+        lambda table: actions.append(("drop_table", table)),
+    )
+
+    migration.downgrade()
+
+    policy = (
+        "execute",
+        "DROP POLICY IF EXISTS organizations_select ON organizations",
+    )
+    assert actions.index(policy) < actions.index(("drop_table", "memberships"))
+
+
 def test_runtime_database_role_cannot_bypass_row_security():
     roles = ROLES.read_text()
     assert "cacheeconomics_app NOSUPERUSER" in roles
