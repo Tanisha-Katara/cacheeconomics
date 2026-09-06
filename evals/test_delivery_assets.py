@@ -76,6 +76,13 @@ def test_backup_restore_script_has_narrow_target_guards():
     assert "has_function_privilege" in script
 
 
+def test_ci_uses_backup_tools_matching_the_postgres_service():
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    assert "postgres:17.11-alpine3.24@sha256:" in workflow
+    assert "postgresql-client-17" in workflow
+    assert "pg_dump --version" in workflow
+
+
 def test_four_runtime_container_roles_are_explicit():
     control_plane = (ROOT / "services/control_plane/Dockerfile").read_text()
     collector = (ROOT / "collectors/Dockerfile").read_text()
