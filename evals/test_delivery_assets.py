@@ -157,7 +157,7 @@ def test_release_requires_approval_and_promotes_scanned_attested_images():
     assert "environment: production" in release
     assert 'GITHUB_REF" != "refs/heads/main"' in release
     assert 'CONFIRMATION" != "PROMOTE"' in release
-    assert "aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b" in release
+    assert "aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25" in release
     assert "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6" in release
     assert "gh attestation verify" in release
     assert "imagetools create" in release

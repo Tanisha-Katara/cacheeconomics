@@ -160,16 +160,16 @@ def _create_job_lease_function() -> None:
         AS $$
         BEGIN
             WITH abandoned AS (
-                UPDATE public.jobs
+                UPDATE public.jobs AS expired_job
                    SET state = 'dead_letter',
                        finished_at = CURRENT_TIMESTAMP,
                        error_type = 'lease_expired',
                        lease_expires_at = NULL,
                        leased_by = NULL
-                 WHERE state = 'running'
-                   AND lease_expires_at < CURRENT_TIMESTAMP
-                   AND attempt >= max_attempts
-                RETURNING source_id, organization_id
+                 WHERE expired_job.state = 'running'
+                   AND expired_job.lease_expires_at < CURRENT_TIMESTAMP
+                   AND expired_job.attempt >= expired_job.max_attempts
+                RETURNING expired_job.source_id, expired_job.organization_id
             )
             UPDATE public.source_health AS health
                SET last_error_at = CURRENT_TIMESTAMP,

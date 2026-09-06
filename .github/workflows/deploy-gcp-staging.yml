@@ -108,7 +108,7 @@ jobs:
           build-args: VCS_REF=${{ github.sha }}
 
       - name: Scan the API image before deployment
-        uses: aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/cacheeconomics-api@${{ steps.api-image.outputs.digest }}
           scanners: vuln,misconfig,secret
@@ -117,7 +117,7 @@ jobs:
           exit-code: "1"
 
       - name: Scan the worker image before deployment
-        uses: aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/cacheeconomics-worker@${{ steps.worker-image.outputs.digest }}
           scanners: vuln,misconfig,secret
@@ -126,7 +126,7 @@ jobs:
           exit-code: "1"
 
       - name: Scan the dashboard image before deployment
-        uses: aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ env.REGISTRY }}/cacheeconomics-dashboard@${{ steps.dashboard-image.outputs.digest }}
           scanners: vuln,misconfig,secret

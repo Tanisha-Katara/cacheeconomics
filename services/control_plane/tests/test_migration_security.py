@@ -103,6 +103,8 @@ def test_worker_role_and_job_lease_have_narrow_privileges(monkeypatch):
     migration._grant_phase_two_permissions()
     rendered = "\n".join(statements)
     assert "FOR UPDATE SKIP LOCKED" in rendered
+    assert "expired_job.attempt >= expired_job.max_attempts" in rendered
+    assert "RETURNING expired_job.source_id, expired_job.organization_id" in rendered
     assert "SECURITY DEFINER" in rendered
     assert "REVOKE ALL ON FUNCTION lease_analysis_job" in rendered
     assert "GRANT EXECUTE ON FUNCTION lease_analysis_job" in rendered

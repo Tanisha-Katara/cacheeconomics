@@ -33,7 +33,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Scan dependencies, configuration, and committed secrets
-        uses: aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -75,7 +75,7 @@ jobs:
           build-args: |
             VCS_REF=${{ github.sha }}
       - name: Scan the built image
-        uses: aquasecurity/trivy-action@a9c5f83e626c6600d71e51391f2af8aa3cf9651b # v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: cacheeconomics-${{ matrix.name }}:ci
           scanners: vuln,misconfig,secret
