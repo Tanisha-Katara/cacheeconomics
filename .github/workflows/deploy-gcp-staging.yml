@@ -1,0 +1,163 @@
+name: deploy-gcp-staging
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Enter DEPLOY STAGING after CI and the cloud accounts are ready
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gcp-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'DEPLOY STAGING'
+    environment: staging
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOYER_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+      AUTH0_DOMAIN: ${{ vars.AUTH0_DOMAIN }}
+      AUTH0_AUDIENCE: ${{ vars.AUTH0_AUDIENCE }}
+      AUTH0_CLIENT_ID: ${{ vars.AUTH0_CLIENT_ID }}
+      CACHEECONOMICS_SERVICE_PREFIX: ${{ vars.CACHEECONOMICS_SERVICE_PREFIX || 'cacheeconomics' }}
+      REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.CACHEECONOMICS_SERVICE_PREFIX || 'cacheeconomics' }}
+
+    steps:
+      - name: Validate non-secret deployment configuration
+        run: |
+          set -eu
+          require_value() {
+            value=$1
+            name=$2
+            if [ -z "$value" ]; then
+              echo "GitHub staging variable $name is required" >&2
+              exit 2
+            fi
+          }
+          require_value "${GCP_PROJECT_ID:-}" GCP_PROJECT_ID
+          require_value "${GCP_REGION:-}" GCP_REGION
+          require_value "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}" GCP_WORKLOAD_IDENTITY_PROVIDER
+          require_value "${GCP_DEPLOYER_SERVICE_ACCOUNT:-}" GCP_DEPLOYER_SERVICE_ACCOUNT
+          require_value "${AUTH0_DOMAIN:-}" AUTH0_DOMAIN
+          require_value "${AUTH0_AUDIENCE:-}" AUTH0_AUDIENCE
+          require_value "${AUTH0_CLIENT_ID:-}" AUTH0_CLIENT_ID
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - id: google-auth
+        name: Exchange the GitHub OIDC token for short-lived Google credentials
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - name: Install the Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+        with:
+          version: ">= 541.0.0"
+
+      - name: Authenticate Docker to the regional registry
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - id: api-image
+        name: Build the API image once and publish its immutable commit tag
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: services/control_plane/Dockerfile
+          target: api
+          push: true
+          tags: ${{ env.REGISTRY }}/cacheeconomics-api:sha-${{ github.sha }}
+          build-args: VCS_REF=${{ github.sha }}
+
+      - id: worker-image
+        name: Build the worker image once and publish its immutable commit tag
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: services/control_plane/Dockerfile
+          target: worker
+          push: true
+          tags: ${{ env.REGISTRY }}/cacheeconomics-worker:sha-${{ github.sha }}
+          build-args: VCS_REF=${{ github.sha }}
+
+      - id: dashboard-image
+        name: Build the dashboard image once and publish its immutable commit tag
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: apps/dashboard/Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/cacheeconomics-dashboard:sha-${{ github.sha }}
+          build-args: VCS_REF=${{ github.sha }}
+
+      - name: Scan the API image before deployment
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/cacheeconomics-api@${{ steps.api-image.outputs.digest }}
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan the worker image before deployment
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/cacheeconomics-worker@${{ steps.worker-image.outputs.digest }}
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Scan the dashboard image before deployment
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/cacheeconomics-dashboard@${{ steps.dashboard-image.outputs.digest }}
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Attest the API image digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/cacheeconomics-api
+          subject-digest: ${{ steps.api-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest the worker image digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/cacheeconomics-worker
+          subject-digest: ${{ steps.worker-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest the dashboard image digest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/cacheeconomics-dashboard
+          subject-digest: ${{ steps.dashboard-image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Deploy migration, services, and scheduled worker by digest
+        env:
+          API_IMAGE: ${{ env.REGISTRY }}/cacheeconomics-api@${{ steps.api-image.outputs.digest }}
+          WORKER_IMAGE: ${{ env.REGISTRY }}/cacheeconomics-worker@${{ steps.worker-image.outputs.digest }}
+          DASHBOARD_IMAGE: ${{ env.REGISTRY }}/cacheeconomics-dashboard@${{ steps.dashboard-image.outputs.digest }}
+        run: sh deploy/gcp/deploy_staging.sh

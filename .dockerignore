@@ -1,0 +1,41 @@
+# Default-deny the build context. A developer checkout may contain ignored
+# customer traces; Docker must never receive them merely because an image is
+# being built. The three Dockerfiles only need the explicit paths below.
+**
+
+!.dockerignore
+!pyproject.toml
+!README.md
+!LICENSE
+!NOTICE
+
+!harness/
+!harness/cacheeconomics/
+!harness/cacheeconomics/**
+
+!services/
+!services/control_plane/
+!services/control_plane/Dockerfile
+!services/control_plane/alembic.ini
+!services/control_plane/requirements-runtime.lock
+!services/control_plane/requirements-observability.lock
+!services/control_plane/src/
+!services/control_plane/src/**
+!services/control_plane/migrations/
+!services/control_plane/migrations/**
+
+!collectors/
+!collectors/Dockerfile
+!collectors/README.md
+!collectors/pyproject.toml
+!collectors/src/
+!collectors/src/**
+
+!apps/
+!apps/dashboard/
+!apps/dashboard/Dockerfile
+!apps/dashboard/nginx.conf
+!apps/dashboard/default.conf.template
+!apps/dashboard/index.html
+!apps/dashboard/styles.css
+!apps/dashboard/app.js

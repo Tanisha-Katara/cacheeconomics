@@ -1,0 +1,5 @@
+{
+  "analysis-result-v1.schema.json": "0493e9027aca29f43233ae4e2e17eed9731296aa57764f510cb584ab3a689fd5",
+  "ingest-batch-v1.schema.json": "409e8e7429f0e28e12bd3cc8c12817feeaf763e39e860f3231ad3c0a57b3aeb2",
+  "ingest-event-v1.schema.json": "4aefb13c8ca99f9e9bd0029fdf57ab2a615a72042fd928c49e908fa7d1809075"
+}

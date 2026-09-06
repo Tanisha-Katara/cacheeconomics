@@ -1,6 +1,7 @@
 # cacheeconomics
 
 [![ci](https://github.com/Tanisha-Katara/cacheeconomics/actions/workflows/ci.yml/badge.svg)](https://github.com/Tanisha-Katara/cacheeconomics/actions/workflows/ci.yml)
+[![security](https://github.com/Tanisha-Katara/cacheeconomics/actions/workflows/security.yml/badge.svg)](https://github.com/Tanisha-Katara/cacheeconomics/actions/workflows/security.yml)
 [![pypi](https://img.shields.io/pypi/v/cacheeconomics)](https://pypi.org/project/cacheeconomics/)
 
 [![Cache is the new cash](docs/assets/cache-is-new-cash.jpg)](https://commodiverus388593.substack.com/p/cache-economics-how-to-stop-paying)
@@ -154,6 +155,41 @@ Network-touching tools are separate and explicit:
 
 - `tier-b/count_tokens.py` sends prompt prefixes to a tokenizer.
 - `tier-b/capture_proxy.py` is a forwarding proxy for measurement.
+- `services/control_plane/` is the separately installed hosted service for
+  identity, organizations, roles, sources, ingestion, jobs, and audit records.
+- `collectors/` is the opt-in network client and LiteLLM callback. It sends only
+  the prompt-free event contract and keeps failed delivery in a local outbox.
+- `apps/dashboard/` is the separately deployed, signed-in browser application.
+  It reads organization-scoped aggregates and analysis results through the
+  hosted API; it is not included in the Python wheel.
+
+Hosted features follow the same rule. None of them add networking to the
+installed package. See [the architecture](docs/architecture.md) and
+[security model](docs/security-model.md). The current gaps and delivery order
+are recorded in the [technical audit](docs/technical-audit.md) and
+[implementation plan](docs/implementation-plan.md). Current API/worker release
+steps are in the [deployment runbook](docs/deployment-runbook.md). The selected
+free-friendly portfolio staging path—GitHub Actions, Cloud Run, Neon, and
+Auth0—is documented in the [provider runbook](deploy/gcp/README.md).
+
+For a portfolio walkthrough without a cloud account, run the clearly labelled
+synthetic, read-only demo:
+
+```bash
+python demo/serve_portfolio_demo.py
+```
+
+The [product tour](docs/product-tour.md),
+[synthetic hosted case study](case-studies/synthetic-hosted-control-plane.md),
+and [evidence ledger](docs/portfolio-evidence.md) trace its claims back to a
+checked fixture and tests. It is not presented as a deployed environment.
+
+The hosted application now has evaluation, container, scanning, SBOM, signed
+provenance, backup/restore, and approval-gated image-promotion definitions. It
+also has a selected provider architecture and approval-gated Cloud Run
+deployment definition. It has not yet been deployed to a public environment;
+the required accounts, secret values, Auth0 callback, managed-database restore,
+and telemetry review remain operator-run work rather than fabricated evidence.
 
 Prompt text is optional. Hashes, structure, and token counts are enough for the
 main findings. Segment identifiers are keyed HMAC-SHA-256, and multi-tenant
@@ -163,12 +199,20 @@ identity can be scoped with `--tenant`.
 
 ```text
 harness/cacheeconomics/  package source
+schemas/                 versioned, prompt-free application contracts
+services/control_plane/  separate hosted authentication and tenancy API
+collectors/               separate opt-in network upload application
+apps/dashboard/           separate hosted organization dashboard
+deploy/                  local multi-service deployment configuration
+evals/                   golden, schema, RBAC, delivery, and performance gates
+demo/                    reproducible synthetic packet and read-only UI replay
 web/                     browser demo bundle
 tier-a/                  static findings on open-source agents
 tier-b/                  live experiments and evidence rows
 case-studies/            narrative write-ups
 disclosure/              upstream disclosures and verifiers
 contrib/                 upstream contribution material
+docs/                    architecture and security decisions
 ```
 
 Only `harness/` ships in the wheel. Evidence and experiments stay in the repo
@@ -184,6 +228,10 @@ pip install .
 python3 -m pytest -q
 python3 web/build_bundle.py   # after changing harness/cacheeconomics
 ```
+
+Hosted-service dependencies and evaluations stay separate from the zero-
+dependency package job. Their commands and the measured synthetic performance
+guard are documented in [evals/README.md](evals/README.md).
 
 Python 3.9 or newer. The package has no runtime dependencies. CI runs on Python
 3.9 and 3.13 with only `pytest` installed.

@@ -20,6 +20,15 @@ tier-b/foundry_run_*.jsonl
 # Never commit credentials
 .env
 *.key
+gha-creds-*.json
+
+# Terraform state contains infrastructure identifiers and can contain secrets.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
 
 # Real-trace analysis output. Transcript-derived data never enters the repo,
 # even in aggregate — the adapter reads only usage fields, but the safe default
@@ -32,8 +41,13 @@ harness/out/
 build/
 dist/
 *.egg-info/
+.pytest_cache/
+.venv*/
 __pycache__/
 *.pyc
+.cacheeconomics-collector.sqlite3
+.cacheeconomics-collector.sqlite3-shm
+.cacheeconomics-collector.sqlite3-wal
 
 # Token-count resume files. Keys are digests now, but the file still records
 # which prefixes a client's traffic contains and how large each one is, and it

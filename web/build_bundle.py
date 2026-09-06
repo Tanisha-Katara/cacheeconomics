@@ -47,7 +47,9 @@ OUT = os.path.join(HERE, "harness-bundle.js")
 # does not have. Excluding them also keeps the bundle's standard-library-only
 # check honest rather than widening its allow-list to accommodate a module the
 # page never imports.
-EXCLUDE = {"recorder.py", "plugin.py", "cli.py", "__main__.py"}
+# contracts.py defines the server exchange format; the browser Worker continues
+# to use its smaller, existing message API.
+EXCLUDE = {"recorder.py", "plugin.py", "cli.py", "__main__.py", "contracts.py"}
 ADAPTERS = {"bodies.py", "__init__.py"}
 
 

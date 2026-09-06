@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+  - package-ecosystem: pip
+    directory: /services/control_plane
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /collectors
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /services/control_plane
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /collectors
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /apps/dashboard
+    schedule:
+      interval: weekly

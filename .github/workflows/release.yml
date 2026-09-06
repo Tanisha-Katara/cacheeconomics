@@ -1,0 +1,163 @@
+name: publish-images
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Publish this commit to staging, or promote an existing staging SHA
+        required: true
+        type: choice
+        options:
+          - publish-staging
+          - promote-production
+      source_sha:
+        description: Full 40-character staging commit SHA (production promotion only)
+        required: false
+        type: string
+      confirmation:
+        description: Enter PROMOTE for production promotion
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-release-${{ inputs.operation }}
+  cancel-in-progress: false
+
+jobs:
+  publish-staging:
+    if: inputs.operation == 'publish-staging'
+    environment: staging
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            image: ghcr.io/tanisha-katara/cacheeconomics-api
+            dockerfile: services/control_plane/Dockerfile
+            target: api
+          - name: worker
+            image: ghcr.io/tanisha-katara/cacheeconomics-worker
+            dockerfile: services/control_plane/Dockerfile
+            target: worker
+          - name: collector
+            image: ghcr.io/tanisha-katara/cacheeconomics-collector
+            dockerfile: collectors/Dockerfile
+            target: ""
+          - name: dashboard
+            image: ghcr.io/tanisha-katara/cacheeconomics-dashboard
+            dockerfile: apps/dashboard/Dockerfile
+            target: ""
+    steps:
+      - name: Require staging publication from main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "staging images may only be published from main" >&2
+            exit 2
+          fi
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish immutable staging image
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          push: true
+          tags: ${{ matrix.image }}:sha-${{ github.sha }}
+          build-args: |
+            VCS_REF=${{ github.sha }}
+      - name: Scan the immutable image before moving the staging tag
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}@${{ steps.push.outputs.digest }}
+          scanners: vuln,misconfig,secret
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Sign the image provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ matrix.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Move the staging pointer only after scan and attestation
+        env:
+          IMAGE: ${{ matrix.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: >-
+          docker buildx imagetools create
+          --tag "$IMAGE:staging"
+          "$IMAGE@$DIGEST"
+
+  promote-production:
+    if: inputs.operation == 'promote-production'
+    environment: production
+    permissions:
+      contents: read
+      packages: write
+      attestations: read
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ghcr.io/tanisha-katara/cacheeconomics-api
+          - ghcr.io/tanisha-katara/cacheeconomics-worker
+          - ghcr.io/tanisha-katara/cacheeconomics-collector
+          - ghcr.io/tanisha-katara/cacheeconomics-dashboard
+    steps:
+      - name: Validate explicit promotion approval and source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION" != "PROMOTE" ]; then
+            echo "production promotion requires the exact confirmation PROMOTE" >&2
+            exit 2
+          fi
+          if ! printf '%s' "$SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "source_sha must be a full lowercase commit SHA" >&2
+            exit 2
+          fi
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify the staging provenance before promotion
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE: ${{ matrix.image }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: >-
+          gh attestation verify
+          "oci://$IMAGE:sha-$SOURCE_SHA"
+          --repo "$GITHUB_REPOSITORY"
+      - name: Promote the already-built staging manifest without rebuilding
+        env:
+          IMAGE: ${{ matrix.image }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: >-
+          docker buildx imagetools create
+          --tag "$IMAGE:production"
+          "$IMAGE:sha-$SOURCE_SHA"
+      - name: Record the promoted digest
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: docker buildx imagetools inspect "$IMAGE:production"

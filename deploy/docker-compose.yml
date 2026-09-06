@@ -1,0 +1,118 @@
+name: cacheeconomics
+
+services:
+  db:
+    image: postgres:17.11-alpine3.24@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+    environment:
+      POSTGRES_DB: cacheeconomics
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres-dev-only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d cacheeconomics"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init/001_roles.sql:/docker-entrypoint-initdb.d/001_roles.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: services/control_plane/Dockerfile
+      target: migrate
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      CACHEECONOMICS_DATABASE_URL: postgresql+psycopg://cacheeconomics_migrator:migrator-dev-only@db/cacheeconomics
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+  api:
+    build:
+      context: ..
+      dockerfile: services/control_plane/Dockerfile
+      target: api
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      CACHEECONOMICS_ENVIRONMENT: development
+      CACHEECONOMICS_DATABASE_URL: postgresql+psycopg://cacheeconomics_app:app-dev-only@db/cacheeconomics
+      CACHEECONOMICS_OIDC_ISSUER: ${CACHEECONOMICS_OIDC_ISSUER:-https://identity.example.invalid/}
+      CACHEECONOMICS_OIDC_AUDIENCE: ${CACHEECONOMICS_OIDC_AUDIENCE:-cacheeconomics-api}
+      CACHEECONOMICS_OIDC_JWKS_URL: ${CACHEECONOMICS_OIDC_JWKS_URL:-https://identity.example.invalid/.well-known/jwks.json}
+      CACHEECONOMICS_ALLOWED_HOSTS: '["localhost", "127.0.0.1", "api"]'
+      CACHEECONOMICS_DASHBOARD_OIDC_AUTHORIZATION_ENDPOINT: ${CACHEECONOMICS_DASHBOARD_OIDC_AUTHORIZATION_ENDPOINT:-}
+      CACHEECONOMICS_DASHBOARD_OIDC_TOKEN_ENDPOINT: ${CACHEECONOMICS_DASHBOARD_OIDC_TOKEN_ENDPOINT:-}
+      CACHEECONOMICS_DASHBOARD_OIDC_CLIENT_ID: ${CACHEECONOMICS_DASHBOARD_OIDC_CLIENT_ID:-}
+      CACHEECONOMICS_DASHBOARD_REDIRECT_URI: ${CACHEECONOMICS_DASHBOARD_REDIRECT_URI:-}
+      CACHEECONOMICS_DASHBOARD_ALLOW_DEVELOPMENT_TOKEN: "true"
+      OTEL_SERVICE_NAME: cacheeconomics-api
+    ports:
+      - "127.0.0.1:8000:8000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: apps/dashboard/Dockerfile
+    depends_on:
+      api:
+        condition: service_started
+    environment:
+      # Keep this exact. Add only the chosen OIDC token origin when OIDC is
+      # configured; never use a wildcard CSP source.
+      DASHBOARD_CONNECT_SRC: "${DASHBOARD_CONNECT_SRC:-'self'}"
+      DASHBOARD_API_ORIGIN: "http://api:8000"
+    ports:
+      - "127.0.0.1:8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:uid=101,gid=101,mode=1777
+      - /etc/nginx/conf.d:uid=101,gid=101,mode=0755
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ..
+      dockerfile: services/control_plane/Dockerfile
+      target: worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      CACHEECONOMICS_ENVIRONMENT: development
+      CACHEECONOMICS_DATABASE_URL: postgresql+psycopg://cacheeconomics_worker:worker-dev-only@db/cacheeconomics
+      CACHEECONOMICS_OIDC_ISSUER: ${CACHEECONOMICS_OIDC_ISSUER:-https://identity.example.invalid/}
+      CACHEECONOMICS_OIDC_AUDIENCE: ${CACHEECONOMICS_OIDC_AUDIENCE:-cacheeconomics-api}
+      CACHEECONOMICS_OIDC_JWKS_URL: ${CACHEECONOMICS_OIDC_JWKS_URL:-https://identity.example.invalid/.well-known/jwks.json}
+      CACHEECONOMICS_ALLOWED_HOSTS: '["worker"]'
+      OTEL_SERVICE_NAME: cacheeconomics-worker
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: ["ALL"]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

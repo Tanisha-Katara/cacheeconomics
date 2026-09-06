@@ -1,0 +1,8 @@
+project_id        = "replace-with-your-gcp-project-id"
+region            = "europe-west1"
+github_repository = "Tanisha-Katara/cacheeconomics"
+
+# Optional labels must use Google Cloud label-compatible values.
+labels = {
+  owner = "portfolio"
+}

@@ -1,0 +1,11 @@
+-r requirements-runtime.lock
+
+# Test-only dependencies. The production container does not install these.
+Pygments==2.21.0
+httpcore2==2.12.0
+httpx2==2.12.0
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+pytest==8.4.2
+truststore==0.10.4

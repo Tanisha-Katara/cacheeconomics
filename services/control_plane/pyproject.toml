@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cacheeconomics-control-plane"
+description = "Networked authentication and multi-tenant control plane for cacheeconomics"
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "alembic==1.19.2",
+    "cacheeconomics==0.3.0",
+    "fastapi==0.141.1",
+    "psycopg[binary]==3.3.5",
+    "pydantic-settings==2.15.0",
+    "PyJWT[crypto]==2.13.0",
+    "SQLAlchemy==2.0.52",
+    "uvicorn[standard]==0.52.4",
+]
+
+[project.optional-dependencies]
+test = [
+    "httpx2==2.12.0",
+    "pytest==8.4.2",
+]
+observability = [
+    "opentelemetry-distro==0.65b0",
+    "opentelemetry-exporter-otlp-proto-http==1.44.0",
+    "opentelemetry-instrumentation-fastapi==0.65b0",
+    "opentelemetry-instrumentation-sqlalchemy==0.65b0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "cacheeconomics_control_plane.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "postgres: requires a migrated PostgreSQL database",
+]

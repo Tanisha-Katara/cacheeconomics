@@ -1,0 +1,8 @@
+-r requirements-runtime.lock
+
+# Optional network exporter and framework instrumentation. These versions were
+# verified against the OpenTelemetry project releases on 2026-09-05.
+opentelemetry-distro==0.65b0
+opentelemetry-exporter-otlp-proto-http==1.44.0
+opentelemetry-instrumentation-fastapi==0.65b0
+opentelemetry-instrumentation-sqlalchemy==0.65b0

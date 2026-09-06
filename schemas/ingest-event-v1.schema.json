@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:cacheeconomics:schema:ingest-event:v1",
+  "title": "cacheeconomics ingest event v1",
+  "description": "Prompt-free telemetry accepted by the future hosted ingestion service. Organization identity comes from the authenticated credential, never this body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "event_id",
+    "sent_at",
+    "model",
+    "target_id",
+    "status",
+    "usage",
+    "segments",
+    "tokens_counted",
+    "collector"
+  ],
+  "properties": {
+    "schema": {"const": "cacheeconomics.ingest-event"},
+    "schema_version": {"const": 1},
+    "event_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "request_id": {"type": ["string", "null"], "maxLength": 256},
+    "sent_at": {"type": "string", "format": "date-time"},
+    "first_token_at": {"type": ["string", "null"], "format": "date-time"},
+    "completed_at": {"type": ["string", "null"], "format": "date-time"},
+    "model": {"type": "string", "minLength": 1, "maxLength": 256},
+    "target_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "agent": {"type": "string", "maxLength": 256},
+    "session": {"type": ["string", "null"], "maxLength": 256},
+    "workload_tenant": {
+      "description": "Optional customer workload label. This is not the authenticated cacheeconomics organization.",
+      "type": ["string", "null"],
+      "maxLength": 256
+    },
+    "ttl_requested": {"type": ["string", "null"], "maxLength": 64},
+    "tokens_counted": {"type": "boolean"},
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome", "code", "error_type"],
+      "allOf": [
+        {
+          "if": {"properties": {"outcome": {"const": "success"}}},
+          "then": {
+            "properties": {
+              "code": {
+                "oneOf": [
+                  {"type": "null"},
+                  {"type": "integer", "minimum": 200, "maximum": 299}
+                ]
+              },
+              "error_type": {"type": "null"}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"outcome": {"const": "error"}}},
+          "then": {
+            "properties": {
+              "code": {
+                "oneOf": [
+                  {"type": "null"},
+                  {"type": "integer", "minimum": 100, "maximum": 199},
+                  {"type": "integer", "minimum": 300, "maximum": 599}
+                ]
+              },
+              "error_type": {"not": {"type": "null"}}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "outcome": {"enum": ["cancelled", "unknown"]}
+            }
+          },
+          "then": {
+            "properties": {
+              "code": {
+                "oneOf": [
+                  {"type": "null"},
+                  {"type": "integer", "minimum": 100, "maximum": 199},
+                  {"type": "integer", "minimum": 300, "maximum": 599}
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "properties": {
+        "outcome": {
+          "enum": ["success", "error", "cancelled", "unknown"]
+        },
+        "code": {"type": ["integer", "null"], "minimum": 100, "maximum": 599},
+        "error_type": {
+          "description": "A short normalized category, not a raw provider error message.",
+          "enum": [
+            null,
+            "authentication_error",
+            "authorization_error",
+            "bad_request",
+            "cancelled",
+            "network_error",
+            "provider_error",
+            "rate_limit",
+            "timeout",
+            "unavailable",
+            "unknown"
+          ]
+        }
+      }
+    },
+    "usage": {
+      "$ref": "#/$defs/usage"
+    },
+    "segments": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {"$ref": "#/$defs/segment"}
+    },
+    "collector": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version", "source_type"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "version": {"type": "string", "minLength": 1, "maxLength": 64},
+        "source_type": {
+          "enum": ["normalized_trace", "litellm", "request_bodies", "claude_code"]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "tokenCount": {"type": "integer", "minimum": 0},
+    "usage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "output_tokens"
+      ],
+      "properties": {
+        "input_tokens": {"$ref": "#/$defs/tokenCount"},
+        "cache_read_input_tokens": {"$ref": "#/$defs/tokenCount"},
+        "cache_creation_input_tokens": {"$ref": "#/$defs/tokenCount"},
+        "output_tokens": {"$ref": "#/$defs/tokenCount"},
+        "cache_creation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ephemeral_5m_input_tokens": {"$ref": "#/$defs/tokenCount"},
+            "ephemeral_1h_input_tokens": {"$ref": "#/$defs/tokenCount"}
+          }
+        }
+      }
+    },
+    "segment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "role", "tokens", "cache_marked", "index", "ttl"],
+      "properties": {
+        "id": {
+          "description": "A keyed HMAC created by a local collector. Raw prompt text is forbidden.",
+          "type": "string",
+          "pattern": "^hmac:[0-9a-f]{64}$"
+        },
+        "role": {"type": "string", "minLength": 1, "maxLength": 64},
+        "label": {"type": "string", "maxLength": 256},
+        "tokens": {"$ref": "#/$defs/tokenCount"},
+        "cache_marked": {"type": "boolean"},
+        "index": {"type": "integer", "minimum": 0},
+        "ttl": {"type": ["string", "null"], "maxLength": 64}
+      }
+    }
+  }
+}
