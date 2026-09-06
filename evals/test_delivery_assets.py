@@ -78,9 +78,11 @@ def test_backup_restore_script_has_narrow_target_guards():
 
 def test_ci_uses_backup_tools_matching_the_postgres_service():
     workflow = (ROOT / ".github/workflows/ci.yml").read_text()
-    assert "postgres:17.11-alpine3.24@sha256:" in workflow
-    assert "postgresql-client-17" in workflow
-    assert "pg_dump --version" in workflow
+    image = "postgres:17.11-alpine3.24@sha256:"
+    assert workflow.count(image) == 2
+    assert "docker run --rm --network host" in workflow
+    assert '--volume "${GITHUB_WORKSPACE}:/workspace:ro"' in workflow
+    assert "sh deploy/scripts/backup_restore_smoke.sh" in workflow
 
 
 def test_four_runtime_container_roles_are_explicit():

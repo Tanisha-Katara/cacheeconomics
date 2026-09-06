@@ -183,12 +183,6 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install the PostgreSQL 17 client tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes postgresql-client-17
-          pg_dump --version | grep --extended-regexp ' 17[.]'
-
       - name: Install the isolated service dependencies
         run: |
           python -m pip install --requirement services/control_plane/requirements-test.lock
@@ -279,7 +273,17 @@ jobs:
           RESTORE_APP_DATABASE_URL: postgresql://cacheeconomics_app:app-dev-only@127.0.0.1/cacheeconomics_restore_test
           RESTORE_WORKER_DATABASE_URL: postgresql://cacheeconomics_worker:worker-dev-only@127.0.0.1/cacheeconomics_restore_test
           CACHEECONOMICS_ALLOW_DESTRUCTIVE_RESTORE_TEST: "yes"
-        run: deploy/scripts/backup_restore_smoke.sh
+        run: >-
+          docker run --rm --network host
+          --env SOURCE_DATABASE_URL
+          --env RESTORE_DATABASE_URL
+          --env RESTORE_APP_DATABASE_URL
+          --env RESTORE_WORKER_DATABASE_URL
+          --env CACHEECONOMICS_ALLOW_DESTRUCTIVE_RESTORE_TEST
+          --volume "${GITHUB_WORKSPACE}:/workspace:ro"
+          --workdir /workspace
+          postgres:17.11-alpine3.24@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
+          sh deploy/scripts/backup_restore_smoke.sh
 
   container-smoke:
     # A clean Docker environment must be able to build, migrate, and expose the
