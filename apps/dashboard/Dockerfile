@@ -21,6 +21,8 @@ COPY apps/dashboard/default.conf.template /etc/nginx/templates/default.conf.temp
 COPY apps/dashboard/index.html /usr/share/nginx/html/index.html
 COPY apps/dashboard/styles.css /usr/share/nginx/html/styles.css
 COPY apps/dashboard/app.js /usr/share/nginx/html/app.js
+COPY apps/dashboard/favicon.svg /usr/share/nginx/html/favicon.svg
+COPY apps/dashboard/media /usr/share/nginx/html/media
 
 RUN rm -f /etc/nginx/conf.d/default.conf \
     && mkdir -p /tmp/client_temp /tmp/proxy_temp /tmp/fastcgi_temp /tmp/uwsgi_temp /tmp/scgi_temp \

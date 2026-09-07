@@ -1,10 +1,26 @@
-# Short demo recording script
+# Short demo recording guide
 
 Record only the synthetic local demo or a clearly labelled staging deployment.
 Never place a real token, organization name, source identifier, or provider
 account data in the recording.
 
-## Two-minute walkthrough
+## Published short films
+
+The public site contains two generated films:
+
+- Recommendations: secure entry, Overview, ranked findings, evidence labels,
+  quality risk, and withheld monetary impact.
+- Operations: secure entry, request aggregates, a 24-hour window, job state,
+  and ingestion health.
+
+Rebuild both from the checked synthetic packet:
+
+```sh
+uv run --isolated --no-project --with playwright \
+  python demo/record_dashboard_videos.py
+```
+
+## Narrated portfolio walkthrough
 
 1. Show the sign-in page and say: “The hosted layer is separate; the installed
    Python package still opens no sockets.”
@@ -28,3 +44,7 @@ account data in the recording.
   final video artifact.
 - Review every frame for tokens, browser history, notifications, and unrelated
   account information before publishing.
+
+The generated product films are silent and browser-chrome-free. A narrated
+version should follow the same disclosure rules and may use this sequence as
+its script.

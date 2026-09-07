@@ -42,20 +42,18 @@ def test_case_study_numbers_are_derived_from_the_packet():
     assert ", ".join(f"`{code}`" for code in checks["finding_codes"]) in case_study
 
 
-def test_portfolio_docs_do_not_claim_missing_deployment_evidence():
+def test_portfolio_docs_separate_completed_and_pending_deployment_evidence():
     ledger = _read("docs/portfolio-evidence.md")
     decisions = _read("docs/deployment-decision-record.md")
     tour = _read("docs/product-tour.md")
     readme = _read("README.md")
 
-    assert "Pending browser capture" in ledger
-    assert "Pending staging exercise" in ledger
+    assert "Implemented with synthetic labels" in ledger
+    assert "restore and rollback drills pending" in ledger
     normalized_decisions = " ".join(decisions.split())
-    assert "Cloud Run workloads await the first deployment" in normalized_decisions
-    assert (
-        "Evidence still required before the hosted application is called “deployed”"
-        in decisions
-    )
-    assert "not checked in yet" in tour
+    assert "deployed to staging" in normalized_decisions
+    assert "Still required before customer production use" in decisions
+    assert "Recommendations and Operations posters" in tour
     assert "python demo/serve_portfolio_demo.py" in readme
     assert "It is not presented as a deployed environment." in readme
+    assert "public Cloud Run staging deployment" in readme

@@ -4,8 +4,9 @@
 
 **Scope:** low-traffic public portfolio staging, not customer production
 
-**State:** Google foundation and database bootstrap applied to staging; service
-images and Cloud Run workloads await the first deployment
+**State:** dashboard, API, worker, scheduler, database migration, remote state,
+and identity configuration deployed to staging; human sign-in and operational
+drills remain open
 
 The chosen design favors services with usable free allowances and keeps the
 number of moving parts small. Free allowances can change and are not hard cost
@@ -72,17 +73,25 @@ analysis library and still has no networking code.
 - OpenTelemetry exporters stay `none`. Cloud Run's own request telemetry and
   stdout collection do not require application trace export.
 
-## Evidence still required before the hosted application is called “deployed”
+## Deployment evidence and remaining exercises
 
-1. Remote Terraform-state object/version evidence and a zero-change plan.
-2. Digest-qualified staging image references and matching attestations.
-3. Successful application migration, synthetic smoke flow, and real PostgreSQL
-   tenant-isolation output.
-4. Backup/restore output showing restored ACLs and restricted-role access.
-5. Cloud Logging review and a decision on safe trace attribute redaction.
-6. Incident, scheduler-failure, credential-revocation, and rollback drills.
-7. Auth0 callback/issuer/audience evidence with secret values removed.
-8. Actual usage/cost review; no savings, uptime, or capacity figure may be
-   inferred from the provider's free allowance.
+Completed on 7 September 2026:
+
+1. Remote Terraform state stored in a private, versioned bucket.
+2. Digest-qualified staging images produced by the GitHub deployment workflow.
+3. Application migration completed and API/dashboard machine smoke checks
+   passed.
+4. Auth0 tenant, SPA application, API audience, callback, logout, and web-origin
+   settings configured without committing secret values.
+
+Still required before customer production use:
+
+1. End-to-end human sign-in and organization-access exercise.
+2. Managed-database backup/restore output showing restored ACLs and
+   restricted-role access.
+3. Cloud Logging review and a decision on safe trace attribute redaction.
+4. Incident, scheduler-failure, credential-revocation, and rollback drills.
+5. Actual usage and cost review. Provider free allowances do not establish
+   savings, uptime, or capacity.
 
 The detailed operator procedure is in `deploy/gcp/README.md`.

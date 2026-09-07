@@ -154,13 +154,17 @@ def test_staging_shell_and_neon_bootstrap_fail_closed():
     assert ".neon" in (ROOT / ".gitignore").read_text().splitlines()
 
 
-def test_provider_runbook_does_not_claim_a_live_or_free_guaranteed_system():
+def test_provider_runbook_does_not_claim_a_free_or_production_system():
     runbook = (ROOT / "deploy/gcp/README.md").read_text()
 
     assert "not a zero-cost guarantee" in runbook
     assert "not a production SLA" in runbook
     decision = (ROOT / "docs/deployment-decision-record.md").read_text()
-    assert "await the first deployment" in " ".join(decision.split())
+    normalized_decision = " ".join(decision.split())
+    assert "low-traffic public portfolio staging, not customer production" in (
+        normalized_decision
+    )
+    assert "Still required before customer production use" in decision
     assert "terraform init -migrate-state -force-copy" in runbook
     assert "OpenTelemetry export disabled" in runbook
     assert "Do not ingest real customer traces" in runbook

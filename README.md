@@ -186,10 +186,10 @@ checked fixture and tests. It is not presented as a deployed environment.
 
 The hosted application now has evaluation, container, scanning, SBOM, signed
 provenance, backup/restore, and approval-gated image-promotion definitions. It
-also has a selected provider architecture and approval-gated Cloud Run
-deployment definition. It has not yet been deployed to a public environment;
-the required accounts, secret values, Auth0 callback, managed-database restore,
-and telemetry review remain operator-run work rather than fabricated evidence.
+also has a public Cloud Run staging deployment backed by a migrated PostgreSQL
+database and a configured Auth0 tenant. Machine smoke checks passed. Human
+sign-in, managed-database restore, telemetry review, and incident/rollback
+drills remain operator-run evidence before customer production use.
 
 Prompt text is optional. Hashes, structure, and token counts are enough for the
 main findings. Segment identifiers are keyed HMAC-SHA-256, and multi-tenant
