@@ -46,11 +46,39 @@ def _wait_for_demo() -> None:
 
 
 def _open_workspace(page: Page) -> None:
-    page.goto(f"{URL}#sign-in", wait_until="networkidle")
+    page.goto(f"{URL}#sign-in", wait_until="domcontentloaded")
     page.locator("#development-token").fill(TOKEN)
     page.locator("#development-token-form button[type=submit]").click()
     page.locator("#workspace").wait_for(state="visible")
     page.locator("#overview-content .kpi-grid").wait_for(state="visible")
+
+
+def _install_tour_caption(page: Page) -> None:
+    page.evaluate(
+        """() => {
+          const caption = document.createElement("div");
+          caption.id = "tour-caption";
+          const kicker = document.createElement("span");
+          const title = document.createElement("strong");
+          caption.append(kicker, title);
+          document.body.append(caption);
+        }"""
+    )
+
+
+def _caption(page: Page, kicker: str, title: str) -> None:
+    page.evaluate(
+        """([kicker, title]) => {
+          const caption = document.querySelector("#tour-caption");
+          caption.classList.remove("is-visible");
+          caption.querySelector("span").textContent = kicker;
+          caption.querySelector("strong").textContent = title;
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            caption.classList.add("is-visible");
+          }));
+        }""",
+        [kicker, title],
+    )
 
 
 def _record(
@@ -64,48 +92,82 @@ def _record(
         viewport=VIEWPORT,
         record_video_dir=str(temporary),
         record_video_size=VIEWPORT,
-        reduced_motion="reduce",
+        reduced_motion="no-preference",
     )
     page = context.new_page()
+    recording_started = time.monotonic()
     _open_workspace(page)
-    page.wait_for_timeout(900)
+    trim_start = max(0.0, time.monotonic() - recording_started - 0.15)
+    _install_tour_caption(page)
+    page.wait_for_timeout(400)
     walkthrough(page)
-    page.wait_for_timeout(900)
+    page.wait_for_timeout(650)
     page.screenshot(path=str(MEDIA / poster), type="jpeg", quality=88)
     video = page.video
     context.close()
     if video is None:
         raise RuntimeError("Playwright did not create a recording")
-    shutil.copyfile(video.path(), MEDIA / name)
+    subprocess.run(  # noqa: S603 - fixed local ffmpeg command
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-ss",
+            f"{trim_start:.3f}",
+            "-i",
+            str(video.path()),
+            "-an",
+            "-c:v",
+            "libvpx-vp9",
+            "-crf",
+            "32",
+            "-b:v",
+            "0",
+            "-deadline",
+            "good",
+            "-cpu-used",
+            "2",
+            "-row-mt",
+            "1",
+            "-y",
+            str(MEDIA / name),
+        ],
+        check=True,
+    )
 
 
 def _recommendations(page: Page) -> None:
+    _caption(page, "START WITH THE FEED", "See the workload before chasing savings.")
     page.locator("#overview-content .kpi").nth(3).hover()
-    page.wait_for_timeout(1900)
+    page.wait_for_timeout(1600)
     page.locator('[data-view="recommendations"]').click()
     page.locator("#recommendations-content .recommendation").first.wait_for(
         state="visible"
     )
-    page.wait_for_timeout(3300)
+    _caption(page, "RANKED ACTIONS", "Evidence and quality risk stay attached.")
+    page.wait_for_timeout(2600)
     page.locator("#recommendations-content .recommendation").first.hover()
-    page.wait_for_timeout(3100)
+    page.wait_for_timeout(2200)
     page.locator("#recommendations-content .recommendation").nth(1).hover()
-    page.wait_for_timeout(2700)
+    page.wait_for_timeout(1900)
 
 
 def _operations(page: Page) -> None:
     page.locator('[data-view="operations"]').click()
     page.locator("#operations-content .volume-chart").wait_for(state="visible")
-    page.wait_for_timeout(3500)
+    _caption(page, "REQUEST SIGNALS", "Volume, latency, and outcomes in one view.")
+    page.wait_for_timeout(2500)
     page.locator("#window-select").select_option("24")
     page.locator("#operations-content .volume-chart").wait_for(state="visible")
-    page.wait_for_timeout(2900)
+    page.wait_for_timeout(1900)
     page.locator('[data-view="jobs"]').click()
     page.locator("#jobs-content .job-row").first.wait_for(state="visible")
-    page.wait_for_timeout(3900)
+    _caption(page, "INGESTION HEALTH", "Jobs, retries, and source status stay visible.")
+    page.wait_for_timeout(2600)
     page.locator('[data-view="operations"]').click()
     page.locator("#operations-content .volume-chart").wait_for(state="visible")
-    page.wait_for_timeout(1200)
+    _caption(page, "REQUEST SIGNALS", "Volume, latency, and outcomes in one view.")
+    page.wait_for_timeout(900)
 
 
 def main() -> int:
