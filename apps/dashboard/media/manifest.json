@@ -1,0 +1,50 @@
+{
+  "schema": "cacheeconomics.dashboard-media",
+  "schema_version": 1,
+  "captured_at": "2026-09-07T12:16:00+04:00",
+  "source_revision": "1f9421d2ef3f7a1c3c293b70004e905cae545d0f",
+  "packet": {
+    "path": "demo/fixtures/portfolio-demo-v1.json",
+    "sha256": "b467553e13c7a436d930cb647bde6b9e7fde2631d70d1b3de75478cb2001e0f9"
+  },
+  "label": "synthetic local demonstration",
+  "viewport": {
+    "width": 1280,
+    "height": 720
+  },
+  "artifacts": [
+    {
+      "path": "apps/dashboard/media/recommendations-tour-poster.jpg",
+      "kind": "poster",
+      "view": "recommendations",
+      "sha256": "c774e69d8f2f4aae4b3269e7dcf79958d4fe7a97b1d6f834dabcc18581bd9f84"
+    },
+    {
+      "path": "apps/dashboard/media/recommendations-tour.webm",
+      "kind": "video",
+      "view": "recommendations",
+      "duration_seconds": 30.64,
+      "sha256": "72202cc4bc226617624051f5f359060d617b16dfeb1322da83261879a3b2bd36"
+    },
+    {
+      "path": "apps/dashboard/media/operations-tour-poster.jpg",
+      "kind": "poster",
+      "view": "operations",
+      "sha256": "b039ca8d7fb33b8bfa525f2498ebb7796791b75d58dfc9560809a72c49de9b93"
+    },
+    {
+      "path": "apps/dashboard/media/operations-tour.webm",
+      "kind": "video",
+      "view": "operations",
+      "duration_seconds": 32.16,
+      "sha256": "4d873f0552be747a5d47466e6465924dc022e91c4bceb9db8a700c472ceb9526"
+    }
+  ],
+  "social_preview": {
+    "path": "apps/dashboard/media/social-preview.png",
+    "width": 1200,
+    "height": 630,
+    "source": "OpenAI built-in image generation; mechanically cropped to the published aspect ratio",
+    "sha256": "fe129e5830c02024b7e7ab67ddee0e4d4047e4066923f9f798b6b9e7a92670e0"
+  }
+}

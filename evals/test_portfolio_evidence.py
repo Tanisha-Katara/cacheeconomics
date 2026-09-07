@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKET_PATH = ROOT / "demo/fixtures/portfolio-demo-v1.json"
+MEDIA_MANIFEST_PATH = ROOT / "apps/dashboard/media/manifest.json"
 
 
 def _read(relative_path: str) -> str:
@@ -40,6 +42,33 @@ def test_case_study_numbers_are_derived_from_the_packet():
     assert f"| Input served from cache | {ratios['input_from_cache']:.1%} |" in case_study
     assert f"| Prefix efficiency | {ratios['prefix_efficiency']:.1%} |" in case_study
     assert ", ".join(f"`{code}`" for code in checks["finding_codes"]) in case_study
+
+
+def test_published_dashboard_media_matches_its_manifest():
+    manifest = json.loads(MEDIA_MANIFEST_PATH.read_text())
+
+    assert manifest["schema"] == "cacheeconomics.dashboard-media"
+    assert re.fullmatch(r"[0-9a-f]{40}", manifest["source_revision"])
+    assert manifest["label"] == "synthetic local demonstration"
+    assert manifest["viewport"] == {"width": 1280, "height": 720}
+    packet = ROOT / manifest["packet"]["path"]
+    assert hashlib.sha256(packet.read_bytes()).hexdigest() == manifest["packet"][
+        "sha256"
+    ]
+
+    for artifact in manifest["artifacts"]:
+        path = ROOT / artifact["path"]
+        assert path.is_file()
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == artifact["sha256"]
+        assert artifact["view"] in {"recommendations", "operations"}
+        if artifact["kind"] == "video":
+            assert 0 < artifact["duration_seconds"] < 45
+
+    social = manifest["social_preview"]
+    social_path = ROOT / social["path"]
+    assert social_path.is_file()
+    assert hashlib.sha256(social_path.read_bytes()).hexdigest() == social["sha256"]
+    assert (social["width"], social["height"]) == (1200, 630)
 
 
 def test_portfolio_docs_separate_completed_and_pending_deployment_evidence():
