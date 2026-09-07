@@ -72,6 +72,16 @@ postgresql+psycopg://cacheeconomics_app:PASSWORD@HOST/cacheeconomics?sslmode=req
 postgresql+psycopg://cacheeconomics_worker:PASSWORD@HOST/cacheeconomics?sslmode=require
 ```
 
+For trusted automation, the same script accepts passwords through environment
+variables rather than command-line arguments. Set three different generated
+values in `CACHEECONOMICS_MIGRATOR_PASSWORD`, `CACHEECONOMICS_APP_PASSWORD`, and
+`CACHEECONOMICS_WORKER_PASSWORD`, then add
+`--set=cacheeconomics_passwords_from_environment=1` to the `psql` command. The
+script fails closed if any resulting role has elevated attributes or inherits
+Neon's managed `neon_superuser` role. Create these restricted roles through the
+SQL script, not the Neon Console, CLI, or API, because Neon grants managed
+superuser membership to control-plane-created roles.
+
 Keep the role passwords in a password manager only long enough to add their
 URLs to Secret Manager. The migrations own database objects; the API and worker
 roles are restricted and cannot bypass row-level security.

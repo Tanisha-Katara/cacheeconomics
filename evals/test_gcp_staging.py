@@ -125,10 +125,18 @@ def test_staging_shell_and_neon_bootstrap_fail_closed():
     neon = (ROOT / "deploy/gcp/bootstrap_neon_roles.sql").read_text()
     assert "current_database() = 'cacheeconomics'" in neon
     assert neon.count("\\password cacheeconomics_") == 3
-    assert "REVOKE neon_superuser" in neon
-    assert neon.count("NOBYPASSRLS") == 3
+    assert neon.count("\\getenv cacheeconomics_") == 3
+    assert "cacheeconomics_passwords_from_environment" in neon
+    assert "REVOKE neon_superuser" not in neon
+    assert "managed owner cannot revoke" in neon
+    assert "runtime database roles are over-privileged" in neon
+    assert "runtime roles must not inherit neon_superuser" in neon
+    assert "rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolbypassrls" in neon
+    assert "ALTER ROLE cacheeconomics_migrator NOSUPERUSER" not in neon
     assert "dev-only" not in neon
     assert "PASSWORD '" not in neon
+
+    assert ".neon" in (ROOT / ".gitignore").read_text().splitlines()
 
 
 def test_provider_runbook_does_not_claim_a_live_or_free_guaranteed_system():
