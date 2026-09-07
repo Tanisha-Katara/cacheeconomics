@@ -83,7 +83,7 @@
             <div class="preview-layout">
               <div class="preview-rail" aria-hidden="true">
                 <span class="preview-rail-logo"></span>
-                <span class="is-active"></span><span></span><span></span><span></span>
+                <span class="is-active">▦</span><span>↗</span><span>⌁</span><span>◷</span>
               </div>
               <div class="preview-main">
                 <div class="preview-heading">
@@ -94,14 +94,20 @@
                   <div><span>Requests analyzed</span><strong>286</strong><small>Accepted usage events</small></div>
                   <div><span>Cached input</span><strong>16.7%</strong><small>Share of input tokens</small></div>
                   <div><span>Recommended fixes</span><strong>4</strong><small>Ranked by likely impact</small></div>
-                  <div class="withheld"><span>Estimated savings</span><strong>Not available</strong><small>No pricing data supplied</small></div>
+                  <div class="pricing-needed"><span>Savings estimate</span><strong>Add pricing</strong><small>Use your contract rates</small></div>
                 </div>
                 <div class="preview-lower">
                   <div class="preview-chart">
-                    <div class="preview-card-title"><strong>Requests analyzed</strong><span>Last 7 days</span></div>
-                    <div class="bar-chart" aria-hidden="true">
-                      <i></i><i></i><i></i><i></i><i></i><i></i>
-                      <i></i><i></i><i></i><i></i><i></i><i></i>
+                    <div class="preview-card-title"><strong>Cached share of input tokens</strong><span>7 days</span></div>
+                    <div class="token-legend" aria-hidden="true"><span class="is-cached">Cached</span><span>Fresh</span></div>
+                    <div class="token-chart" aria-label="Cached input increased from 9 percent on Monday to 17 percent on Sunday">
+                      <span><em>9%</em><i><b></b></i><small>Mon</small></span>
+                      <span><em>11%</em><i><b></b></i><small>Tue</small></span>
+                      <span><em>10%</em><i><b></b></i><small>Wed</small></span>
+                      <span><em>14%</em><i><b></b></i><small>Thu</small></span>
+                      <span><em>13%</em><i><b></b></i><small>Fri</small></span>
+                      <span><em>16%</em><i><b></b></i><small>Sat</small></span>
+                      <span><em>17%</em><i><b></b></i><small>Sun</small></span>
                     </div>
                   </div>
                   <div class="preview-finding">
@@ -113,9 +119,6 @@
               </div>
             </div>
           </div>
-          <p class="preview-caption">
-            Dashboard preview with example data. No customer traffic is shown.
-          </p>
         </div>
       </section>
 
