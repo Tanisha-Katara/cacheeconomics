@@ -51,8 +51,11 @@ def test_portfolio_docs_do_not_claim_missing_deployment_evidence():
     assert "Pending browser capture" in ledger
     assert "Pending staging exercise" in ledger
     normalized_decisions = " ".join(decisions.split())
-    assert "not yet applied" in normalized_decisions
-    assert "Evidence still required before the word “deployed” is used" in decisions
+    assert "Cloud Run workloads await the first deployment" in normalized_decisions
+    assert (
+        "Evidence still required before the hosted application is called “deployed”"
+        in decisions
+    )
     assert "not checked in yet" in tour
     assert "python demo/serve_portfolio_demo.py" in readme
     assert "It is not presented as a deployed environment." in readme
