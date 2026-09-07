@@ -139,21 +139,18 @@ jobs:
         with:
           subject-name: ${{ env.REGISTRY }}/cacheeconomics-api
           subject-digest: ${{ steps.api-image.outputs.digest }}
-          push-to-registry: true
 
       - name: Attest the worker image digest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/cacheeconomics-worker
           subject-digest: ${{ steps.worker-image.outputs.digest }}
-          push-to-registry: true
 
       - name: Attest the dashboard image digest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-name: ${{ env.REGISTRY }}/cacheeconomics-dashboard
           subject-digest: ${{ steps.dashboard-image.outputs.digest }}
-          push-to-registry: true
 
       - name: Deploy migration, services, and scheduled worker by digest
         env:
