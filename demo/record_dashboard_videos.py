@@ -51,6 +51,18 @@ def _open_workspace(page: Page) -> None:
     page.locator("#development-token-form button[type=submit]").click()
     page.locator("#workspace").wait_for(state="visible")
     page.locator("#overview-content .kpi-grid").wait_for(state="visible")
+    page.evaluate(
+        """() => {
+          const organization = document.querySelector("#organization-select option:checked");
+          const source = document.querySelector("#source-select option:checked");
+          if (organization) organization.textContent = "Example workspace";
+          if (source) source.textContent = "Example usage source";
+          const overviewTitle = document.querySelector("#overview-content .section-intro h2");
+          if (overviewTitle) overviewTitle.textContent = "Example usage source";
+          document.querySelector("#user-name").textContent = "Demo user";
+          document.querySelector("#user-avatar").textContent = "D";
+        }"""
+    )
 
 
 def _install_tour_caption(page: Page) -> None:
@@ -97,7 +109,7 @@ def _record(
     page = context.new_page()
     recording_started = time.monotonic()
     _open_workspace(page)
-    trim_start = max(0.0, time.monotonic() - recording_started - 0.15)
+    trim_start = max(0.0, time.monotonic() - recording_started)
     _install_tour_caption(page)
     page.wait_for_timeout(400)
     walkthrough(page)
@@ -137,14 +149,14 @@ def _record(
 
 
 def _recommendations(page: Page) -> None:
-    _caption(page, "START WITH THE FEED", "See the workload before chasing savings.")
+    _caption(page, "CURRENT USAGE", "See cache reads, writes, and fresh input.")
     page.locator("#overview-content .kpi").nth(3).hover()
     page.wait_for_timeout(1600)
     page.locator('[data-view="recommendations"]').click()
     page.locator("#recommendations-content .recommendation").first.wait_for(
         state="visible"
     )
-    _caption(page, "RANKED ACTIONS", "Evidence and quality risk stay attached.")
+    _caption(page, "TOP RECOMMENDATION", "See the problem and the change to test.")
     page.wait_for_timeout(2600)
     page.locator("#recommendations-content .recommendation").first.hover()
     page.wait_for_timeout(2200)
@@ -155,18 +167,18 @@ def _recommendations(page: Page) -> None:
 def _operations(page: Page) -> None:
     page.locator('[data-view="operations"]').click()
     page.locator("#operations-content .volume-chart").wait_for(state="visible")
-    _caption(page, "REQUEST SIGNALS", "Volume, latency, and outcomes in one view.")
+    _caption(page, "REQUEST HEALTH", "See volume, response time, and errors.")
     page.wait_for_timeout(2500)
     page.locator("#window-select").select_option("24")
     page.locator("#operations-content .volume-chart").wait_for(state="visible")
     page.wait_for_timeout(1900)
     page.locator('[data-view="jobs"]').click()
     page.locator("#jobs-content .job-row").first.wait_for(state="visible")
-    _caption(page, "INGESTION HEALTH", "Jobs, retries, and source status stay visible.")
+    _caption(page, "DATA DELIVERY", "Check imports, retries, and source status.")
     page.wait_for_timeout(2600)
     page.locator('[data-view="operations"]').click()
     page.locator("#operations-content .volume-chart").wait_for(state="visible")
-    _caption(page, "REQUEST SIGNALS", "Volume, latency, and outcomes in one view.")
+    _caption(page, "REQUEST HEALTH", "See volume, response time, and errors.")
     page.wait_for_timeout(900)
 
 

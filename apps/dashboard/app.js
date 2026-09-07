@@ -25,10 +25,10 @@ const state = {
 };
 
 const views = {
-  overview: { title: "Overview", kicker: "CONTROL ROOM" },
-  recommendations: { title: "Recommendations", kicker: "EVIDENCE → ACTION" },
-  operations: { title: "Operations", kicker: "REQUEST SIGNALS" },
-  jobs: { title: "Jobs & health", kicker: "INGESTION CONTROL" },
+  overview: { title: "Overview", kicker: "CACHE PERFORMANCE" },
+  recommendations: { title: "Recommendations", kicker: "WHAT TO FIX" },
+  operations: { title: "Operations", kicker: "REQUEST HEALTH" },
+  jobs: { title: "Jobs & health", kicker: "DATA DELIVERY" },
 };
 
 class ApiError extends Error {
@@ -645,7 +645,7 @@ function renderOverview(loading = false) {
   const ratios = body?.ratios || {};
   root.append(sectionIntro(
     currentSource()?.name || "Selected source",
-    "Cost figures keep their server-side release state. Withheld values are never reconstructed in the browser.",
+    "See cache use, estimated spend, and source health for the latest completed analysis.",
     state.analysis ? `Analysis created ${timestamp(state.analysis.created_at)}` : "No completed analysis",
   ));
 
@@ -666,7 +666,7 @@ function renderOverview(loading = false) {
   const lower = element("div", "overview-grid");
   const healthCard = element("article", "card");
   const healthHead = element("div", "card-head");
-  healthHead.append(element("h3", "", "Health signals"), element("span", "", "Direct observations only"));
+  healthHead.append(element("h3", "", "Current status"), element("span", "", "Source and analysis health"));
   const healthBody = element("div", "card-body alert-list");
   sourceAlerts().forEach((alert) => {
     const row = element("div", `health-alert ${alert.tone}`);
@@ -682,7 +682,7 @@ function renderOverview(loading = false) {
 
   const factsCard = element("article", "card");
   const factsHead = element("div", "card-head");
-  factsHead.append(element("h3", "", "Evidence record"), body ? badge(titleCase(body.tier), "info") : badge("empty", "neutral"));
+  factsHead.append(element("h3", "", "Analysis details"), body ? badge(titleCase(body.tier), "info") : badge("empty", "neutral"));
   const factsBody = element("div", "card-body");
   const facts = element("dl", "source-facts");
   [
@@ -711,7 +711,7 @@ function renderRecommendations(loading = false) {
     return;
   }
   if (!state.sourceId) {
-    root.append(statePanel("↗", "No source selected", "Select a source to see its evidence-backed recommendations."));
+    root.append(statePanel("↗", "No source selected", "Select a source to see its cache recommendations."));
     return;
   }
   const body = analysisBody();
@@ -722,11 +722,11 @@ function renderRecommendations(loading = false) {
   const findings = Array.isArray(body.findings) ? body.findings : [];
   root.append(sectionIntro(
     findings.length ? `${findings.length} ranked recommendation${findings.length === 1 ? "" : "s"}` : "No recommendation returned",
-    "Each action preserves the analyzer’s evidence class, quality warning, and cost-release gate.",
+    "Each recommendation explains the observed problem, suggested change, and response-quality risk.",
     `Registry ${state.analysis.result.registry?.sha256?.slice(0, 10) || "not recorded"}`,
   ));
   if (!findings.length) {
-    root.append(statePanel("✓", "Nothing to act on in this result", "This is the analyzer’s current result, not a promise that the workload is fully optimized."));
+    root.append(statePanel("✓", "No cache issue found", "Check again after more traffic arrives or after the workload changes."));
   } else {
     const list = element("div", "recommendation-list");
     findings.forEach((finding, index) => {
@@ -1043,7 +1043,7 @@ function updateRoiCalculator() {
   byId("roi-repeat-display").textContent = percent(repeatShare);
   byId("roi-discount-display").textContent = percent(discount);
   byId("roi-baseline-chart").textContent = currency(baseline);
-  byId("roi-percent").textContent = `${percent(reduction)} of standard-rate input spend`;
+  byId("roi-percent").textContent = `${percent(reduction)} of monthly input-token spend`;
 
   animateEstimate(byId("roi-monthly"), monthlySavings, currency);
   animateEstimate(byId("roi-projected"), projected, currency);

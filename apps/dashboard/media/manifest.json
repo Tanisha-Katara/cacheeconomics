@@ -1,8 +1,8 @@
 {
   "schema": "cacheeconomics.dashboard-media",
   "schema_version": 1,
-  "captured_at": "2026-09-07T13:46:32+04:00",
-  "source_revision": "b998713ecb56645b8d4f98b102fcc07d684b388b",
+  "captured_at": "2026-09-07T21:14:02+04:00",
+  "source_revision": "41bb0f34d1bd621782f0373a92c626a2776f620e",
   "packet": {
     "path": "demo/fixtures/portfolio-demo-v1.json",
     "sha256": "b467553e13c7a436d930cb647bde6b9e7fde2631d70d1b3de75478cb2001e0f9"
@@ -17,34 +17,34 @@
       "path": "apps/dashboard/media/recommendations-tour-poster.jpg",
       "kind": "poster",
       "view": "recommendations",
-      "sha256": "5acbbac72abc284e2d3e18e0abe9f3564a1a3d66a2c6f542a7209466fb23cbcc"
+      "sha256": "c62739d2db2f7b1672c4afe246b56a21573c854db9d3c0063cec224b32f5a006"
     },
     {
       "path": "apps/dashboard/media/recommendations-tour.webm",
       "kind": "video",
       "view": "recommendations",
-      "duration_seconds": 11.52,
-      "sha256": "87b29270a8df0ee5745652eea11db29a524900874a0feac26866b8ebdec2974a"
+      "duration_seconds": 12.92,
+      "sha256": "de95c6de6ffada6e8743004916ea75ac30e162db40e20b39002baba432cd3282"
     },
     {
       "path": "apps/dashboard/media/operations-tour-poster.jpg",
       "kind": "poster",
       "view": "operations",
-      "sha256": "13c15e2dd9e144cf4da3ac5a80cdb6e32d3518d7d26beed26d1755fd48def6c3"
+      "sha256": "40b6119cc7b54d9bdb6624671f7a71a70f35d0ec1900cc166f674814210fa9e7"
     },
     {
       "path": "apps/dashboard/media/operations-tour.webm",
       "kind": "video",
       "view": "operations",
-      "duration_seconds": 11.6,
-      "sha256": "2726d2e4178d0fe1c85051efa576c933b20bc2feb01a292ccf0ed94bd9754960"
+      "duration_seconds": 10.52,
+      "sha256": "76cd14b6bd5780c834f106f09fbf10073917ea293e5272da5dc4ab9a6bb32097"
     }
   ],
   "social_preview": {
     "path": "apps/dashboard/media/social-preview.png",
     "width": 1200,
     "height": 630,
-    "source": "OpenAI built-in image generation; mechanically cropped to the published aspect ratio",
-    "sha256": "fe129e5830c02024b7e7ab67ddee0e4d4047e4066923f9f798b6b9e7a92670e0"
+    "source": "OpenAI built-in image generation; resized to the published aspect ratio",
+    "sha256": "7da0c4a144b2e65c7a9e34b032c4704415b34e38e37b9dddb2e051e7f8958e62"
   }
 }

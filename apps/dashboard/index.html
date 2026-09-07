@@ -7,12 +7,12 @@
     <meta name="theme-color" content="#173c36">
     <meta
       name="description"
-      content="CacheEconomics finds broken prompt-cache reuse, ranks practical fixes, and keeps cost claims behind evidence gates."
+      content="CacheEconomics shows where LLM prompt caching misses repeated input, what it may cost, and which fix to test first."
     >
-    <meta property="og:title" content="CacheEconomics — prompt-cache cost intelligence">
+    <meta property="og:title" content="CacheEconomics — find prompt-cache savings">
     <meta
       property="og:description"
-      content="Find where LLM cache reuse breaks down and which changes are worth testing."
+      content="Measure prompt-cache use, find missed savings, and get a practical list of fixes for your LLM workload."
     >
     <meta property="og:type" content="website">
     <meta
@@ -21,9 +21,9 @@
     >
     <meta property="og:image:width" content="1200">
     <meta property="og:image:height" content="630">
-    <meta property="og:image:alt" content="CacheEconomics — Spend less on repeated context.">
+    <meta property="og:image:alt" content="CacheEconomics — Cut LLM costs with better prompt caching.">
     <meta name="twitter:card" content="summary_large_image">
-    <title>CacheEconomics — prompt-cache cost intelligence</title>
+    <title>CacheEconomics — find prompt-cache savings</title>
     <link rel="icon" href="/favicon.svg" type="image/svg+xml">
     <link rel="stylesheet" href="/styles.css">
     <script src="/app.js" defer></script>
@@ -57,28 +57,28 @@
 
       <section id="top" class="hero section-shell">
         <div class="hero-copy reveal">
-          <p class="eyebrow">PROMPT-CACHE COST INTELLIGENCE</p>
-          <h1>Spend less on repeated context.</h1>
+          <p class="eyebrow">LLM PROMPT-CACHE ANALYTICS</p>
+          <h1>Cut LLM costs with better prompt caching.</h1>
           <p class="hero-lede">
-            Find where prompt-cache reuse breaks, what it costs, and which
-            engineering change is worth testing first.
+            CacheEconomics analyzes LiteLLM usage metadata, shows where repeated
+            input misses the cache, and recommends the first fix to test.
           </p>
           <div class="hero-actions">
-            <a class="button button-primary button-large" href="#calculator">Estimate savings</a>
-            <a class="button button-secondary button-large" href="#demo">See the product</a>
+            <a class="button button-primary button-large" href="#calculator">Estimate your savings</a>
+            <a class="button button-secondary button-large" href="#demo">Watch the dashboard tour</a>
           </div>
           <ul class="hero-proof" aria-label="Product safeguards">
-            <li><span aria-hidden="true">✓</span> Prompt bodies rejected</li>
-            <li><span aria-hidden="true">✓</span> Provider facts source-dated</li>
-            <li><span aria-hidden="true">✓</span> Core library stays offline</li>
+            <li><span aria-hidden="true">✓</span> Works with LiteLLM today</li>
+            <li><span aria-hidden="true">✓</span> Prompt and response text rejected</li>
+            <li><span aria-hidden="true">✓</span> Open-source analyzer runs offline</li>
           </ul>
         </div>
 
-        <div class="hero-product reveal" aria-label="Synthetic dashboard preview">
+        <div class="hero-product reveal" aria-label="Dashboard preview using example data">
           <div class="preview-window">
             <div class="preview-bar">
               <span class="preview-brand"><i></i> CacheEconomics</span>
-              <span class="badge badge-info">Synthetic walkthrough</span>
+              <span class="badge badge-info">Example data</span>
             </div>
             <div class="preview-layout">
               <div class="preview-rail" aria-hidden="true">
@@ -91,71 +91,67 @@
                   <span class="health-pill"><i></i> Receiving data</span>
                 </div>
                 <div class="preview-kpis">
-                  <div><span>Accepted events</span><strong>286</strong><small>Checked synthetic trace</small></div>
-                  <div><span>Input from cache</span><strong>16.7%</strong><small>Observed token ratio</small></div>
-                  <div><span>Ranked findings</span><strong>4</strong><small>Evidence-labelled actions</small></div>
-                  <div class="withheld"><span>Monthly impact</span><strong>Withheld</strong><small>No invoice supplied</small></div>
+                  <div><span>Requests analyzed</span><strong>286</strong><small>Accepted usage events</small></div>
+                  <div><span>Cached input</span><strong>16.7%</strong><small>Share of input tokens</small></div>
+                  <div><span>Recommended fixes</span><strong>4</strong><small>Ranked by likely impact</small></div>
+                  <div class="withheld"><span>Estimated savings</span><strong>Not available</strong><small>No pricing data supplied</small></div>
                 </div>
                 <div class="preview-lower">
                   <div class="preview-chart">
-                    <div class="preview-card-title"><strong>Request signals</strong><span>7 days</span></div>
+                    <div class="preview-card-title"><strong>Requests analyzed</strong><span>Last 7 days</span></div>
                     <div class="bar-chart" aria-hidden="true">
-                      <i style="--h:28%"></i><i style="--h:43%"></i><i style="--h:38%"></i>
-                      <i style="--h:62%"></i><i style="--h:56%"></i><i style="--h:78%"></i>
-                      <i style="--h:68%"></i><i style="--h:88%"></i><i style="--h:73%"></i>
-                      <i style="--h:96%"></i><i style="--h:82%"></i><i style="--h:90%"></i>
+                      <i></i><i></i><i></i><i></i><i></i><i></i>
+                      <i></i><i></i><i></i><i></i><i></i><i></i>
                     </div>
                   </div>
                   <div class="preview-finding">
                     <div class="preview-card-title"><strong>Top action</strong><span>TTL-1</span></div>
-                    <p>Test a longer cache lifetime for the stable prefix.</p>
-                    <span class="evidence-tag">STRUCTURAL EVIDENCE</span>
+                    <p>Keep stable instructions together so more requests can reuse them.</p>
+                    <span class="evidence-tag">BASED ON REQUEST STRUCTURE</span>
                   </div>
                 </div>
               </div>
             </div>
           </div>
           <p class="preview-caption">
-            Real dashboard contract · checked synthetic data · monetary values withheld
+            Dashboard preview with example data. No customer traffic is shown.
           </p>
         </div>
       </section>
 
       <div class="trust-strip" aria-label="Project credibility">
-        <span>Apache-2.0 source</span>
-        <span>Prompt-free ingest schema</span>
-        <span>Reproducible evaluation packet</span>
-        <span>Scanned, digest-pinned deployments</span>
+        <span>Live LiteLLM callback</span>
+        <span>Prompt and response text rejected</span>
+        <span>Multi-tenant access controls</span>
+        <span>Open-source core</span>
       </div>
 
       <section id="product" class="section-shell product-section">
         <div class="section-heading reveal">
-          <p class="eyebrow">THE QUESTIONS THAT MATTER</p>
-          <h2>Know where cache value leaks.</h2>
-          <p>
-            Follow the cost, the cause, and the next action in one view.
-          </p>
+          <p class="eyebrow">WHAT CACHEECONOMICS SHOWS</p>
+          <h2>Where repeated input is missing the cache.</h2>
+          <p>System prompts, tool definitions, documents, and conversation history often repeat. See how much is reused and what still pays the standard input rate.</p>
         </div>
         <div class="outcome-grid">
           <article class="outcome-card reveal">
             <span class="outcome-number">01</span>
-            <h3>See the write/read balance</h3>
-            <p>Separate writes, reads, fresh input, and output.</p>
+            <h3>Measure cache use</h3>
+            <p>See fresh input, cache writes, cache reads, and output tokens.</p>
           </article>
           <article class="outcome-card reveal">
             <span class="outcome-number">02</span>
-            <h3>Find broken reuse windows</h3>
-            <p>Match stable prefixes and request cadence to the right TTL.</p>
+            <h3>Find missed reuse</h3>
+            <p>Spot repeated input that expires or changes before it can be reused.</p>
           </article>
           <article class="outcome-card reveal">
             <span class="outcome-number">03</span>
-            <h3>Keep money defensible</h3>
-            <p>See the evidence behind every released cost figure.</p>
+            <h3>Estimate financial impact</h3>
+            <p>Apply your pricing to measured traffic and see how each estimate was calculated.</p>
           </article>
           <article class="outcome-card reveal">
             <span class="outcome-number">04</span>
-            <h3>Watch the pipeline</h3>
-            <p>Track volume, latency, errors, jobs, and ingestion lag.</p>
+            <h3>Monitor data delivery</h3>
+            <p>Track request volume, latency, errors, analysis jobs, and ingestion lag.</p>
           </article>
         </div>
       </section>
@@ -163,53 +159,62 @@
       <section id="calculator" class="calculator-section">
         <div class="section-shell">
           <div class="section-heading calculator-heading reveal">
-            <p class="eyebrow">QUICK ESTIMATE</p>
-            <h2>See the opportunity in seconds.</h2>
-            <p>Move three sliders. Start with the example or use your own workload.</p>
+            <p class="eyebrow">SAVINGS CALCULATOR</p>
+            <h2>Estimate your prompt-caching savings.</h2>
+            <p>Use three numbers from your LLM bill and traffic pattern.</p>
           </div>
 
           <form id="roi-calculator" class="calculator-card reveal">
             <div class="calculator-controls">
               <div class="estimate-label">
-                <span>ILLUSTRATIVE STARTING POINT</span>
-                <strong>Adjust the assumptions</strong>
+                <span>PLANNING ESTIMATE</span>
+                <strong>Enter your workload</strong>
               </div>
-              <label class="range-field">
-                <span><strong>Standard-rate input each month</strong><output id="roi-baseline-display" for="roi-baseline">$25,000</output></span>
-                <input id="roi-baseline" name="baseline" type="range" min="1000" max="250000" step="1000" value="25000">
-              </label>
-              <label class="range-field">
-                <span><strong>Traffic that repeats</strong><output id="roi-repeat-display" for="roi-repeat">50%</output></span>
-                <input id="roi-repeat" name="repeat_share" type="range" min="0" max="90" step="5" value="50">
-              </label>
-              <label class="range-field">
-                <span><strong>Discount when cache reads hit</strong><output id="roi-discount-display" for="roi-discount">90%</output></span>
-                <input id="roi-discount" name="read_discount" type="range" min="0" max="95" step="5" value="90">
-              </label>
-              <p class="calculator-footnote">Example assumptions only. Check the cache-read rate in your provider contract.</p>
+              <div class="range-field">
+                <div class="range-field-head">
+                  <span class="control-label"><label for="roi-baseline"><strong>Monthly input-token spend</strong></label><button class="info-button" type="button" aria-label="Explain monthly input-token spend" aria-describedby="tip-baseline">i</button><span id="tip-baseline" class="metric-tooltip" role="tooltip">What you currently pay each month for tokens sent into your models. Leave out output-token charges.</span></span>
+                  <output id="roi-baseline-display" for="roi-baseline">$25,000</output>
+                </div>
+                <input id="roi-baseline" name="baseline" type="range" min="1000" max="250000" step="1000" value="25000" aria-describedby="tip-baseline">
+              </div>
+              <div class="range-field">
+                <div class="range-field-head">
+                  <span class="control-label"><label for="roi-repeat"><strong>Input tokens that could be reused</strong></label><button class="info-button" type="button" aria-label="Explain reusable input tokens" aria-describedby="tip-repeat">i</button><span id="tip-repeat" class="metric-tooltip" role="tooltip">The share of input tokens repeated across requests while the cache is still valid. Common examples are system instructions, tool definitions, reference documents, and conversation history.</span></span>
+                  <output id="roi-repeat-display" for="roi-repeat">50%</output>
+                </div>
+                <input id="roi-repeat" name="repeat_share" type="range" min="0" max="90" step="5" value="50" aria-describedby="tip-repeat">
+              </div>
+              <div class="range-field">
+                <div class="range-field-head">
+                  <span class="control-label"><label for="roi-discount"><strong>Cache-read price reduction</strong></label><button class="info-button" type="button" aria-label="Explain cache-read price reduction" aria-describedby="tip-discount">i</button><span id="tip-discount" class="metric-tooltip" role="tooltip">How much less a cached input token costs than a standard input token under your provider pricing. If standard input costs $10 and a cache read costs $1, the reduction is 90%.</span></span>
+                  <output id="roi-discount-display" for="roi-discount">90%</output>
+                </div>
+                <input id="roi-discount" name="read_discount" type="range" min="0" max="95" step="5" value="90" aria-describedby="tip-discount">
+              </div>
+              <p class="calculator-footnote">Use input-token charges from your bill. Confirm the cache-read price in your provider contract.</p>
             </div>
 
             <div id="roi-results" class="calculator-visual" aria-live="polite">
               <div class="estimate-primary">
-                <span>POTENTIAL MONTHLY SAVINGS</span>
+                <span>ESTIMATED MONTHLY INPUT SAVINGS</span>
                 <strong id="roi-monthly">$11,250</strong>
-                <small id="roi-percent">45% of standard-rate input spend</small>
+                <small id="roi-percent">45% of monthly input-token spend</small>
               </div>
               <div class="cost-comparison" aria-label="Standard input cost compared with the cache-read scenario">
                 <div class="cost-row">
-                  <span><strong>Standard input</strong><output id="roi-baseline-chart">$25,000</output></span>
+                  <span><strong>Current monthly input cost</strong><output id="roi-baseline-chart">$25,000</output></span>
                   <div class="cost-track"><i id="roi-standard-bar"></i></div>
                 </div>
                 <div class="cost-row cost-row-scenario">
-                  <span><strong>With cache reads</strong><output id="roi-projected">$13,750</output></span>
+                  <span><strong>Estimated after caching</strong><output id="roi-projected">$13,750</output></span>
                   <div class="cost-track"><i id="roi-scenario-bar"></i></div>
                 </div>
               </div>
               <div class="estimate-summary">
-                <span><small>12-month opportunity</small><strong id="roi-annual">$135,000</strong></span>
-                <span><small>Input-cost reduction</small><strong id="roi-reduction">45%</strong></span>
+                <span><small>Estimated annual savings</small><strong id="roi-annual">$135,000</strong></span>
+                <span><small>Monthly cost reduction</small><strong id="roi-reduction">45%</strong></span>
               </div>
-              <p class="calculator-caveat">Rough planning estimate before cache-write premiums, output tokens, volume terms, and implementation cost. The workspace uses measured traffic and stronger evidence gates.</p>
+              <p class="calculator-caveat">Planning estimate. It excludes cache-write charges, output tokens, negotiated rates, and implementation cost.</p>
             </div>
           </form>
         </div>
@@ -218,11 +223,11 @@
       <section id="demo" class="demo-section">
         <div class="section-shell">
           <div class="section-heading section-heading-light reveal">
-            <p class="eyebrow eyebrow-light">PRODUCT TOUR</p>
-            <h2>See the product move.</h2>
+            <p class="eyebrow eyebrow-light">DASHBOARD TOUR</p>
+            <h2>Watch the dashboard find a cache issue.</h2>
             <p>
-              Short tours built from the checked synthetic trace. Dollar values
-              stay withheld because the fixture has no invoice.
+              These short tours use example data, so you can see the workflow
+              without exposing customer traffic.
             </p>
           </div>
           <div class="film-layout reveal">
@@ -239,7 +244,7 @@
                 <source src="/media/recommendations-tour.webm" type="video/webm">
                 Your browser can download the walkthrough from the product repository.
               </video>
-              <div class="film-label"><span>SYNTHETIC PRODUCT WALKTHROUGH</span><span id="film-duration">00:12</span></div>
+              <div class="film-label"><span>EXAMPLE DATA · DASHBOARD TOUR</span><span id="film-duration">00:13</span></div>
             </div>
             <div class="film-chapters" role="tablist" aria-label="Product films">
               <button
@@ -249,11 +254,11 @@
                 aria-selected="true"
                 data-film="/media/recommendations-tour.webm"
                 data-poster="/media/recommendations-tour-poster.jpg"
-                data-duration="00:12"
+                data-duration="00:13"
               >
                 <span>01 · Recommendations</span>
-                <strong>From signal to ranked action.</strong>
-                <small>Evidence, fixes, and quality risk.</small>
+                <strong>See which cache issue to fix first.</strong>
+                <small>Review the observed signal, suggested change, and risk.</small>
               </button>
               <button
                 class="film-chapter"
@@ -262,18 +267,18 @@
                 aria-selected="false"
                 data-film="/media/operations-tour.webm"
                 data-poster="/media/operations-tour-poster.jpg"
-                data-duration="00:12"
+                data-duration="00:11"
               >
                 <span>02 · Operations</span>
-                <strong>Watch the ingestion path.</strong>
-                <small>Volume, latency, jobs, and source health.</small>
+                <strong>Check whether data is arriving.</strong>
+                <small>Monitor request volume, errors, latency, and background jobs.</small>
               </button>
               <a
                 class="film-link"
                 href="https://github.com/Tanisha-Katara/cacheeconomics/blob/main/case-studies/synthetic-hosted-control-plane.md"
                 target="_blank"
                 rel="noopener noreferrer"
-              >Read the synthetic case study <span aria-hidden="true">↗</span></a>
+              >See how the example data was created <span aria-hidden="true">↗</span></a>
             </div>
           </div>
         </div>
@@ -281,25 +286,25 @@
 
       <section id="method" class="section-shell method-section">
         <div class="section-heading reveal">
-          <p class="eyebrow">HOW THE ANALYSIS WORKS</p>
-          <h2>Four steps. Every claim traceable.</h2>
+          <p class="eyebrow">HOW IT WORKS</p>
+          <h2>From LLM requests to practical cache fixes.</h2>
         </div>
         <ol class="method-list">
           <li class="reveal">
             <span>01</span>
-            <div><h3>Observe locally</h3><p>Collect counters, timing, outcomes, and keyed segment fingerprints.</p></div>
+            <div><h3>Collect usage metadata</h3><p>The collector records token counts, timing, outcomes, and private identifiers for repeated prompt sections.</p></div>
           </li>
           <li class="reveal">
             <span>02</span>
-            <div><h3>Validate before storage</h3><p>Reject prompt bodies and every field outside the allow-list.</p></div>
+            <div><h3>Block prompt text</h3><p>Every event is checked before storage. Prompt text, response text, and unknown fields are rejected.</p></div>
           </li>
           <li class="reveal">
             <span>03</span>
-            <div><h3>Analyze offline</h3><p>Evaluate token classes, structure, reuse timing, and dated provider facts.</p></div>
+            <div><h3>Measure cache performance</h3><p>The analyzer compares fresh input, cache writes, cache reads, request timing, and repeated sections.</p></div>
           </li>
           <li class="reveal">
             <span>04</span>
-            <div><h3>Publish the evidence</h3><p>Pair each action with its evidence, quality risk, and release state.</p></div>
+            <div><h3>Rank the next fixes</h3><p>The dashboard explains the observed problem, the change to test, and any risk to response quality.</p></div>
           </li>
         </ol>
       </section>
@@ -308,10 +313,10 @@
         <div class="section-shell security-layout">
           <div class="security-copy reveal">
             <p class="eyebrow eyebrow-light">PRIVACY BOUNDARY</p>
-            <h2>Your prompts stay where your models run.</h2>
+            <h2>Your prompt and response text stay in your environment.</h2>
             <p>
-              Only operational metadata and keyed fingerprints cross the
-              boundary. Prompt and completion bodies are rejected twice.
+              The collector sends token counts, timing, model names, outcomes,
+              and one-way identifiers. It rejects prompt and response text.
             </p>
             <a
               class="button button-on-dark"
@@ -322,17 +327,17 @@
           </div>
           <div class="boundary-diagram reveal" aria-label="Data boundary overview">
             <div class="boundary-zone boundary-local">
-              <span>YOUR ENVIRONMENT</span>
-              <strong>Prompt bodies</strong>
-              <strong>Completion bodies</strong>
-              <strong>Local HMAC key</strong>
+              <span>STAYS WITH YOU</span>
+              <strong>Prompt text</strong>
+              <strong>Response text</strong>
+              <strong>Secret hashing key</strong>
             </div>
-            <div class="boundary-flow" aria-hidden="true"><i></i><span>ALLOW-LISTED SIGNALS</span></div>
+            <div class="boundary-flow" aria-hidden="true"><i></i><span>USAGE METADATA ONLY</span></div>
             <div class="boundary-zone boundary-hosted">
-              <span>HOSTED WORKSPACE</span>
-              <strong>Token counters</strong>
-              <strong>Timing &amp; outcomes</strong>
-              <strong>Keyed fingerprints</strong>
+              <span>SENT TO THE DASHBOARD</span>
+              <strong>Input and output token counts</strong>
+              <strong>Latency and request status</strong>
+              <strong>Private section identifiers</strong>
             </div>
           </div>
         </div>
@@ -340,22 +345,22 @@
 
       <section class="section-shell evidence-section">
         <div class="section-heading reveal">
-          <p class="eyebrow">BUILT FOR SCRUTINY</p>
-          <h2>Inspect the work behind the claim.</h2>
-          <p>Architecture, assumptions, results, and deployment proof live beside the code.</p>
+          <p class="eyebrow">OPEN ENGINEERING</p>
+          <h2>Review how it was built.</h2>
+          <p>The tests, system design, security decisions, and remaining production work are public.</p>
         </div>
         <div class="evidence-grid">
           <a class="evidence-card reveal" href="https://github.com/Tanisha-Katara/cacheeconomics/actions" target="_blank" rel="noopener noreferrer">
-            <span>Continuous verification</span><strong>Tests, privacy checks, and container scans on every change.</strong><i aria-hidden="true">↗</i>
+            <span>Automated tests</span><strong>Privacy checks, regression tests, and container scans run on every change.</strong><i aria-hidden="true">↗</i>
           </a>
           <a class="evidence-card reveal" href="https://github.com/Tanisha-Katara/cacheeconomics/blob/main/docs/architecture.md" target="_blank" rel="noopener noreferrer">
-            <span>Published architecture</span><strong>Tenant boundaries, data flow, and service ownership.</strong><i aria-hidden="true">↗</i>
+            <span>System design</span><strong>See how authentication, organizations, data ingestion, and analysis fit together.</strong><i aria-hidden="true">↗</i>
           </a>
           <a class="evidence-card reveal" href="https://github.com/Tanisha-Katara/cacheeconomics/blob/main/docs/portfolio-evidence.md" target="_blank" rel="noopener noreferrer">
-            <span>Evidence ledger</span><strong>Implemented proof and open production work.</strong><i aria-hidden="true">↗</i>
+            <span>Production readiness</span><strong>See what has been tested, deployed, and left on the readiness checklist.</strong><i aria-hidden="true">↗</i>
           </a>
           <a class="evidence-card reveal" href="https://github.com/Tanisha-Katara/cacheeconomics/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">
-            <span>Open source</span><strong>Apache-2.0 code you can inspect and run locally.</strong><i aria-hidden="true">↗</i>
+            <span>Source code and license</span><strong>Read the Apache-2.0 code or run the analyzer locally.</strong><i aria-hidden="true">↗</i>
           </a>
         </div>
       </section>
@@ -363,43 +368,43 @@
       <section id="faq" class="section-shell faq-section">
         <div class="section-heading reveal">
           <p class="eyebrow">FAQ</p>
-          <h2>Before you connect traffic.</h2>
+          <h2>Common questions.</h2>
         </div>
         <div class="faq-list reveal">
           <details>
-            <summary>What data leaves my environment?<span aria-hidden="true">+</span></summary>
-            <p>Timestamps, token counters, normalized outcome and timing fields, model and surface labels, and locally keyed segment fingerprints. The collector validates that shape before it writes to its local delivery queue.</p>
+            <summary>What can I connect today?<span aria-hidden="true">+</span></summary>
+            <p>You can connect a LiteLLM proxy callback, upload existing LiteLLM JSONL logs, or upload a normalized CacheEconomics trace.</p>
           </details>
           <details>
-            <summary>Does the collector change live requests?<span aria-hidden="true">+</span></summary>
-            <p>The documented LiteLLM setup uses observe-only mode. Marker placement is a separate opt-in behavior that should be evaluated against the workload before use.</p>
+            <summary>Does CacheEconomics read or store my prompts?<span aria-hidden="true">+</span></summary>
+            <p>No. The collector sends usage metadata and one-way identifiers. Prompt text and response text are rejected before they can enter the delivery queue or hosted API.</p>
           </details>
           <details>
-            <summary>Which ingestion paths work today?<span aria-hidden="true">+</span></summary>
-            <p>The implemented live path is a LiteLLM proxy callback. Existing LiteLLM JSONL logs and normalized CacheEconomics traces can also be uploaded explicitly.</p>
+            <summary>How does the savings calculator work?<span aria-hidden="true">+</span></summary>
+            <p>It multiplies monthly input-token spend by the share of reusable input and the cache-read price reduction. The estimate excludes output tokens, cache-write charges, negotiated rates, and implementation cost.</p>
           </details>
           <details>
-            <summary>Why would the dashboard withhold a dollar figure?<span aria-hidden="true">+</span></summary>
-            <p>Monetary results require sufficient request coverage, structural evidence, reconciled usage, and applicable pricing or invoice evidence. The API returns the reason when a value stays withheld.</p>
+            <summary>Why can a dashboard estimate be unavailable?<span aria-hidden="true">+</span></summary>
+            <p>The dashboard needs enough complete request data and applicable pricing or invoice information. When either is missing, it explains what is needed instead of showing an unsupported dollar figure.</p>
           </details>
           <details>
-            <summary>How are teams separated?<span aria-hidden="true">+</span></summary>
-            <p>Every workspace request carries an organization context. Membership and roles are enforced by the API, with PostgreSQL row-level security providing a second tenant boundary.</p>
+            <summary>Can a team share one workspace?<span aria-hidden="true">+</span></summary>
+            <p>Yes. Organizations keep each team’s data separate, and roles control who can view results, manage sources, run analyses, and administer members.</p>
           </details>
           <details>
-            <summary>What is the current deployment meant for?<span aria-hidden="true">+</span></summary>
-            <p>The public environment is a low-traffic portfolio staging system using synthetic data. The runbook lists the backup, telemetry, capacity, and incident exercises required before customer production use.</p>
+            <summary>What data is shown in the public demo?<span aria-hidden="true">+</span></summary>
+            <p>The public demo uses generated test traffic. It lets visitors explore the product without exposing customer prompts, usage, invoices, or performance data.</p>
           </details>
         </div>
       </section>
 
       <section class="closing-section section-shell reveal">
-        <p class="eyebrow eyebrow-light">CACHE ECONOMICS YOU CAN DEFEND</p>
-        <h2>Bring the evidence into one workspace.</h2>
-        <p>Connect a prompt-free source and turn repeated context into ranked, reviewable actions.</p>
+        <p class="eyebrow eyebrow-light">READY TO ANALYZE YOUR TRAFFIC?</p>
+        <h2>Find your biggest cache opportunity.</h2>
+        <p>Connect LiteLLM or upload a usage file. See where cached input is being missed and what to change.</p>
         <div class="closing-actions">
-          <a class="button button-light button-large open-workspace" href="#sign-in">Open workspace</a>
-          <a class="closing-link" href="https://github.com/Tanisha-Katara/cacheeconomics" target="_blank" rel="noopener noreferrer">Review the source <span aria-hidden="true">↗</span></a>
+          <a class="button button-light button-large open-workspace" href="#sign-in">Sign in to the dashboard</a>
+          <a class="closing-link" href="https://github.com/Tanisha-Katara/cacheeconomics" target="_blank" rel="noopener noreferrer">View on GitHub <span aria-hidden="true">↗</span></a>
         </div>
       </section>
 
@@ -420,18 +425,18 @@
           <span>cacheeconomics</span>
         </a>
         <div class="auth-copy">
-          <p class="eyebrow eyebrow-light">YOUR CACHE CONTROL ROOM</p>
-          <h1 id="auth-title">Pick up where the evidence leads.</h1>
+          <p class="eyebrow eyebrow-light">DASHBOARD SIGN-IN</p>
+          <h1 id="auth-title">Sign in to your CacheEconomics workspace.</h1>
           <p>
-            Review spend evidence, cache ratios, ranked recommendations,
-            request latency, and ingestion health for your organization.
+            Review cache use, cost estimates, recommended fixes, request
+            latency, and data-delivery health for your organization.
           </p>
         </div>
         <div class="boundary-card">
           <span class="boundary-icon" aria-hidden="true">◎</span>
           <div>
-            <strong>The local boundary stays intact</strong>
-            <span>The installed Python package remains offline and socket-free.</span>
+            <strong>Prompt text stays in your environment</strong>
+            <span>The installed Python analyzer does not open network connections.</span>
           </div>
         </div>
       </section>
@@ -533,7 +538,7 @@
         <div class="sidebar-foot">
           <div class="privacy-note">
             <span aria-hidden="true">◎</span>
-            <div><strong>Prompt-free view</strong><small>Operational metadata only</small></div>
+            <div><strong>Private usage view</strong><small>Prompt and response text excluded</small></div>
           </div>
           <button id="sign-out" class="sign-out" type="button">Sign out</button>
         </div>
@@ -542,7 +547,7 @@
       <div class="content-shell">
         <header class="topbar">
           <div>
-            <p id="view-kicker" class="eyebrow">CONTROL ROOM</p>
+            <p id="view-kicker" class="eyebrow">CACHE PERFORMANCE</p>
             <h1 id="view-title">Overview</h1>
           </div>
           <div class="topbar-actions">
@@ -576,8 +581,8 @@
         <section id="view-operations" class="view-panel" aria-labelledby="view-title" hidden>
           <div class="view-tools">
             <div>
-              <strong>Received request signals</strong>
-              <span>Times use the collector timestamps; buckets use API receipt time.</span>
+              <strong>Request activity</strong>
+              <span>Request volume, response time, and errors in the selected period.</span>
             </div>
             <label class="window-control" for="window-select">
               Window
