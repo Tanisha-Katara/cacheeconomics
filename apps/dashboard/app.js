@@ -89,6 +89,7 @@ function currency(value) {
     ? new Intl.NumberFormat(undefined, {
       style: "currency",
       currency: "USD",
+      currencyDisplay: "narrowSymbol",
       maximumFractionDigits: Math.abs(value) >= 1000 ? 0 : 2,
     }).format(value)
     : "—";
@@ -999,64 +1000,62 @@ function signOut() {
   window.history.replaceState({}, document.title, `${window.location.pathname}#top`);
 }
 
+function animateEstimate(node, nextValue, formatter) {
+  const previousValue = Number(node.dataset.value ?? nextValue);
+  node.dataset.value = String(nextValue);
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    node.textContent = formatter(nextValue);
+    return;
+  }
+
+  const startedAt = performance.now();
+  const duration = 360;
+  const tick = (now) => {
+    if (node.dataset.value !== String(nextValue)) return;
+    const elapsed = Math.min((now - startedAt) / duration, 1);
+    const eased = 1 - Math.pow(1 - elapsed, 3);
+    node.textContent = formatter(previousValue + ((nextValue - previousValue) * eased));
+    if (elapsed < 1 && node.dataset.value === String(nextValue)) requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+
+function setRangeProgress(input) {
+  const minimum = Number(input.min);
+  const maximum = Number(input.max);
+  const progress = ((Number(input.value) - minimum) / (maximum - minimum)) * 100;
+  input.style.setProperty("--range-progress", `${progress}%`);
+}
+
 function updateRoiCalculator() {
-  const requiredIds = [
-    "roi-baseline",
-    "roi-read-share",
-    "roi-write-share",
-    "roi-read-price",
-    "roi-write-price",
-  ];
-  const raw = Object.fromEntries(requiredIds.map((id) => [id, byId(id).value.trim()]));
-  const resultIds = ["roi-projected", "roi-monthly", "roi-annual", "roi-payback"];
-  const error = byId("roi-error");
-  error.hidden = true;
+  const baselineInput = byId("roi-baseline");
+  const repeatInput = byId("roi-repeat");
+  const discountInput = byId("roi-discount");
+  const baseline = Number(baselineInput.value);
+  const repeatShare = Number(repeatInput.value) / 100;
+  const discount = Number(discountInput.value) / 100;
+  const monthlySavings = baseline * repeatShare * discount;
+  const projected = baseline - monthlySavings;
+  const reduction = baseline === 0 ? 0 : monthlySavings / baseline;
 
-  if (requiredIds.some((id) => raw[id] === "")) {
-    resultIds.forEach((id) => { byId(id).textContent = "—"; });
-    return;
-  }
+  [baselineInput, repeatInput, discountInput].forEach(setRangeProgress);
+  byId("roi-baseline-display").textContent = currency(baseline);
+  byId("roi-repeat-display").textContent = percent(repeatShare);
+  byId("roi-discount-display").textContent = percent(discount);
+  byId("roi-baseline-chart").textContent = currency(baseline);
+  byId("roi-percent").textContent = `${percent(reduction)} of standard-rate input spend`;
 
-  const baseline = Number(raw["roi-baseline"]);
-  const readShare = Number(raw["roi-read-share"]) / 100;
-  const writeShare = Number(raw["roi-write-share"]) / 100;
-  const readPrice = Number(raw["roi-read-price"]) / 100;
-  const writePrice = Number(raw["roi-write-price"]) / 100;
-  const implementation = byId("roi-implementation").value.trim() === ""
-    ? 0
-    : Number(byId("roi-implementation").value);
-  const values = [baseline, readShare, writeShare, readPrice, writePrice, implementation];
+  animateEstimate(byId("roi-monthly"), monthlySavings, currency);
+  animateEstimate(byId("roi-projected"), projected, currency);
+  animateEstimate(byId("roi-annual"), monthlySavings * 12, currency);
+  animateEstimate(byId("roi-reduction"), reduction, percent);
 
-  if (values.some((value) => !Number.isFinite(value) || value < 0)) {
-    error.textContent = "Enter zero or a positive number in each field.";
-    error.hidden = false;
-    resultIds.forEach((id) => { byId(id).textContent = "—"; });
-    return;
-  }
-  if (readShare + writeShare > 1) {
-    error.textContent = "Cache reads and cache writes cannot exceed 100% of input together.";
-    error.hidden = false;
-    resultIds.forEach((id) => { byId(id).textContent = "—"; });
-    return;
-  }
-
-  const uncachedShare = 1 - readShare - writeShare;
-  const projected = baseline * (
-    uncachedShare + (readShare * readPrice) + (writeShare * writePrice)
-  );
-  const monthlyReduction = baseline - projected;
-  const firstYearNet = (monthlyReduction * 12) - implementation;
-  let payback = "No payback";
-  if (monthlyReduction > 0 && implementation === 0) payback = "Immediate";
-  else if (monthlyReduction > 0) payback = `${(implementation / monthlyReduction).toFixed(1)} months`;
-
-  byId("roi-projected").textContent = currency(projected);
-  byId("roi-monthly").textContent = currency(monthlyReduction);
-  byId("roi-annual").textContent = currency(firstYearNet);
-  byId("roi-payback").textContent = payback;
+  byId("roi-standard-bar").style.width = "100%";
+  byId("roi-scenario-bar").style.width = `${Math.max(0, 100 - (reduction * 100))}%`;
 }
 
 function initializeLandingInteractions() {
+  requestAnimationFrame(() => document.documentElement.classList.add("landing-ready"));
   const revealNodes = document.querySelectorAll(".reveal");
   if ("IntersectionObserver" in window) {
     const observer = new IntersectionObserver((entries) => {
@@ -1075,6 +1074,7 @@ function initializeLandingInteractions() {
   const calculator = byId("roi-calculator");
   calculator.addEventListener("input", updateRoiCalculator);
   calculator.addEventListener("submit", (event) => event.preventDefault());
+  updateRoiCalculator();
 
   const film = byId("product-film");
   document.querySelectorAll(".film-chapter").forEach((chapter) => {

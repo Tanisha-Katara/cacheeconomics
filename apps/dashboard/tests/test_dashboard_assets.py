@@ -34,24 +34,31 @@ def test_public_site_explains_the_product_before_sign_in():
     assert "checked synthetic data" in html
 
 
-def test_roi_model_uses_only_visitor_supplied_values():
+def test_roi_model_is_an_adjustable_illustrative_scenario():
     html = _read("index.html")
     javascript = _read("app.js")
 
     for field in (
         "roi-baseline",
-        "roi-read-share",
-        "roi-write-share",
-        "roi-read-price",
-        "roi-write-price",
-        "roi-implementation",
+        "roi-repeat",
+        "roi-discount",
     ):
         assert f'id="{field}"' in html
-    assert 'id="roi-baseline"' in html and 'value="' not in html.split(
-        'id="roi-baseline"', maxsplit=1
-    )[1].split(">", maxsplit=1)[0]
-    assert "readShare + writeShare > 1" in javascript
-    assert "uncachedShare + (readShare * readPrice) + (writeShare * writePrice)" in javascript
+    assert "ILLUSTRATIVE STARTING POINT" in html
+    assert 'id="roi-baseline"' in html and 'value="25000"' in html
+    assert "baseline * repeatShare * discount" in javascript
+    assert "cache-write premiums" in html
+
+
+def test_landing_motion_is_visible_and_respects_reduced_motion():
+    javascript = _read("app.js")
+    stylesheet = _read("styles.css")
+
+    assert 'classList.add("landing-ready")' in javascript
+    assert "requestAnimationFrame" in javascript
+    assert "preview-scan" in stylesheet
+    assert "hero-line-in" in stylesheet
+    assert "prefers-reduced-motion: reduce" in stylesheet
 
 
 def test_product_films_are_checked_in_and_clearly_synthetic():
