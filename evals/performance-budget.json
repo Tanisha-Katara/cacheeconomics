@@ -24,19 +24,24 @@
       "ingestion_median_events_per_second": 3098.8975021799456,
       "ingestion_p95_batch_latency_ms": 32.98412502044812,
       "analysis_p95_latency_ms": 12.959165993379429,
-      "dashboard_raw_bytes": 68789,
-      "dashboard_gzip_bytes": 17699
+      "dashboard_raw_bytes": 121053,
+      "dashboard_gzip_bytes": 28747
+    },
+    "dashboard_measurement": {
+      "recorded_on": "2026-09-07",
+      "environment": "GitHub Actions Ubuntu runner",
+      "reason": "Reviewed public landing page, calculator, and workspace bundle"
     }
   },
   "limits": {
     "ingestion_median_events_per_second_min": 620,
     "ingestion_p95_batch_latency_ms_max": 165,
     "analysis_p95_latency_ms_max": 60,
-    "dashboard_raw_bytes_max": 79000,
-    "dashboard_gzip_bytes_max": 20400
+    "dashboard_raw_bytes_max": 140000,
+    "dashboard_gzip_bytes_max": 33200
   },
   "rationale": {
     "timing": "Timing limits allow up to five times the measured baseline because shared CI runners differ from the recorded machine; the 620 events/second floor is one fifth of the recorded 3098.898 rate, and the 165 ms ingestion ceiling is five times the recorded 32.984 ms latency. They catch large regressions rather than normal runner variation.",
-    "dashboard": "Asset ceilings allow approximately 15 percent growth over the measured transfer sizes and require deliberate review beyond that point."
+    "dashboard": "Asset ceilings allow approximately 15 percent growth over the public product-site transfer sizes measured by GitHub Actions on 2026-09-07 and require deliberate review beyond that point. Video, poster, and social-preview media are excluded from this startup bundle measurement."
   }
 }

@@ -9,7 +9,7 @@ from demo.build_portfolio_packet import (
     DEMO_TOKEN,
     build_packet,
 )
-from demo.serve_portfolio_demo import _api_response, load_packet
+from demo.serve_portfolio_demo import STATIC_FILES, _api_response, load_packet
 
 
 def test_checked_packet_is_rebuilt_by_the_real_synthetic_flow():
@@ -96,3 +96,15 @@ def test_replay_api_supports_each_dashboard_window_but_no_mutations():
     )
     assert status == 405
     assert body["detail"] == "The portfolio packet is read-only."
+
+
+def test_replay_serves_the_generated_product_films():
+    for path in (
+        "/media/recommendations-tour.webm",
+        "/media/recommendations-tour-poster.jpg",
+        "/media/operations-tour.webm",
+        "/media/operations-tour-poster.jpg",
+        "/media/social-preview.png",
+    ):
+        assert STATIC_FILES[path].is_file()
+        assert STATIC_FILES[path].stat().st_size > 1_000

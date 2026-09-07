@@ -21,6 +21,59 @@ def test_dashboard_has_all_phase_three_views_and_states():
         assert state in javascript.lower()
 
 
+def test_public_site_explains_the_product_before_sign_in():
+    html = _read("index.html")
+
+    assert html.index('id="landing-view"') < html.index('id="auth-view"')
+    assert 'id="roi-calculator"' in html
+    assert 'id="demo"' in html
+    assert 'id="security"' in html
+    assert 'id="faq"' in html
+    assert "Spend less on repeated context." in html
+    assert "Prompt bodies rejected" in html
+    assert "checked synthetic data" in html
+
+
+def test_roi_model_uses_only_visitor_supplied_values():
+    html = _read("index.html")
+    javascript = _read("app.js")
+
+    for field in (
+        "roi-baseline",
+        "roi-read-share",
+        "roi-write-share",
+        "roi-read-price",
+        "roi-write-price",
+        "roi-implementation",
+    ):
+        assert f'id="{field}"' in html
+    assert 'id="roi-baseline"' in html and 'value="' not in html.split(
+        'id="roi-baseline"', maxsplit=1
+    )[1].split(">", maxsplit=1)[0]
+    assert "readShare + writeShare > 1" in javascript
+    assert "uncachedShare + (readShare * readPrice) + (writeShare * writePrice)" in javascript
+
+
+def test_product_films_are_checked_in_and_clearly_synthetic():
+    html = _read("index.html")
+    media = DASHBOARD / "media"
+
+    for name in (
+        "recommendations-tour.webm",
+        "recommendations-tour-poster.jpg",
+        "operations-tour.webm",
+        "operations-tour-poster.jpg",
+        "social-preview.png",
+    ):
+        assert (media / name).stat().st_size > 1_000
+        assert f"/media/{name}" in html
+    assert html.count("SYNTHETIC PRODUCT WALKTHROUGH") == 1
+    assert 'property="og:image:width" content="1200"' in html
+    assert 'property="og:image:height" content="630"' in html
+    assert (DASHBOARD / "favicon.svg").is_file()
+    assert 'href="/favicon.svg"' in html
+
+
 def test_tokens_are_not_persisted_or_rendered_as_html():
     javascript = _read("app.js")
 
@@ -61,3 +114,12 @@ def test_dashboard_container_drops_root():
     assert "USER nginx" in dockerfile
     assert "EXPOSE 8080" in dockerfile
     assert 'DASHBOARD_API_ORIGIN="http://api:8000"' in dockerfile
+    assert "COPY apps/dashboard/media /usr/share/nginx/html/media" in dockerfile
+    assert "COPY apps/dashboard/favicon.svg /usr/share/nginx/html/favicon.svg" in dockerfile
+
+
+def test_withheld_money_stays_compact_in_the_interface():
+    javascript = _read("app.js")
+
+    assert 'if (!figure.released || figure.release_state === "withheld") return "Withheld";' in javascript
+    assert "spend?.withheld_because" in javascript

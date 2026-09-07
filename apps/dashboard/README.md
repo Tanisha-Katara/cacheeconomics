@@ -4,6 +4,12 @@ This is the browser application for the networked control plane. It is separate
 from both the installed `cacheeconomics` package and the existing static local
 demo in `web/`.
 
+The public route explains the product, evidence model, supported ingestion
+paths, and privacy boundary before asking a visitor to sign in. It also includes
+a planning calculator that uses only visitor-supplied spend, traffic mix, and
+contract multipliers. The authenticated workspace continues to display only
+server-released monetary figures.
+
 ## Security boundary
 
 - The browser requests only organization-scoped, prompt-free API responses.
@@ -43,3 +49,17 @@ Basic asset checks need no JavaScript packages:
 node --check apps/dashboard/app.js
 python -m pytest -q apps/dashboard/tests
 ```
+
+## Reproducible product films
+
+The two short films in `media/` are recorded from the checked synthetic packet,
+through the real dashboard and loopback replay server. Rebuild them with:
+
+```bash
+uv run --isolated --no-project --with playwright \
+  python demo/record_dashboard_videos.py
+```
+
+They contain no external account, customer data, or production credential. The
+poster and video hashes, packet hash, viewport, and capture label are recorded
+in `media/manifest.json`.

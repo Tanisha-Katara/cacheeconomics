@@ -22,6 +22,14 @@ STATIC_FILES = {
     "/index.html": DASHBOARD / "index.html",
     "/styles.css": DASHBOARD / "styles.css",
     "/app.js": DASHBOARD / "app.js",
+    "/favicon.svg": DASHBOARD / "favicon.svg",
+    "/media/recommendations-tour.webm": DASHBOARD / "media/recommendations-tour.webm",
+    "/media/recommendations-tour-poster.jpg": DASHBOARD
+    / "media/recommendations-tour-poster.jpg",
+    "/media/operations-tour.webm": DASHBOARD / "media/operations-tour.webm",
+    "/media/operations-tour-poster.jpg": DASHBOARD
+    / "media/operations-tour-poster.jpg",
+    "/media/social-preview.png": DASHBOARD / "media/social-preview.png",
 }
 
 

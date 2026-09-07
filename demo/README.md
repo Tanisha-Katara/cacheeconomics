@@ -21,6 +21,20 @@ Open `http://127.0.0.1:8765`, paste the printed token, and use the four views.
 The server binds only to loopback and accepts only the fixed, non-secret demo
 token. It does not connect to any external service.
 
+## Rebuild the public product films
+
+The landing page uses two short WebM recordings of this exact replay. Generate
+the recordings and their 1280×720 posters with:
+
+```sh
+uv run --isolated --no-project --with playwright \
+  python demo/record_dashboard_videos.py
+```
+
+The Recommendations film runs for approximately 31 seconds and the Operations
+film for approximately 32 seconds. Both begin at the explained sign-in boundary
+and retain the synthetic organization and source labels in the workspace.
+
 ## Rebuild and verify the packet
 
 Install the control-plane test dependencies, then run:

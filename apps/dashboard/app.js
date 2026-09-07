@@ -1,5 +1,7 @@
 "use strict";
 
+document.documentElement.classList.add("has-js");
+
 const API_ROOT = "/api";
 const PKCE_VERIFIER_KEY = "cacheeconomics.pkce.verifier";
 const OAUTH_STATE_KEY = "cacheeconomics.oauth.state";
@@ -79,6 +81,16 @@ function percent(value) {
 function milliseconds(value) {
   return typeof value === "number" && Number.isFinite(value)
     ? `${new Intl.NumberFormat(undefined, { maximumFractionDigits: 1 }).format(value)} ms`
+    : "—";
+}
+
+function currency(value) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: Math.abs(value) >= 1000 ? 0 : 2,
+    }).format(value)
     : "—";
 }
 
@@ -247,8 +259,35 @@ function setAuthError(message) {
   node.hidden = false;
 }
 
+function showLanding() {
+  if (state.token) return;
+  byId("workspace").hidden = true;
+  byId("auth-view").hidden = true;
+  byId("landing-view").hidden = false;
+}
+
+function showSignIn() {
+  if (state.token) return;
+  byId("workspace").hidden = true;
+  byId("landing-view").hidden = true;
+  byId("auth-view").hidden = false;
+  window.scrollTo({ top: 0, behavior: "auto" });
+}
+
+function syncPublicRoute() {
+  if (state.token || !byId("workspace").hidden) return;
+  if (window.location.hash === "#sign-in") showSignIn();
+  else showLanding();
+}
+
 async function initializeAuthentication() {
   try {
+    const query = new URLSearchParams(window.location.search);
+    if (query.has("code") || query.has("error") || window.location.hash === "#sign-in") {
+      showSignIn();
+    } else {
+      showLanding();
+    }
     const response = await fetch(`${API_ROOT}/v1/dashboard/config`, {
       headers: { "Accept": "application/json" },
       credentials: "omit",
@@ -257,7 +296,6 @@ async function initializeAuthentication() {
     if (!response.ok) throw new Error("Dashboard configuration is unavailable.");
     state.config = await response.json();
 
-    const query = new URLSearchParams(window.location.search);
     if (query.has("error")) {
       window.history.replaceState({}, document.title, window.location.pathname);
       throw new Error("The identity provider did not complete sign-in.");
@@ -302,6 +340,7 @@ async function openWorkspace() {
   try {
     const me = await api("/v1/me", { organization: false });
     state.me = me;
+    byId("landing-view").hidden = true;
     byId("auth-view").hidden = true;
     byId("workspace").hidden = false;
     byId("user-name").textContent = me.user.display_name || me.user.email || "Signed-in user";
@@ -318,6 +357,7 @@ async function openWorkspace() {
   } catch (error) {
     state.token = null;
     byId("workspace").hidden = true;
+    byId("landing-view").hidden = true;
     byId("auth-view").hidden = false;
     byId("auth-actions").hidden = false;
     setAuthError(error instanceof ApiError && error.status === 401
@@ -519,7 +559,9 @@ function releaseLabel(figure) {
 }
 
 function figureDisplay(figure) {
-  return figure && typeof figure.display === "string" ? figure.display : "Unavailable";
+  if (!figure) return "Unavailable";
+  if (!figure.released || figure.release_state === "withheld") return "Withheld";
+  return typeof figure.display === "string" ? figure.display : "Unavailable";
 }
 
 function kpi(label, value, help, statusBadge = null) {
@@ -950,9 +992,122 @@ function signOut() {
   window.sessionStorage.removeItem(OAUTH_STATE_KEY);
   window.sessionStorage.removeItem(PKCE_VERIFIER_KEY);
   byId("workspace").hidden = true;
-  byId("auth-view").hidden = false;
+  byId("auth-view").hidden = true;
+  byId("landing-view").hidden = false;
   byId("auth-actions").hidden = false;
   byId("auth-error").hidden = true;
+  window.history.replaceState({}, document.title, `${window.location.pathname}#top`);
+}
+
+function updateRoiCalculator() {
+  const requiredIds = [
+    "roi-baseline",
+    "roi-read-share",
+    "roi-write-share",
+    "roi-read-price",
+    "roi-write-price",
+  ];
+  const raw = Object.fromEntries(requiredIds.map((id) => [id, byId(id).value.trim()]));
+  const resultIds = ["roi-projected", "roi-monthly", "roi-annual", "roi-payback"];
+  const error = byId("roi-error");
+  error.hidden = true;
+
+  if (requiredIds.some((id) => raw[id] === "")) {
+    resultIds.forEach((id) => { byId(id).textContent = "—"; });
+    return;
+  }
+
+  const baseline = Number(raw["roi-baseline"]);
+  const readShare = Number(raw["roi-read-share"]) / 100;
+  const writeShare = Number(raw["roi-write-share"]) / 100;
+  const readPrice = Number(raw["roi-read-price"]) / 100;
+  const writePrice = Number(raw["roi-write-price"]) / 100;
+  const implementation = byId("roi-implementation").value.trim() === ""
+    ? 0
+    : Number(byId("roi-implementation").value);
+  const values = [baseline, readShare, writeShare, readPrice, writePrice, implementation];
+
+  if (values.some((value) => !Number.isFinite(value) || value < 0)) {
+    error.textContent = "Enter zero or a positive number in each field.";
+    error.hidden = false;
+    resultIds.forEach((id) => { byId(id).textContent = "—"; });
+    return;
+  }
+  if (readShare + writeShare > 1) {
+    error.textContent = "Cache reads and cache writes cannot exceed 100% of input together.";
+    error.hidden = false;
+    resultIds.forEach((id) => { byId(id).textContent = "—"; });
+    return;
+  }
+
+  const uncachedShare = 1 - readShare - writeShare;
+  const projected = baseline * (
+    uncachedShare + (readShare * readPrice) + (writeShare * writePrice)
+  );
+  const monthlyReduction = baseline - projected;
+  const firstYearNet = (monthlyReduction * 12) - implementation;
+  let payback = "No payback";
+  if (monthlyReduction > 0 && implementation === 0) payback = "Immediate";
+  else if (monthlyReduction > 0) payback = `${(implementation / monthlyReduction).toFixed(1)} months`;
+
+  byId("roi-projected").textContent = currency(projected);
+  byId("roi-monthly").textContent = currency(monthlyReduction);
+  byId("roi-annual").textContent = currency(firstYearNet);
+  byId("roi-payback").textContent = payback;
+}
+
+function initializeLandingInteractions() {
+  const revealNodes = document.querySelectorAll(".reveal");
+  if ("IntersectionObserver" in window) {
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach((entry) => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add("is-visible");
+          observer.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.14 });
+    revealNodes.forEach((node) => observer.observe(node));
+  } else {
+    revealNodes.forEach((node) => node.classList.add("is-visible"));
+  }
+
+  const calculator = byId("roi-calculator");
+  calculator.addEventListener("input", updateRoiCalculator);
+  calculator.addEventListener("submit", (event) => event.preventDefault());
+
+  const film = byId("product-film");
+  document.querySelectorAll(".film-chapter").forEach((chapter) => {
+    chapter.addEventListener("click", async () => {
+      document.querySelectorAll(".film-chapter").forEach((item) => {
+        const selected = item === chapter;
+        item.classList.toggle("is-active", selected);
+        item.setAttribute("aria-selected", String(selected));
+      });
+      film.poster = chapter.dataset.poster;
+      film.src = chapter.dataset.film;
+      byId("film-duration").textContent = chapter.dataset.duration;
+      film.load();
+      try {
+        await film.play();
+      } catch (_error) {
+        // Browser autoplay policy can leave the film paused with controls visible.
+      }
+    });
+  });
+
+  if ("IntersectionObserver" in window && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    const filmObserver = new IntersectionObserver((entries) => {
+      entries.forEach(async (entry) => {
+        if (entry.isIntersecting) {
+          try { await film.play(); } catch (_error) { /* Controls remain available. */ }
+        } else {
+          film.pause();
+        }
+      });
+    }, { threshold: 0.55 });
+    filmObserver.observe(film);
+  }
 }
 
 byId("oidc-sign-in").addEventListener("click", beginOidcSignIn);
@@ -979,10 +1134,12 @@ byId("window-select").addEventListener("change", async (event) => {
 byId("run-analysis").addEventListener("click", runAnalysis);
 byId("refresh-dashboard").addEventListener("click", () => refreshWorkspace(false));
 byId("sign-out").addEventListener("click", signOut);
+window.addEventListener("hashchange", syncPublicRoute);
 document.querySelectorAll(".nav-item").forEach((item) => {
   item.addEventListener("click", () => switchView(item.dataset.view));
 });
 
+initializeLandingInteractions();
 initializeAuthentication();
 
 window.setInterval(() => {

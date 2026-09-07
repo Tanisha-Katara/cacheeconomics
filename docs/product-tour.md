@@ -61,7 +61,10 @@ does not pretend to execute mutations against a live deployment.
 
 ## Screenshot status
 
-The real dashboard packet and browser walkthrough are reproducible. Screenshots
-are not checked in yet and remain a named Phase 5 deliverable. Images must be
-captured from this demo, then recorded with their packet hash and viewport in
-the portfolio evidence manifest; mockups must not be substituted.
+The repository includes 1280×720 Recommendations and Operations posters plus
+the corresponding short WebM tours. They were generated from the real dashboard
+and checked packet on 7 September 2026. `apps/dashboard/media/manifest.json`
+records the packet and artifact hashes, viewport, view, and synthetic label.
+
+The public hero contains a compact illustrative preview built in HTML and CSS.
+The labelled film posters and videos are the reproducible evidence captures.
