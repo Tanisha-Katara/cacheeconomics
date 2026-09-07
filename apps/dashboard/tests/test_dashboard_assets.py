@@ -31,7 +31,8 @@ def test_public_site_explains_the_product_before_sign_in():
     assert 'id="faq"' in html
     assert "Cut LLM costs with better prompt caching." in html
     assert "Prompt and response text rejected" in html
-    assert "Dashboard preview with example data" in html
+    assert "Cached share of input tokens" in html
+    assert "Use your contract rates" in html
 
 
 def test_roi_model_is_an_adjustable_illustrative_scenario():
@@ -90,7 +91,8 @@ def test_dashboard_preview_chart_works_with_the_production_csp():
     stylesheet = _read("styles.css")
 
     assert 'style="--h:' not in html
-    assert ".bar-chart i:nth-child(12) { height: 90%; }" in stylesheet
+    assert html.count("<em>") >= 7
+    assert ".token-chart > span:nth-child(7) b { height: 17%; }" in stylesheet
 
 
 def test_tokens_are_not_persisted_or_rendered_as_html():
