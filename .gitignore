@@ -22,6 +22,10 @@ tier-b/foundry_run_*.jsonl
 *.key
 gha-creds-*.json
 
+# Neon CLI context is local deployment state. It contains the selected project
+# identifier and must not silently select a developer's project for anyone else.
+.neon
+
 # Terraform state contains infrastructure identifiers and can contain secrets.
 **/.terraform/
 *.tfstate

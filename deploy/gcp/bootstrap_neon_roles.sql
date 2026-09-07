@@ -24,16 +24,32 @@ BEGIN
 END
 $$;
 
-\echo 'Enter a unique generated password for the migration role.'
-\password cacheeconomics_migrator
-\echo 'Enter a different generated password for the API role.'
-\password cacheeconomics_app
-\echo 'Enter a third generated password for the worker role.'
-\password cacheeconomics_worker
+-- Interactive password entry is the safe default. A trusted automation process
+-- can opt in to environment-backed values without placing passwords in command
+-- arguments or this file.
+\if :{?cacheeconomics_passwords_from_environment}
+  \getenv cacheeconomics_migrator_password CACHEECONOMICS_MIGRATOR_PASSWORD
+  \getenv cacheeconomics_app_password CACHEECONOMICS_APP_PASSWORD
+  \getenv cacheeconomics_worker_password CACHEECONOMICS_WORKER_PASSWORD
+  ALTER ROLE cacheeconomics_migrator PASSWORD :'cacheeconomics_migrator_password';
+  ALTER ROLE cacheeconomics_app PASSWORD :'cacheeconomics_app_password';
+  ALTER ROLE cacheeconomics_worker PASSWORD :'cacheeconomics_worker_password';
+\else
+  \echo 'Enter a unique generated password for the migration role.'
+  \password cacheeconomics_migrator
+  \echo 'Enter a different generated password for the API role.'
+  \password cacheeconomics_app
+  \echo 'Enter a third generated password for the worker role.'
+  \password cacheeconomics_worker
+\endif
 
-ALTER ROLE cacheeconomics_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
-ALTER ROLE cacheeconomics_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
-ALTER ROLE cacheeconomics_worker NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS;
+-- Neon's managed owner is deliberately not a PostgreSQL superuser, so it may
+-- not spell out NOSUPERUSER or NOBYPASSRLS in ALTER ROLE. Roles created here
+-- through SQL already default to both; the fail-closed assertion below proves
+-- the attributes instead of relying on the default silently.
+ALTER ROLE cacheeconomics_migrator NOCREATEDB NOCREATEROLE NOINHERIT;
+ALTER ROLE cacheeconomics_app NOCREATEDB NOCREATEROLE NOINHERIT;
+ALTER ROLE cacheeconomics_worker NOCREATEDB NOCREATEROLE NOINHERIT;
 ALTER ROLE cacheeconomics_app SET statement_timeout = '15s';
 ALTER ROLE cacheeconomics_app SET lock_timeout = '5s';
 ALTER ROLE cacheeconomics_app SET idle_in_transaction_session_timeout = '30s';
@@ -41,9 +57,43 @@ ALTER ROLE cacheeconomics_worker SET statement_timeout = '60s';
 ALTER ROLE cacheeconomics_worker SET lock_timeout = '5s';
 ALTER ROLE cacheeconomics_worker SET idle_in_transaction_session_timeout = '30s';
 
--- A Neon-created role can otherwise inherit broad managed-service access.
--- REVOKE reports a harmless warning when no such membership exists.
-REVOKE neon_superuser FROM cacheeconomics_migrator, cacheeconomics_app, cacheeconomics_worker;
+-- Roles created through SQL do not receive Neon's managed neon_superuser
+-- membership. The managed owner cannot revoke that protected role, even as a
+-- harmless no-op, so prove non-membership below and abort if Neon ever changes
+-- the SQL-created-role behavior.
+
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM pg_roles
+        WHERE rolname IN (
+            'cacheeconomics_migrator',
+            'cacheeconomics_app',
+            'cacheeconomics_worker'
+        )
+        AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolbypassrls)
+    ) THEN
+        RAISE EXCEPTION 'cacheeconomics runtime database roles are over-privileged';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_auth_members memberships
+        JOIN pg_roles granted_role ON granted_role.oid = memberships.roleid
+        JOIN pg_roles member_role ON member_role.oid = memberships.member
+        WHERE granted_role.rolname = 'neon_superuser'
+        AND member_role.rolname IN (
+            'cacheeconomics_migrator',
+            'cacheeconomics_app',
+            'cacheeconomics_worker'
+        )
+    ) THEN
+        RAISE EXCEPTION 'cacheeconomics runtime roles must not inherit neon_superuser';
+    END IF;
+END
+$$;
+
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 GRANT CONNECT ON DATABASE cacheeconomics TO cacheeconomics_migrator, cacheeconomics_app, cacheeconomics_worker;
 GRANT USAGE, CREATE ON SCHEMA public TO cacheeconomics_migrator;
