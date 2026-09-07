@@ -32,6 +32,7 @@ jobs:
       AUTH0_DOMAIN: ${{ vars.AUTH0_DOMAIN }}
       AUTH0_AUDIENCE: ${{ vars.AUTH0_AUDIENCE }}
       AUTH0_CLIENT_ID: ${{ vars.AUTH0_CLIENT_ID }}
+      DASHBOARD_PUBLIC_URL: ${{ vars.DASHBOARD_PUBLIC_URL }}
       CACHEECONOMICS_SERVICE_PREFIX: ${{ vars.CACHEECONOMICS_SERVICE_PREFIX || 'cacheeconomics' }}
       REGISTRY: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.CACHEECONOMICS_SERVICE_PREFIX || 'cacheeconomics' }}
 

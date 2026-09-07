@@ -1,0 +1,82 @@
+name: configure-gcp-domain
+
+on:
+  workflow_dispatch:
+    inputs:
+      domain:
+        description: Verified custom hostname to map to the staging dashboard
+        required: true
+        type: string
+      confirmation:
+        description: Enter MAP DOMAIN to create or inspect the mapping
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  map-domain:
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'MAP DOMAIN'
+    environment: staging
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOYER_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+      CACHEECONOMICS_SERVICE_PREFIX: ${{ vars.CACHEECONOMICS_SERVICE_PREFIX || 'cacheeconomics' }}
+      CUSTOM_DOMAIN: ${{ inputs.domain }}
+
+    steps:
+      - name: Validate the requested hostname
+        run: |
+          set -eu
+          if ! printf '%s' "$CUSTOM_DOMAIN" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$'; then
+            echo "domain must be a hostname without a scheme, path, or wildcard" >&2
+            exit 2
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Exchange the GitHub OIDC token for short-lived Google credentials
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+
+      - name: Install the Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3
+        with:
+          version: ">= 541.0.0"
+
+      - name: Create the Cloud Run domain mapping
+        run: |
+          set -eu
+          service="${CACHEECONOMICS_SERVICE_PREFIX}-dashboard"
+          if gcloud beta run domain-mappings describe \
+            --project="$GCP_PROJECT_ID" \
+            --region="$GCP_REGION" \
+            --domain="$CUSTOM_DOMAIN" >/dev/null 2>&1
+          then
+            echo "The mapping already exists."
+          else
+            gcloud beta run domain-mappings create \
+              --project="$GCP_PROJECT_ID" \
+              --region="$GCP_REGION" \
+              --service="$service" \
+              --domain="$CUSTOM_DOMAIN" \
+              --quiet
+          fi
+
+      - name: Print the required DNS records and certificate state
+        run: >-
+          gcloud beta run domain-mappings describe
+          --project="$GCP_PROJECT_ID"
+          --region="$GCP_REGION"
+          --domain="$CUSTOM_DOMAIN"
+          --format='yaml(status.conditions,status.resourceRecords)'

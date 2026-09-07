@@ -36,6 +36,19 @@ if ! printf '%s' "$AUTH0_DOMAIN" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-
     exit 2
 fi
 
+dashboard_public_url=${DASHBOARD_PUBLIC_URL:-}
+if [ -n "$dashboard_public_url" ]; then
+    dashboard_public_url=${dashboard_public_url%/}
+    if ! printf '%s' "$dashboard_public_url" | grep -Eq '^https://[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$'; then
+        echo "DASHBOARD_PUBLIC_URL must be an HTTPS origin without a path" >&2
+        exit 2
+    fi
+    dashboard_public_host=${dashboard_public_url#https://}
+    allowed_hosts="[\"*.run.app\",\"${dashboard_public_host}\"]"
+else
+    allowed_hosts='["*.run.app"]'
+fi
+
 prefix=${CACHEECONOMICS_SERVICE_PREFIX:-cacheeconomics}
 if ! printf '%s' "$prefix" | grep -Eq '^[a-z][a-z0-9-]{1,18}[a-z0-9]$'; then
     echo "CACHEECONOMICS_SERVICE_PREFIX must be 3-20 lowercase letters, numbers, or internal hyphens" >&2
@@ -66,8 +79,6 @@ issuer="https://${AUTH0_DOMAIN}/"
 jwks_url="https://${AUTH0_DOMAIN}/.well-known/jwks.json"
 authorization_endpoint="https://${AUTH0_DOMAIN}/authorize"
 token_endpoint="https://${AUTH0_DOMAIN}/oauth/token"
-allowed_hosts='["*.run.app"]'
-
 common_env="^@^CACHEECONOMICS_ENVIRONMENT=production@CACHEECONOMICS_OIDC_ISSUER=${issuer}@CACHEECONOMICS_OIDC_AUDIENCE=${AUTH0_AUDIENCE}@CACHEECONOMICS_OIDC_JWKS_URL=${jwks_url}@CACHEECONOMICS_ALLOWED_HOSTS=${allowed_hosts}@CACHEECONOMICS_DASHBOARD_ALLOW_DEVELOPMENT_TOKEN=false@OTEL_TRACES_EXPORTER=none@OTEL_METRICS_EXPORTER=none@OTEL_LOGS_EXPORTER=none"
 
 echo "Deploying and executing the database migration job"
@@ -135,11 +146,15 @@ dashboard_url=$(gcloud run services describe "$dashboard_service" \
     --region="$GCP_REGION" \
     --format='value(status.url)')
 
+if [ -z "$dashboard_public_url" ]; then
+    dashboard_public_url=$dashboard_url
+fi
+
 echo "Completing the dashboard's Authorization Code with PKCE configuration"
 gcloud run services update "$api_service" \
     --project="$GCP_PROJECT_ID" \
     --region="$GCP_REGION" \
-    --update-env-vars="^@^CACHEECONOMICS_DASHBOARD_OIDC_AUTHORIZATION_ENDPOINT=${authorization_endpoint}@CACHEECONOMICS_DASHBOARD_OIDC_TOKEN_ENDPOINT=${token_endpoint}@CACHEECONOMICS_DASHBOARD_OIDC_CLIENT_ID=${AUTH0_CLIENT_ID}@CACHEECONOMICS_DASHBOARD_REDIRECT_URI=${dashboard_url}/" \
+    --update-env-vars="^@^CACHEECONOMICS_DASHBOARD_OIDC_AUTHORIZATION_ENDPOINT=${authorization_endpoint}@CACHEECONOMICS_DASHBOARD_OIDC_TOKEN_ENDPOINT=${token_endpoint}@CACHEECONOMICS_DASHBOARD_OIDC_CLIENT_ID=${AUTH0_CLIENT_ID}@CACHEECONOMICS_DASHBOARD_REDIRECT_URI=${dashboard_public_url}/" \
     --quiet
 
 echo "Deploying the bounded one-job worker"
@@ -197,9 +212,10 @@ dashboard_config=$(curl --fail --silent --show-error --retry 6 \
     --retry-all-errors --retry-delay 5 \
     "${dashboard_url}/api/v1/dashboard/config")
 printf '%s' "$dashboard_config" | grep -F '"oidc_enabled":true' >/dev/null
-printf '%s' "$dashboard_config" | grep -F "${dashboard_url}/" >/dev/null
+printf '%s' "$dashboard_config" | grep -F "${dashboard_public_url}/" >/dev/null
 
 echo "Staging services are deployed. Interactive Auth0 login still requires"
 echo "the exact callback URL to be registered before sign-in testing."
 echo "STAGING_DASHBOARD_URL=${dashboard_url}"
+echo "PUBLIC_DASHBOARD_URL=${dashboard_public_url}"
 echo "STAGING_API_URL=${api_url}"
