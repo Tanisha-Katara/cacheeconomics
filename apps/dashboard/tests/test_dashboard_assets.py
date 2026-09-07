@@ -29,9 +29,9 @@ def test_public_site_explains_the_product_before_sign_in():
     assert 'id="demo"' in html
     assert 'id="security"' in html
     assert 'id="faq"' in html
-    assert "Spend less on repeated context." in html
-    assert "Prompt bodies rejected" in html
-    assert "checked synthetic data" in html
+    assert "Cut LLM costs with better prompt caching." in html
+    assert "Prompt and response text rejected" in html
+    assert "Dashboard preview with example data" in html
 
 
 def test_roi_model_is_an_adjustable_illustrative_scenario():
@@ -44,10 +44,14 @@ def test_roi_model_is_an_adjustable_illustrative_scenario():
         "roi-discount",
     ):
         assert f'id="{field}"' in html
-    assert "ILLUSTRATIVE STARTING POINT" in html
+    assert "PLANNING ESTIMATE" in html
     assert 'id="roi-baseline"' in html and 'value="25000"' in html
     assert "baseline * repeatShare * discount" in javascript
-    assert "cache-write premiums" in html
+    assert "cache-write charges" in html
+    assert html.count('class="info-button"') == 3
+    assert "Monthly input-token spend" in html
+    assert "Input tokens that could be reused" in html
+    assert "Cache-read price reduction" in html
 
 
 def test_landing_motion_is_visible_and_respects_reduced_motion():
@@ -61,7 +65,7 @@ def test_landing_motion_is_visible_and_respects_reduced_motion():
     assert "prefers-reduced-motion: reduce" in stylesheet
 
 
-def test_product_films_are_checked_in_and_clearly_synthetic():
+def test_product_films_are_checked_in_and_clearly_labelled_as_example_data():
     html = _read("index.html")
     media = DASHBOARD / "media"
 
@@ -74,11 +78,19 @@ def test_product_films_are_checked_in_and_clearly_synthetic():
     ):
         assert (media / name).stat().st_size > 1_000
         assert f"/media/{name}" in html
-    assert html.count("SYNTHETIC PRODUCT WALKTHROUGH") == 1
+    assert html.count("EXAMPLE DATA · DASHBOARD TOUR") == 1
     assert 'property="og:image:width" content="1200"' in html
     assert 'property="og:image:height" content="630"' in html
     assert (DASHBOARD / "favicon.svg").is_file()
     assert 'href="/favicon.svg"' in html
+
+
+def test_dashboard_preview_chart_works_with_the_production_csp():
+    html = _read("index.html")
+    stylesheet = _read("styles.css")
+
+    assert 'style="--h:' not in html
+    assert ".bar-chart i:nth-child(12) { height: 90%; }" in stylesheet
 
 
 def test_tokens_are_not_persisted_or_rendered_as_html():
