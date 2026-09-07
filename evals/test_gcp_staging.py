@@ -73,6 +73,7 @@ def test_github_staging_deploy_uses_short_lived_identity_and_immutable_images():
     assert workflow.count("docker/build-push-action@") == 3
     assert workflow.count("aquasecurity/trivy-action@") == 3
     assert workflow.count("actions/attest@") == 3
+    assert "push-to-registry" not in workflow
     assert workflow.count("@${{ steps.") >= 6
     assert "sh deploy/gcp/deploy_staging.sh" in workflow
 
