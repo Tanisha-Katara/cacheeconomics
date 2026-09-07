@@ -109,6 +109,7 @@ def test_custom_domain_workflow_uses_short_lived_identity_and_exact_confirmation
     assert "inputs.confirmation == 'MAP DOMAIN'" in workflow
     assert "id-token: write" in workflow
     assert "google-github-actions/auth@" in workflow
+    assert "gcloud components install beta --quiet" in workflow
     assert "gcloud beta run domain-mappings create" in workflow
     assert "--domain=\"$CUSTOM_DOMAIN\"" in workflow
     assert "credentials_json" not in workflow

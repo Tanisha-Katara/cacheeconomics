@@ -54,6 +54,9 @@ jobs:
         with:
           version: ">= 541.0.0"
 
+      - name: Install Cloud Run domain-mapping commands
+        run: gcloud components install beta --quiet
+
       - name: Create the Cloud Run domain mapping
         run: |
           set -eu
