@@ -89,22 +89,42 @@ roles are restricted and cannot bypass row-level security.
 ## 3. Bootstrap Google Cloud once
 
 Install Terraform 1.8+ and the Google Cloud CLI, then authenticate locally.
-Copy the example variables file without committing the copy:
+Create a dedicated private GCS bucket for Terraform state before the first
+`terraform init`. Enable uniform bucket-level access, public-access prevention,
+object versioning, and soft delete. Do not place application data or backups in
+this bucket.
+
+Copy both example configuration files without committing the copies:
 
 ```bash
 cd deploy/gcp/terraform
 cp terraform.tfvars.example terraform.tfvars
+cp backend.gcs.tfbackend.example backend.gcs.tfbackend
 gcloud auth application-default login
-terraform init
+terraform init -backend-config=backend.gcs.tfbackend
 terraform plan
 terraform apply
 terraform output
 ```
 
-Review the plan before applying it. The default Terraform state is local and is
-gitignored. For a team or production environment, move it to an access-logged,
-versioned remote backend before applying; do not commit state because it can
-contain infrastructure metadata.
+Replace the backend example's bucket name before initialization. Review the
+plan before applying it. Both configuration copies and any fallback local state
+are gitignored. The shared remote state is the deployment source of truth and
+may contain sensitive infrastructure metadata, so keep the bucket private and
+limit access to deployment administrators.
+
+If this infrastructure was first applied with local state, migrate it once
+after creating and verifying the bucket:
+
+```bash
+terraform init -migrate-state -force-copy \
+  -backend-config=backend.gcs.tfbackend
+terraform plan
+```
+
+The plan after migration must report no changes. Verify that the remote object
+has at least one generation before treating the migration as complete; retain
+the local state until that verification succeeds.
 
 Add the secret versions from a trusted terminal. The command reads from stdin,
 so the values do not appear as command arguments:

@@ -32,6 +32,8 @@ gha-creds-*.json
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
+*.tfbackend
+!*.tfbackend.example
 crash.log
 
 # Real-trace analysis output. Transcript-derived data never enters the repo,
