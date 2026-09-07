@@ -155,6 +155,7 @@ Terraform outputs and Auth0 values:
 | `AUTH0_DOMAIN` | Tenant hostname only, with no `https://` or path |
 | `AUTH0_AUDIENCE` | Exact Auth0 API identifier |
 | `AUTH0_CLIENT_ID` | Public dashboard application's client ID |
+| `DASHBOARD_PUBLIC_URL` | Optional custom HTTPS origin, such as `https://cacheeconomics.tanishakatara.com` |
 | `CACHEECONOMICS_SERVICE_PREFIX` | Optional; leave unset for `cacheeconomics`, or match the Terraform value exactly |
 
 No long-lived Google credential belongs in GitHub Secrets.
@@ -162,13 +163,18 @@ No long-lived Google credential belongs in GitHub Secrets.
 Protect `main` and require the existing `ci` and `security` checks before
 allowing deployment.
 
-## 5. First deployment and Auth0 callback
+## 5. First deployment, custom domain, and Auth0 callback
 
 From GitHub Actions, run **deploy-gcp-staging** on `main` and enter
 `DEPLOY STAGING`. The job prints stable Cloud Run dashboard and API URLs.
 
-In Auth0, set these values to the exact printed dashboard URL (including its
-`https://` scheme and no wildcard):
+For a custom hostname, run **configure-gcp-domain** on `main` with the hostname
+and `MAP DOMAIN`. Add the exact DNS records printed by that workflow. Wait for
+the managed certificate to become active, then set `DASHBOARD_PUBLIC_URL` to
+the custom HTTPS origin and rerun **deploy-gcp-staging**.
+
+In Auth0, keep the Cloud Run URL and add the custom origin to these lists
+(including its `https://` scheme and no wildcard):
 
 - Allowed Callback URLs: `DASHBOARD_URL/`
 - Allowed Web Origins: `DASHBOARD_URL`

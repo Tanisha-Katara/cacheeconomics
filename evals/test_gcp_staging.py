@@ -70,6 +70,7 @@ def test_github_staging_deploy_uses_short_lived_identity_and_immutable_images():
     assert "credentials_json" not in workflow
     assert "service_account_key" not in workflow
     assert "vars.CACHEECONOMICS_SERVICE_PREFIX || 'cacheeconomics'" in workflow
+    assert "DASHBOARD_PUBLIC_URL: ${{ vars.DASHBOARD_PUBLIC_URL }}" in workflow
     assert workflow.count("docker/build-push-action@") == 3
     assert workflow.count("aquasecurity/trivy-action@") == 3
     assert workflow.count("actions/attest@") == 3
@@ -96,9 +97,21 @@ def test_staging_deploy_is_bounded_migrates_first_and_keeps_trace_export_off():
     assert "OTEL_LOGS_EXPORTER=none" in script
     assert "CACHEECONOMICS_DASHBOARD_ALLOW_DEVELOPMENT_TOKEN=false" in script
     assert "CACHEECONOMICS_SERVICE_PREFIX must be 3-20" in script
-    assert "CACHEECONOMICS_DASHBOARD_REDIRECT_URI=${dashboard_url}/" in script
+    assert "CACHEECONOMICS_DASHBOARD_REDIRECT_URI=${dashboard_public_url}/" in script
     assert '"${api_url}/readyz"' in script
     assert '"${dashboard_url}/api/v1/dashboard/config"' in script
+
+
+def test_custom_domain_workflow_uses_short_lived_identity_and_exact_confirmation():
+    workflow = (ROOT / ".github/workflows/configure-gcp-domain.yml").read_text()
+
+    assert "github.ref == 'refs/heads/main'" in workflow
+    assert "inputs.confirmation == 'MAP DOMAIN'" in workflow
+    assert "id-token: write" in workflow
+    assert "google-github-actions/auth@" in workflow
+    assert "gcloud beta run domain-mappings create" in workflow
+    assert "--domain=\"$CUSTOM_DOMAIN\"" in workflow
+    assert "credentials_json" not in workflow
 
 
 def test_staging_deploy_rejects_mutable_images_before_cloud_access():
@@ -125,6 +138,34 @@ def test_staging_deploy_rejects_mutable_images_before_cloud_access():
 
     assert result.returncode == 2
     assert "immutable @sha256 digest" in result.stderr
+
+
+def test_staging_deploy_rejects_a_public_url_with_a_path():
+    script = ROOT / "deploy/gcp/deploy_staging.sh"
+    digest = "sha256:" + ("a" * 64)
+    environment = os.environ.copy()
+    environment.update(
+        GCP_PROJECT_ID="portfolio-staging",
+        GCP_REGION="europe-west1",
+        AUTH0_DOMAIN="tenant.example.test",
+        AUTH0_AUDIENCE="cacheeconomics-api",
+        AUTH0_CLIENT_ID="public-client",
+        API_IMAGE=f"example.test/api@{digest}",
+        WORKER_IMAGE=f"example.test/worker@{digest}",
+        DASHBOARD_IMAGE=f"example.test/dashboard@{digest}",
+        DASHBOARD_PUBLIC_URL="https://dashboard.example.test/a-path",
+    )
+
+    result = subprocess.run(
+        ["sh", str(script)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "HTTPS origin without a path" in result.stderr
 
 
 def test_staging_shell_and_neon_bootstrap_fail_closed():
