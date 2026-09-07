@@ -4,7 +4,8 @@
 
 **Scope:** low-traffic public portfolio staging, not customer production
 
-**State:** selected and implemented as deployment definitions; not yet applied
+**State:** Google foundation and database bootstrap applied to staging; service
+images and Cloud Run workloads await the first deployment
 
 The chosen design favors services with usable free allowances and keeps the
 number of moving parts small. Free allowances can change and are not hard cost
@@ -71,11 +72,11 @@ analysis library and still has no networking code.
 - OpenTelemetry exporters stay `none`. Cloud Run's own request telemetry and
   stdout collection do not require application trace export.
 
-## Evidence still required before the word “deployed” is used
+## Evidence still required before the hosted application is called “deployed”
 
-1. Terraform plan/apply output and exact provider/resource locations.
+1. Remote Terraform-state object/version evidence and a zero-change plan.
 2. Digest-qualified staging image references and matching attestations.
-3. Successful migration, synthetic smoke flow, and real PostgreSQL
+3. Successful application migration, synthetic smoke flow, and real PostgreSQL
    tenant-isolation output.
 4. Backup/restore output showing restored ACLs and restricted-role access.
 5. Cloud Logging review and a decision on safe trace attribute redaction.

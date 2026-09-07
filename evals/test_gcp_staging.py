@@ -25,6 +25,20 @@ def test_google_bootstrap_has_narrow_workload_identity_and_no_secret_values():
     assert "private_key" not in terraform
 
 
+def test_terraform_uses_an_external_backend_without_committing_its_values():
+    versions = (ROOT / "deploy/gcp/terraform/versions.tf").read_text()
+    backend_example = (
+        ROOT / "deploy/gcp/terraform/backend.gcs.tfbackend.example"
+    ).read_text()
+    gitignore = (ROOT / ".gitignore").read_text().splitlines()
+
+    assert 'backend "gcs" {}' in versions
+    assert 'bucket = "replace-with-private-versioned-state-bucket"' in backend_example
+    assert 'prefix = "staging/terraform"' in backend_example
+    assert "*.tfbackend" in gitignore
+    assert "!*.tfbackend.example" in gitignore
+
+
 def test_google_bootstrap_separates_runtime_identities_and_secrets():
     terraform = (ROOT / "deploy/gcp/terraform/main.tf").read_text()
 
@@ -145,6 +159,7 @@ def test_provider_runbook_does_not_claim_a_live_or_free_guaranteed_system():
     assert "not a zero-cost guarantee" in runbook
     assert "not a production SLA" in runbook
     decision = (ROOT / "docs/deployment-decision-record.md").read_text()
-    assert "not yet applied" in " ".join(decision.split())
+    assert "await the first deployment" in " ".join(decision.split())
+    assert "terraform init -migrate-state -force-copy" in runbook
     assert "OpenTelemetry export disabled" in runbook
     assert "Do not ingest real customer traces" in runbook
