@@ -31,7 +31,7 @@ def test_public_site_explains_the_product_before_sign_in():
     assert 'id="faq"' in html
     assert "Cut LLM costs with better prompt caching." in html
     assert "Prompt and response text rejected" in html
-    assert "Cached share of input tokens" in html
+    assert "Cached input this week" in html
     assert "Use your contract rates" in html
 
 
@@ -92,7 +92,9 @@ def test_dashboard_preview_chart_works_with_the_production_csp():
 
     assert 'style="--h:' not in html
     assert html.count("<em>") >= 7
-    assert ".token-chart > span:nth-child(7) b { height: 17%; }" in stylesheet
+    assert 'class="token-scale"' in html
+    assert ".token-bars > span:nth-child(7) b { height: 85%;" in stylesheet
+    assert "@keyframes cache-bars-in" in stylesheet
 
 
 def test_tokens_are_not_persisted_or_rendered_as_html():
