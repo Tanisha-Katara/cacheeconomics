@@ -147,7 +147,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .preview-bar { display: flex; min-height: 50px; align-items: center; justify-content: space-between; padding: 0 18px; border-bottom: 1px solid #e3e1d9; background: white; }
 .preview-brand { display: flex; align-items: center; gap: 8px; color: #30433e; font-size: 10px; font-weight: 800; }
 .preview-brand i { width: 9px; height: 14px; border-radius: 8px; background: var(--coral); box-shadow: 6px 0 0 var(--mint), 12px 0 0 #e8c778; }
-.preview-layout { display: grid; min-height: 455px; grid-template-columns: 57px 1fr; }
+.preview-layout { display: grid; grid-template-columns: 57px 1fr; }
 .preview-rail { display: flex; align-items: center; flex-direction: column; gap: 17px; padding: 22px 14px; background: var(--forest); }
 .preview-rail > span { display: grid; width: 24px; height: 24px; place-items: center; border-radius: 6px; color: rgba(255,255,255,.58); background: rgba(255,255,255,.08); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 11px; font-weight: 700; }
 .preview-rail > span.is-active { margin-top: 24px; background: rgba(169,215,200,.22); box-shadow: inset 2px 0 var(--coral); }
@@ -756,7 +756,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   .site-actions { gap: 10px; }
   .hero { gap: 58px; padding-block: 65px 80px; }
   .hero h1 { font-size: clamp(52px, 14vw, 82px); }
-  .preview-layout { min-height: 390px; grid-template-columns: 45px 1fr; }
+  .preview-layout { grid-template-columns: 45px 1fr; }
   .preview-main { padding: 20px 16px; }
   .preview-kpis { grid-template-columns: repeat(2,1fr); }
   .preview-kpis > div { min-height: 88px; }
@@ -802,7 +802,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
   .hero-proof { display: grid; }
   .preview-window { border-radius: 10px; }
   .preview-bar .badge { display: none; }
-  .preview-layout { min-height: 350px; grid-template-columns: 37px 1fr; }
+  .preview-layout { grid-template-columns: 37px 1fr; }
   .preview-rail { padding-inline: 8px; }
   .preview-heading .health-pill { display: none; }
   .preview-chart { min-height: 160px; }

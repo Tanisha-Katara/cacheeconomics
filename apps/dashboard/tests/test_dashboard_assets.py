@@ -95,6 +95,8 @@ def test_dashboard_preview_chart_works_with_the_production_csp():
     assert 'class="token-scale"' in html
     assert ".token-bars > span:nth-child(7) b { height: 85%;" in stylesheet
     assert "@keyframes cache-bars-in" in stylesheet
+    assert ".preview-layout { display: grid; min-height:" not in stylesheet
+    assert ".preview-layout { min-height:" not in stylesheet
 
 
 def test_tokens_are_not_persisted_or_rendered_as_html():
