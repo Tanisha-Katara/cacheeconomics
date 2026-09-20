@@ -1,4 +1,4 @@
-FROM python:3.12.14-slim-trixie@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea AS builder
+FROM python:3.14.6-slim-trixie@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491539145e2978f7f97ce9144 AS builder
 
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE NOTICE /src/
@@ -7,7 +7,7 @@ COPY collectors /src/collectors
 RUN python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels /src \
     && python -m pip wheel --no-cache-dir --no-deps --wheel-dir /wheels /src/collectors
 
-FROM python:3.12.14-slim-trixie@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+FROM python:3.14.6-slim-trixie@sha256:7bec7ddcddeff7975d6ba9b4be7dd6f6b2f55e7491539145e2978f7f97ce9144
 
 ARG VCS_REF="unknown"
 LABEL org.opencontainers.image.title="cacheeconomics collector" \
