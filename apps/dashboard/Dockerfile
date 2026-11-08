@@ -1,4 +1,4 @@
-FROM nginx:1.30.4-alpine3.24@sha256:dc5069ad14f19660b141b21236140b91656bf89bbc3e2417c70ae650cd66104c
+FROM nginx:1.31.7-alpine3.24@sha256:892bb2152464f0c5d8972593a5f5afaf8054552580b699d95f8ff4af08c2d33d
 
 ARG VCS_REF="unknown"
 LABEL org.opencontainers.image.title="cacheeconomics dashboard" \
